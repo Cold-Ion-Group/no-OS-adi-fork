@@ -1,0 +1,17 @@
+# Usage with Vitis IDE:
+# In Vitis IDE create a Single Application Debug launch configuration,
+# change the debug type to 'Attach to running target' and provide this 
+# tcl script in 'Execute Script' option.
+# Path of this script: C:\Users\fpga_\Desktop\adi\no-OS\projects\plain_spi\spi_fmc_test_system\_ide\scripts\debugger_spi_fmc_test-default.tcl
+# 
+# 
+# Usage with xsct:
+# To debug using xsct, launch xsct and run below command
+# source C:\Users\fpga_\Desktop\adi\no-OS\projects\plain_spi\spi_fmc_test_system\_ide\scripts\debugger_spi_fmc_test-default.tcl
+# 
+connect -url tcp:127.0.0.1:3121
+targets -set -filter {jtag_cable_name =~ "Digilent JTAG-SMT2NC 210308B3AF60" && level==0 && jtag_device_ctx=="jsn-JTAG-SMT2NC-210308B3AF60-04a62093-0"}
+fpga -file C:/Users/fpga_/Desktop/adi/no-OS/projects/plain_spi/spi_fmc_test/_ide/bitstream/interface_with_spi.bit
+targets -set -nocase -filter {name =~ "*microblaze*#0" && bscan=="USER2" }
+loadhw -hw C:/Users/fpga_/Desktop/adi/no-OS/projects/plain_spi/interface_with_spi/export/interface_with_spi/hw/interface_with_spi.xsa -regs
+configparams mdm-detect-bscan-mask 2

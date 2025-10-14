@@ -1,42 +1,5 @@
-/***************************************************************************//**
- *   @file   AD9516.h
- *   @brief  Header file of AD9516 Driver.
- *   @author DBogdan (dragos.bogdan@analog.com)
- *   @author Prerna Baranwal, modified for KCU116 and AD9144 
-********************************************************************************
- * Copyright 2012(c) Analog Devices, Inc.
- *
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *  - Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  - Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in
- *    the documentation and/or other materials provided with the
- *    distribution.
- *  - Neither the name of Analog Devices, Inc. nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *  - The use of this software may or may not infringe the patent rights
- *    of one or more patent holders.  This license does not release you
- *    from the requirement that you obtain separate licenses from these
- *    patent holders to use this software.
- *  - Use of the software either in source or binary form, must be run
- *    on or directly connected to an Analog Devices Inc. component.
- *
- * THIS SOFTWARE IS PROVIDED BY ANALOG DEVICES "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, NON-INFRINGEMENT,
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL ANALOG DEVICES BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, INTELLECTUAL PROPERTY RIGHTS, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*******************************************************************************/
+// header file for the ad9516 chip, code is adapted from the ad9517 chip
+
 #ifndef __AD9516_H__
 #define __AD9516_H__
 
@@ -44,13 +7,13 @@
 /***************************** Include Files **********************************/
 /******************************************************************************/
 #include <stdint.h>
-#include "no_os_spi.h"
-//#include "ad9516_cfg.h"
+#include "no_os_spi.h" // header file for the bare metal spi protocol
+
 
 /******************************************************************************/
 /****************************** AD9516 ****************************************/
 /******************************************************************************/
-#define AD9516_READ				(1 << 15)
+#define AD9516_READ				    (1 << 15)
 #define AD9516_WRITE				(0 << 15)
 #define AD9516_CNT(x)				((x - 1) << 13)
 #define AD9516_ADDR(x)				(x & 0x3FF)
@@ -63,8 +26,8 @@
 /* SPI Register Map */
 
 /* Serial Port Configuration */
-#define AD9516_REG_SERIAL_PORT_CONFIG		(AD9516_T1B | 0x000)
-#define AD9516_REG_PART_ID			(AD9516_T1B | 0x003)
+#define AD9516_REG_SERIAL_PORT_CONFIG	(AD9516_T1B | 0x000)
+#define AD9516_REG_PART_ID			    (AD9516_T1B | 0x003)
 #define AD9516_REG_READBACK_CTRL		(AD9516_T1B | 0x004)
 
 /* PLL */
@@ -122,6 +85,7 @@
 #define AD9516_REG_DIVIDER_2_1			(AD9516_T1B | 0x197)
 #define AD9516_REG_DIVIDER_2_2			(AD9516_T1B | 0x198)
 
+
 /* LVDS/CMOS Channel Dividers */
 #define AD9516_REG_LVDS_CMOS_DIVIDER_3_0	(AD9516_T1B | 0x199)
 #define AD9516_REG_LVDS_CMOS_DIVIDER_3_1	(AD9516_T1B | 0x19A)
@@ -148,16 +112,16 @@
 #define AD9516_SDO_ACTIVE			((1 << 7) | (1 << 0))
 #define AD9516_LSB_FIRST			((1 << 6) | (1 << 1))
 #define AD9516_SOFT_RESET			((1 << 5) | (1 << 2))
-#define AD9516_LONG_INSTRUCTION			((1 << 4) | (1 << 3))
+#define AD9516_LONG_INSTRUCTION	    ((1 << 4) | (1 << 3))
 
 /* AD9516_REG_READBACK_CTRL Definition */
 #define AD9516_REG_BANK_SELECTION		(1 << 0)
 
 /* AD9516_REG_PFD_CHARGE_PUMP Definition */
 #define AD9516_PFD_POLARITY			(1 << 7)
-#define AD9516_CP_CURRENT(x)			((x & 0x7) << 4)
+#define AD9516_CP_CURRENT(x)		((x & 0x7) << 4)
 #define AD9516_CP_MODE(x)			((x & 0x3) << 2)
-#define AD9516_PLL_POWER_DOWN(x)		((x & 0x3) << 0)
+#define AD9516_PLL_POWER_DOWN(x)	((x & 0x3) << 0)
 
 /* AD9516_REG_R_COUNTER Definition */
 #define AD9516_R_COUNTER(x)			((x & 0x3FFF) << 0)
@@ -169,7 +133,7 @@
 #define AD9516_B_COUNTER(x)			((x & 0x1FFF) << 0)
 
 /* AD9516_REG_PLL_CTRL_1 Definition */
-#define AD9516_CP_VCP_DIV2			(1 << 7)
+#define AD9516_CP_VCP_DIV2			    (1 << 7)
 #define AD9516_RESET_R_COUNTER			(1 << 6)
 #define AD9516_RESET_A_B_COUNTERS		(1 << 5)
 #define AD9516_RESET_ALL_COUNTERS		(1 << 4)
@@ -177,7 +141,7 @@
 #define AD9516_PRESCALER_P(x)			((x & 0x7) << 0)
 
 /* AD9516_REG_PLL_CTRL_2 Definition */
-#define AD9516_STATUS_PIN_CTRL(x)		((x & 0x3F) << 2)
+#define AD9516_STATUS_PIN_CTRL(x)		    ((x & 0x3F) << 2)
 #define AD9516_ANTIBACKLASH_PULSE_WIDTH(x)	((x & 0x3) << 0)
 
 /* AD9516_REG_PLL_CTRL_3 Definition */
@@ -229,14 +193,14 @@
 #define AD9516_OUT_DELAY_BYPASS			(1 << 0)
 
 /* AD9516_REG_OUTn_DELAY_FULL_SCALE Definition */
-#define AD9516_OUT_RAMP_CAPACITORS(x)		((x & 0x7) << 3)
+#define AD9516_OUT_RAMP_CAPACITORS(x)	((x & 0x7) << 3)
 #define AD9516_OUT_RAMP_CURRENT(x)		((x & 0x7) << 0)
 
 /* AD9516_REG_OUTn_DELAY_FRACTION Definition */
 #define AD9516_OUT_DELAY_FRACTION(x)		((x & 0x3F) << 0)
 
 /* AD9516_REG_LVPECL_OUTn Definition */
-#define AD9516_OUT_LVPECL_INVERT		(1 << 4)
+#define AD9516_OUT_LVPECL_INVERT		    (1 << 4)
 #define AD9516_OUT_LVPECL_DIFF_VOLTAGE(x)	((x & 0x3) << 2)
 #define AD9516_OUT_LVPECL_POWER_DOWN(x)		((x & 0x3) << 0)
 
@@ -252,14 +216,14 @@
 #define AD9516_DIVIDER_HIGH_CYCLES(x)		((x & 0xF) << 0)
 
 /* AD9516_REG_DIVIDER_n_1 Definition */
-#define AD9516_DIVIDER_BYPASS			(1 << 7)
+#define AD9516_DIVIDER_BYPASS			    (1 << 7)
 #define AD9516_LVPECL_DIVIDER_NOSYNC		(1 << 6)
 #define AD9516_LVPECL_DIVIDER_FORCE_HIGH	(1 << 5)
-#define AD9516_DIVIDER_START_HIGH		(1 << 4)
+#define AD9516_DIVIDER_START_HIGH		    (1 << 4)
 #define AD9516_DIVIDER_PHASE_OFFSET(x)		((x & 0xF) << 0)
 
 /* AD9516_REG_DIVIDER_n_2 Definition */
-#define AD9516_DIVIDER_DIRECT_TO_OUTPUT		(1 << 1)
+#define AD9516_DIVIDER_DIRECT_TO_OUTPUT	(1 << 1)
 #define AD9516_DIVIDER_DCCOFF			(1 << 0)
 
 /* AD9516_REG_LVDS_CMOS_DIVIDER_n_0 Definition */
@@ -341,8 +305,9 @@ struct ad9516_platform_data {
 	/* output channel configuration */
 
 	int32_t num_channels;
-	// pointer to channel array
-	struct ad9516_lvpecl_channel_spec *channels;
+	//channel initialisation
+	int32_t channels;
+
 
 
 	uint8_t power_down_vco_clk;
@@ -412,7 +377,7 @@ struct ad9516_dev {
 	/* Device Settings */
 	struct ad9516_state ad9516_st;
 	enum ad9516_type	ad9516_type;
-	//struct ad9516_platform_data	     *pdata;
+
 };
 
 struct ad9516_init_param {
@@ -421,7 +386,7 @@ struct ad9516_init_param {
 	/* Device Settings */
 	struct ad9516_state ad9516_st;
 	enum ad9516_type	ad9516_type;
-	//struct ad9516_platform_data	     *pdata;
+
 };
 
 /******************************************************************************/
@@ -429,7 +394,7 @@ struct ad9516_init_param {
 /******************************************************************************/
 /*! Initializes the AD9516. */
 int32_t ad9516_setup(struct ad9516_dev **device,
-		      struct ad9516_init_param *init_param);
+		      struct ad9516_init_param init_param);
 /*! Free the resources allocated by ad9516_setup(). */
 int32_t ad9516_remove(struct ad9516_dev *dev);
 /*!  Writes data into a register. */
@@ -457,7 +422,7 @@ int32_t ad9516_phase(struct ad9516_dev *dev,
 int32_t ad9516_power_mode(struct ad9516_dev *dev,
 			  int32_t channel,
 			  int32_t mode);
-//int32_t ad9516_init(struct ad9516_init_param *init_param);
+int32_t ad9516_init(struct ad9516_init_param *init_param);
 
 
 #endif // __AD9516_H__

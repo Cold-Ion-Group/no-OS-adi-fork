@@ -1,54 +1,11 @@
-/***************************************************************************//**
- *   @file   AD9516_cfg.h
- *   @brief  Header file of AD9516 Driver Configuration.
- *   @author DBogdan (dragos.bogdan@analog.com)
- *   @author Modified by Prerna Baranwal for KCU116 and AD9144 
-********************************************************************************
- * Copyright 2012(c) Analog Devices, Inc.
- *
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *  - Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  - Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in
- *    the documentation and/or other materials provided with the
- *    distribution.
- *  - Neither the name of Analog Devices, Inc. nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *  - The use of this software may or may not infringe the patent rights
- *    of one or more patent holders.  This license does not release you
- *    from the requirement that you obtain separate licenses from these
- *    patent holders to use this software.
- *  - Use of the software either in source or binary form, must be run
- *    on or directly connected to an Analog Devices Inc. component.
- *
- * THIS SOFTWARE IS PROVIDED BY ANALOG DEVICES "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, NON-INFRINGEMENT,
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL ANALOG DEVICES BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, INTELLECTUAL PROPERTY RIGHTS, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*******************************************************************************/
+// configuration file for the ad9516 clock chip, it does not contain ports to the in 
 #ifndef __AD9516_CFG_H__
 #define __AD9516_CFG_H__
-
-/******************************************************************************/
-/***************************** Include Files **********************************/
-/******************************************************************************/
-//#include "AD9516.h"
-
+// 40 mhz is the external clock reference frequency from the AWG 
 struct ad9516_platform_data ad9516_pdata_lpc = {
 	/* PLL Reference */
-	250000000, // ref_1_freq
-	250000000, // ref_2_freq
+	0, // ref_1_freq
+    0, // ref_2_freq
 	1, // diff_ref_en
 	1, // ref_1_power_on
 	1, // ref_2_power_on
@@ -56,11 +13,11 @@ struct ad9516_platform_data ad9516_pdata_lpc = {
 	1, // ref_sel_pin
 	0, // ref_2_en
 
-	250000000, // ext_clk_freq
+	40000000, // ext_clk_freq
 	1600000000, // int_vco_freq
 	0, // vco_clk_sel
 	0, // power_down_vco_clk
-	"ad9516-lpc" // name[16]
+	"ad9516_channels" // name[16]
 };
 
 // 6 LVPECL output, 4  of lvds clock output 
@@ -68,7 +25,7 @@ struct ad9516_platform_data ad9516_pdata_lpc = {
 struct ad9516_lvpecl_channel_spec ad9516_lvpecl_channels[] = {
 	{
 		0, // channel_num - Output channel number.
-		0, // out_invert_en - Invert the polarity of the output clock.
+		0, // out_invert_en - Invert the polarity of the output clock.l
 		LVPECL_780mV, // out_diff_voltage - LVPECL output differential voltage.
 		"CH0" // name[16] - Optional descriptive channel name.
 	},

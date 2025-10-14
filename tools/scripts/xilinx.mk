@@ -37,55 +37,6 @@ JTAG_CABLE_ID = $2
 TARGET_CPU ?= 0
 PROJECT_BUILD = $(BUILD_DIR)/app
 
-################|--------------------------------------------------------------
-################|                   Zynq                                       
-################|--------------------------------------------------------------
-ifneq (,$(findstring cortexa9,$(strip $(ARCH))))
-
-CC := arm-none-eabi-gcc
-AR := arm-none-eabi-ar
-
-LD := $(CC)
-
-CFLAGS += -mcpu=cortex-a9 						\
-	  -mfpu=vfpv3 							\
-	  -mfloat-abi=hard
-
-LDFLAGS += -specs=$(BUILD_DIR)/app/src/Xilinx.spec 			\
-	   -mfpu=vfpv3							\
- 	   -mfloat-abi=hard 						\
-	   -mcpu=cortex-a9						\
-	   -Wl,-build-id=none
-
-endif
-
-################|--------------------------------------------------------------
-################|                   ZynqMP                                     
-################|--------------------------------------------------------------
-ifneq (,$(findstring cortexa53,$(strip $(ARCH))))
-
-CC := aarch64-none-elf-gcc
-AR := aarch64-none-elf-ar
-
-LD := $(CC)
-endif
-
-ifneq (,$(findstring cortexr5,$(strip $(ARCH))))
-
-CC := armr5-none-eabi-gcc 
-AR := armr5-none-eabi-ar
-
-LD := $(CC)
-
-CFLAGS += -mcpu=cortex-r5						\
-	  -mfloat-abi=hard						\
-	  -mfpu=vfpv3-d16
-
-LDFLAGS += -mcpu=cortex-r5						\
-           -mfloat-abi=hard						\
-	   -mfpu=vfpv3-d16						\
-	   -DARMR5
-endif
 
 ################|--------------------------------------------------------------
 ################|                  Microblaze                                  

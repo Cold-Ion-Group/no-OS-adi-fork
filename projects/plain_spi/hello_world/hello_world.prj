@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="ASCII"?>
+<sdkproject:SdkProject xmi:version="2.0" xmlns:xmi="http://www.omg.org/XMI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:sdkproject="http://www.xilinx.com/sdkproject" name="hello_world" location="C:/Users/fpga_/Desktop/adi/no-OS/projects/plain_spi/hello_world" platform="C:/Users/fpga_/Desktop/adi/no-OS/projects/plain_spi/interface_with_spi_1/export/interface_with_spi_1/interface_with_spi_1.xpfm" platformUID="xilinx:kcu116:name:0.0(custom)" systemProject="hello_world_system" sysConfig="interface_with_spi_1" runtime="cpp" cpu="standalone_microblaze_mcs_0_microblaze_I" cpuInstance="microblaze_mcs_0_microblaze_I" os="standalone" mssSignature="86cda3f59266bc99a95b1b9dacede4b6">
+  <configuration name="Debug" id="xilinx.gnu.mb.exe.debug.1083717695">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+    <lastBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <configuration name="Release" id="xilinx.gnu.mb.exe.release.588115992" dirty="true">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <template appTemplateName="hello_world"/>
+</sdkproject:SdkProject>

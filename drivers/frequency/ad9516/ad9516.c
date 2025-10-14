@@ -1,63 +1,13 @@
-/***************************************************************************//**
- *   @file   AD9516.c
- *   @brief  Implementation of AD9516 Driver.
- *   @author DBogdan (dragos.bogdan@analog.com)
- *   @author Prerna Baranwal, modified for kcu116 and ad9144
-********************************************************************************
- * Copyright 2012(c) Analog Devices, Inc.
- *
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *  - Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  - Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in
- *    the documentation and/or other materials provided with the
- *    distribution.
- *  - Neither the name of Analog Devices, Inc. nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *  - The use of this software may or may not infringe the patent rights
- *    of one or more patent holders.  This license does not release you
- *    from the requirement that you obtain separate licenses from these
- *    patent holders to use this software.
- *  - Use of the software either in source or binary form, must be run
- *    on or directly connected to an Analog Devices Inc. component.
- *
- * THIS SOFTWARE IS PROVIDED BY ANALOG DEVICES "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, NON-INFRINGEMENT,
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL ANALOG DEVICES BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, INTELLECTUAL PROPERTY RIGHTS, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*******************************************************************************/
 
-/******************************************************************************/
-/***************************** Include Files **********************************/
-/******************************************************************************/
 #include <stdlib.h>
 #include <errno.h>
 #include "no_os_delay.h"
+#include "no_os_alloc.h"
 #include "ad9516.h"
 
 
-/***************************************************************************//**
- * @brief Initializes the AD9516.
- *
- * @param device     - The device structure.
- * @param init_param - The structure that contains the device initial
- * 		       parameters.
- *
- * @return Returns 0 in case of success or negative error code.
-*******************************************************************************/
 int32_t ad9516_setup(struct ad9516_dev **device,
-		     struct ad9516_init_param *init_param)
+		     struct ad9516_init_param init_param)
 {
 	int32_t		    ret = 0;
 	int8_t		    index = 0;
@@ -74,29 +24,26 @@ int32_t ad9516_setup(struct ad9516_dev **device,
 		AD9516_REG_LVPECL_OUT5
 	};
 
-	dev = (struct ad9516_dev *)malloc(sizeof(*dev));
+	dev = (struct ad9516_dev *)no_os_malloc(sizeof(*dev));
 	if (!dev) {
 		printf("Memory allocation for 'dev' failed.\n");
 		return -1;
 	}
 
-	dev->ad9516_st = init_param->ad9516_st;
-	dev->ad9516_type = init_param->ad9516_type;
+	dev->ad9516_st = init_param.ad9516_st;
+	dev->ad9516_type = init_param.ad9516_type;
 
 	/* Initializes the SPI peripheral */
-	ret = no_os_spi_init(&dev->spi_desc, &init_param->spi_init);
+	ret = no_os_spi_init(&dev->spi_desc, &init_param.spi_init);
+	// doesnot do anything, remove it 
 	if (ret) {
 		printf("SPI initialization failed with error code: %d\n", ret);
+		no_os_free(dev);
 		return ret;
 	}
 
 	printf("Reading PART ID from register address: 0x%X\n", AD9516_REG_PART_ID);
-    ret = ad9516_read(dev, AD9516_REG_PART_ID, &reg_value);
-    if (ret) {
-    printf("Failed to read PART ID register. Error code: %d\n", ret);
-    return ret;
-    }
-printf("PART ID read: 0x%X\n", reg_value);
+  
 
 	ret = ad9516_read(dev, AD9516_REG_PART_ID, &reg_value);
 	if (ret) {
@@ -170,7 +117,7 @@ printf("PART ID read: 0x%X\n", reg_value);
 	}
 
 	/* Update the device with user settings for the LVDS/CMOS output channels. */
-	for (index = 0; index < 4; index++) {
+	for (index = 0; index < 6; index++) {
 		reg_address = AD9516_REG_LVDS_CMOS_OUT6 + index;
 		reg_value = AD9516_OUT_LVDS_CMOS_INVERT(dev->ad9516_st.lvds_cmos_channels[index].out_invert) |
 		            dev->ad9516_st.lvds_cmos_channels[index].logic_level * AD9516_OUT_LVDS_CMOS |
@@ -242,33 +189,17 @@ printf("PART ID read: 0x%X\n", reg_value);
 }
 
 
-/***************************************************************************//**
- * @brief Free the resources allocated by ad9516_setup().
- *
- * @param dev - The device structure.
- *
- * @return 0 in case of success, negative error code otherwise.
-*******************************************************************************/
 int32_t ad9516_remove(struct ad9516_dev *dev)
 {
 	int32_t ret;
 
 	ret = no_os_spi_remove(dev->spi_desc);
 
-	free(dev);
+	no_os_free(dev);
 
 	return ret;
 }
 
-/***************************************************************************//**
-* @brief Writes data into a register.
-*
-* @param dev      - The device structure.
-* @param reg_addr - The address of the register to be written.
-* @param reg_val  - The value to be written into the register.
-*
-* @return Returns 0 in case of success or negative error code.
-*******************************************************************************/
 int32_t ad9516_write(struct ad9516_dev *dev,
 		     uint32_t reg_addr,
 		     uint16_t reg_val)
@@ -297,15 +228,6 @@ int32_t ad9516_write(struct ad9516_dev *dev,
 	return ret;
 }
 
-/***************************************************************************//**
-* @brief Reads data from a register.
-*
-* @param dev      - The device structure.
-* @param reg_addr - The address of the register to be read.
-* @param reg_value - Pointer to the value to be read from the register.
-*
-* @return Returns the read data or negative error code.
-*******************************************************************************/
 int32_t ad9516_read(struct ad9516_dev *dev,
 		    uint32_t reg_addr,
 		    uint32_t *reg_value)
@@ -334,30 +256,12 @@ int32_t ad9516_read(struct ad9516_dev *dev,
 	return ret;
 }
 
-/***************************************************************************//**
- * @brief Transfers the contents of the buffer registers into the active
- *        registers.
- *
- * @param dev - The device structure.
- *
- * @return Returns 0 in case of success or negative error code.
-*******************************************************************************/
 int32_t ad9516_update(struct ad9516_dev *dev)
 {
 	return ad9516_write(dev,
 			    AD9516_REG_UPDATE_ALL_REGS,
 			    AD9516_UPDATE_ALL_REGS);
 }
-
-
-/***************************************************************************//**
- * @brief Sets the VCO frequency.
- *
- * @param dev       - The device structure.
- * @param frequency - The desired frequency value.
- *
- * @return vco_freq - The actual frequency value that was set.
-*******************************************************************************/
 int64_t ad9516_vco_frequency(struct ad9516_dev *dev,
 			     int64_t frequency)
 {
@@ -470,15 +374,6 @@ int64_t ad9516_vco_frequency(struct ad9516_dev *dev,
 
 	return vco_freq;
 }
-
-/***************************************************************************//**
- * @brief Checks if the number can be decomposed into a product of two numbers
- *        smaller or equal to 32 each one.
- *
- * @param number - The number.
- *
- * @return Returns 1 if the number can't be decomposed or 0 otherwise.
-*******************************************************************************/
 int8_t dividers_checker(int32_t number)
 {
 	int32_t i = 0;
@@ -495,16 +390,6 @@ int8_t dividers_checker(int32_t number)
 
 	return 1;
 }
-
-/***************************************************************************//**
- * @brief Sets the frequency on the specified channel.
- *
- * @param dev       - The device structure.
- * @param channel   - The channel.
- * @param frequency - The desired frequency value.
- *
- * @return set_freq - The actual frequency value that was set.
-*******************************************************************************/
 int64_t ad9516_frequency(struct ad9516_dev *dev,
 			 int32_t channel,
 			 int64_t frequency)
@@ -796,16 +681,6 @@ int64_t ad9516_frequency(struct ad9516_dev *dev,
 
 	return set_freq;
 }
-
-/***************************************************************************//**
- * @brief Sets the phase on the specified channel.
- *
- * @param dev     - The device structure.
- * @param channel - The channel.
- * @param phase   - The desired phase value.
- *
- * @return Returns the phase or negative error code.
-*******************************************************************************/
 int32_t ad9516_phase(struct ad9516_dev *dev, int32_t channel, int32_t phase)
 {
 	uint32_t reg_value = 0;
@@ -845,15 +720,7 @@ int32_t ad9516_phase(struct ad9516_dev *dev, int32_t channel, int32_t phase)
 	return phase;
 }
 
-/***************************************************************************//**
- * @brief Sets the power mode of the specified channel.
- *
- * @param dev     - The device structure.
- * @param channel - The channel.
- * @param mode    - Power mode.
- *
- * @return Returns the mode or negative error code.
-*******************************************************************************/
+
 int32_t ad9516_power_mode(struct ad9516_dev *dev, int32_t channel, int32_t mode)
 {
 	struct ad9516_lvpecl_channel_spec *lvpecl_channel;

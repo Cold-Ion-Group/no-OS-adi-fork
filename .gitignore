@@ -25,3 +25,17 @@ aducm_build
 *.sopcinfo
 
 local_variables.mk
+# IDE and tool outputs
+*.log
+*.str
+*.cso
+*.clk
+*.stp
+*.json
+*.analytics
+/garbage_dump/
+/projects/*/.log/
+/projects/*/logs/
+/projects/*/resources/
+/projects/*/_ide/
+/projects/*/*.prj

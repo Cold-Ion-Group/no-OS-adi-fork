@@ -118,6 +118,7 @@ static int32_t spi_init_pl(struct no_os_spi_desc *desc,
 
 	ret = XSpi_SetOptions(xdesc->instance,
 			      XSP_MASTER_OPTION |
+			      XSP_MANUAL_SSELECT_OPTION |  /* Enable manual slave select control */
 			      ((desc->mode & NO_OS_SPI_CPOL) ?
 			       XSP_CLK_ACTIVE_LOW_OPTION : 0) |
 			      ((desc->mode & NO_OS_SPI_CPHA) ?

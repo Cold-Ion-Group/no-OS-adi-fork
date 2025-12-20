@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <inttypes.h>
-#include <string.h>
 #include <xil_printf.h>
 #include <xil_cache.h>
 #include "app_config.h"
@@ -26,13 +25,12 @@
 #endif
 struct fmcdac_dev {
 	struct ad9144_dev *ad9144_device;
-    struct ad9516_dev *ad9516_device; // Fixed name to match usage
+    struct ad9516_dev *ad9516_dev;
 
 	struct no_os_gpio_desc *gpio_clkd_sync;
 	struct no_os_gpio_desc *gpio_dac_reset;
 	struct no_os_gpio_desc *gpio_dac_txen;
 
-	struct ad9516_lvpecl_channel_spec ad9516_channels[4]; // Added missing array
 
 	struct adxcvr *ad9144_xcvr;
 	struct adxcvr *ad9156_adxcvr; 
@@ -44,6 +42,7 @@ struct fmcdac_dev {
 
 	struct axi_dmac *ad9144_dmac;
 	
+	struct ad9516_lvpecl_channel_spec ad9516_channels[4];
 } fmcdac;
 
 #ifdef JESD_FSM_ON
@@ -56,7 +55,7 @@ struct link_init_param {
 	uint32_t	high_density;
 	uint8_t		scrambling;
 	uint32_t	converter_resolution;
-	uint32_t	bits_per_sample;l
+	uint32_t	bits_per_sample;
 	uint32_t	converters_per_device;
 	uint32_t	control_bits_per_sample;
 	uint32_t	lanes_per_device;
@@ -165,22 +164,30 @@ static int fmcdac_spi_init(struct fmcdac_init_param *dev_init)
 // max value is 25 Mhz  
 	/* Initialize SPI structures */
 	
+	xil_printf("[SPI] Configuring SPI parameters...\n\r");
+	
 	struct no_os_spi_init_param ad9516_spi_param = {
 		.device_id = SPI_DEVICE_ID,
 		.max_speed_hz = 2000000u, // this is the communication speed for the spi 
-		.chip_select = 4, // value takem from the evaluation board schematic
-	.mode = NO_OS_SPI_MODE_0,
-	.platform_ops = &xil_spi_ops
+		.chip_select = 0, // CS0 maps to spi_csn_clk (AD9516) per HDL design
+		.mode = NO_OS_SPI_MODE_0,
+		.platform_ops = &xil_spi_ops
 	};
 
 	struct no_os_spi_init_param ad9144_spi_param = {
 		.device_id = SPI_DEVICE_ID,
 		.max_speed_hz = 2000000u,
-		.chip_select = 1,
+		.chip_select = 1, // CS1 maps to spi_csn_dac (AD9144) per HDL design
 		.mode = NO_OS_SPI_MODE_0,
 		.platform_ops = &xil_spi_ops
 	};
 
+	xil_printf("[SPI] AD9516 chip_select = %d (maps to spi_csn_clk)\n\r", ad9516_spi_param.chip_select);
+	xil_printf("[SPI] AD9144 chip_select = %d (maps to spi_csn_dac)\n\r", ad9144_spi_param.chip_select);
+	xil_printf("[SPI] SPI_DEVICE_ID = %d\n\r", SPI_DEVICE_ID);
+	xil_printf("[SPI] SPI clock speed = %u Hz\n\r", ad9516_spi_param.max_speed_hz);
+	xil_printf("[SPI] SPI mode = %d (should be 0 for MODE_0)\n\r", ad9516_spi_param.mode);
+	xil_printf("[SPI] Verify AXI SPI has exactly 2 CS lines enabled in Vivado\n\r");
 
 	static struct xil_spi_init_param xil_spi_param = {
 		.type = SPI_PL,
@@ -208,7 +215,7 @@ static int fmcdac_clk_init(struct fmcdac_dev *dev,
 
 	// clock distribution device (AD9516) configuration 
 	ad9516_pdata.num_channels = 4; // 4 channels as 4 clock lines are being used to run the ad9144 evaluation board
-	ad9516_pdata.channels = &dev->ad9516_channels[0]; // channel initialisation may not be of the correct data type
+	ad9516_pdata.channels = (int32_t)(&dev->ad9516_channels[0]); // channel initialisation may not be of the correct data type
 	dev_init->ad9516_param.ad9516_st.pdata = &ad9516_pdata;
 	dev_init->ad9516_param.ad9516_type = AD9516_1; // look into  the board and then change this , according to the specs sheet its ad9516-1
 	dev_init->ad9516_param.ad9516_st.lvpecl_channels = &dev->ad9516_channels[0];
@@ -225,8 +232,7 @@ static int fmcdac_clk_init(struct fmcdac_dev *dev,
 		ad9516_pdata.int_vco_freq = 1250000000;
 		ad9516_pdata.vco_clk_sel = 1;
 		ad9516_pdata.power_down_vco_clk = 0;
-		strncpy((char*)ad9516_pdata.name, "ad9516_lpc", sizeof(ad9516_pdata.name) - 1);
-		ad9516_pdata.name[sizeof(ad9516_pdata.name) - 1] = '\0';
+		snprintf((char*)ad9516_pdata.name, sizeof(ad9516_pdata.name), "ad9516_lpc");
 		
 	dev->ad9516_channels[DAC_DEVICE_CLK].channel_num = 0;
 	dev->ad9516_channels[DAC_DEVICE_CLK].out_invert_en = 0;
@@ -245,16 +251,17 @@ static int fmcdac_clk_init(struct fmcdac_dev *dev,
 	dev->ad9516_channels[DAC_FPGA_SYSREF].out_invert_en = 0;
 	dev->ad9516_channels[DAC_FPGA_SYSREF].out_diff_voltage= LVPECL_780mV;
 
-	ret = ad9516_setup(&dev->ad9516_device, dev_init->ad9516_param);
+	ret = ad9516_setup(&dev->ad9516_dev, dev_init->ad9516_param);
 	
 	if (ret < 0) {
-		printf("\nClock init failed");
+		xil_printf("\nClock init failed");
 		return ret;
 	}
 
 
 	return ret;
 }
+
 // TODO: modified the jesd204 platform to include only ad9144
 static int fmcdac_jesd_init(struct fmcdac_init_param *dev_init)
 {
@@ -264,8 +271,8 @@ static int fmcdac_jesd_init(struct fmcdac_init_param *dev_init)
 		.sys_clk_sel = ADXCVR_SYS_CLK_QPLL0,
 		.out_clk_sel = ADXCVR_REFCLK_DIV2,
 		.lpm_enable = 1,
-		.ref_rate_khz = 500000,
 		.lane_rate_khz = 10000000,
+		.ref_rate_khz = 500000,
 	};
 	/* JESD initialization */
 	dev_init->ad9144_jesd_param = (struct jesd204_tx_init) {
@@ -314,21 +321,21 @@ static int fmcdac_trasnceiver_setup(struct fmcdac_dev *dev,
 	status = axi_jesd204_tx_init_jesd_fsm(&dev->ad9144_jesd,
 					      &dev_init->ad9144_jesd_param);
 	if (status) {
-		printf("error: %s: axi_jesd204_tx_init_jesd_fsm() failed\n",
+		xil_printf("error: %s: axi_jesd204_tx_init_jesd_fsm() failed\n",
 		       dev_init->ad9144_jesd_param.name);
 		return status;
 	}
 #else
 	status = axi_jesd204_tx_init(&dev->ad9144_jesd, &dev_init->ad9144_jesd_param);
 	if (status != 0) {
-		printf("error: %s: axi_jesd204_tx_init() failed\n",
+		xil_printf("error: %s: axi_jesd204_tx_init() failed\n",
 		       dev_init->ad9144_jesd_param.name);
 		return status;
 	}
 
 	status = axi_jesd204_tx_lane_clk_enable(dev->ad9144_jesd);
 	if (status != 0) {
-		printf("error: %s: axi_jesd204_tx_lane_clk_enable() failed\n",
+		xil_printf("error: %s: axi_jesd204_tx_lane_clk_enable() failed\n",
 		       dev->ad9144_jesd->name);
 		return status;
 	}
@@ -336,13 +343,13 @@ static int fmcdac_trasnceiver_setup(struct fmcdac_dev *dev,
 
 	status = adxcvr_init(&dev->ad9144_xcvr, &dev_init->ad9144_xcvr_param);
 	if (status != 0) {
-		printf("error: %s: adxcvr_init() failed\n", dev_init->ad9144_xcvr_param.name);
+		xil_printf("error: %s: adxcvr_init() failed\n", dev_init->ad9144_xcvr_param.name);
 		return status;
 	}
 #ifndef ALTERA_PLATFORM
 	status = adxcvr_clk_enable(dev->ad9144_xcvr);
 	if (status != 0) {
-		printf("error: %s: adxcvr_clk_enable() failed\n", dev->ad9144_xcvr->name);
+		xil_printf("error: %s: adxcvr_clk_enable() failed\n", dev->ad9144_xcvr->name);
 		return status;
 	}
 #endif
@@ -358,7 +365,7 @@ static int fmcdac_test(struct fmcdac_dev *dev,
 
 	status = axi_jesd204_tx_status_read(dev->ad9144_jesd);
 	if (status != 0) {
-		printf("axi_jesd204_tx_status_read() error: %d\n", status);
+		xil_printf("axi_jesd204_tx_status_read() error: %d\n", status);
 	}
 
 	status = ad9144_status(dev->ad9144_device);
@@ -472,7 +479,7 @@ static void fmcdac_remove(struct fmcdac_dev *dev)
 {
 	/* Memory deallocation for devices and spi */
 	ad9144_remove(dev->ad9144_device);
-	ad9516_remove(dev->ad9516_device);
+	ad9516_remove(dev->ad9516_dev);
 
 	/* Memory deallocation for PHY and LINK layers */
 	adxcvr_remove(dev->ad9144_xcvr);
@@ -483,7 +490,6 @@ static void fmcdac_remove(struct fmcdac_dev *dev)
 	no_os_gpio_remove(dev->gpio_clkd_sync);
 	no_os_gpio_remove(dev->gpio_dac_reset);
 	no_os_gpio_remove(dev->gpio_dac_txen);
-	// fifo??????? l
 }
 
 int fmcdac_reconfig(struct ad9144_init_param *p_ad9144_param,
@@ -505,7 +511,7 @@ int fmcdac_reconfig(struct ad9144_init_param *p_ad9144_param,
     // TODO: look into the modification for how the clock is configured and for replacing ad9523
 	switch (mode) {
 	case '5':
-		printf("5 - DAC 2000 MSPS (2x interpolation)\n");
+		xil_printf("5 - DAC 2000 MSPS (2x interpolation)\n");
 		/* REF clock = 100 MHz */
 		//p_ad9516_param->channels[DAC_DEVICE_CLK].channel_divider = 10;
 		p_ad9144_param->pll_ref_frequency_khz = 100000;
@@ -587,24 +593,62 @@ static int fmcdac_setup(struct fmcdac_dev *dev,
 {
 	int status;
 
+	xil_printf("[SETUP] Starting FMCDAC setup...\n\r");
+
+	xil_printf("[SETUP] Initializing GPIO...\n\r");
 	status = fmcdac_gpio_init(dev);
-	if (status < 0)
+	if (status < 0) {
+		xil_printf("[ERROR] GPIO init failed: %d\n\r", status);
 		return status;
+	}
+	xil_printf("[SETUP] GPIO initialized successfully\n\r");
 
+	xil_printf("[SETUP] Initializing SPI...\n\r");
 	status = fmcdac_spi_init(dev_init);
-	if (status < 0)
+	if (status < 0) {
+		xil_printf("[ERROR] SPI init failed: %d\n\r", status);
 		return status;
+	}
+	xil_printf("[SETUP] SPI initialized successfully\n\r");
 
+	xil_printf("[SETUP] Initializing Clock (AD9516)...\n\r");
+	
+	// TEST: Try a simple SPI loopback/read test before initializing AD9516
+	xil_printf("[TEST] Testing SPI communication...\n\r");
+	struct no_os_spi_desc *test_spi;
+	uint8_t test_buffer[3] = {0x00, 0x00, 0x00};
+	int spi_test_ret = no_os_spi_init(&test_spi, &dev_init->ad9516_param.spi_init);
+	if (spi_test_ret == 0) {
+		xil_printf("[TEST] SPI initialized for test\n\r");
+		// Try reading from AD9516 PART ID (address 0x0003, with read bit = 0x8000)
+		test_buffer[0] = 0x80;  // High byte with read bit
+		test_buffer[1] = 0x03;  // Low byte of address
+		test_buffer[2] = 0x00;  // Dummy byte
+		spi_test_ret = no_os_spi_write_and_read(test_spi, test_buffer, 3);
+		xil_printf("[TEST] SPI read result: ret=%d, data=0x%02X 0x%02X 0x%02X\n\r", 
+			spi_test_ret, test_buffer[0], test_buffer[1], test_buffer[2]);
+		no_os_spi_remove(test_spi);
+	} else {
+		xil_printf("[TEST] SPI init failed: %d\n\r", spi_test_ret);
+	}
+	
 	status = fmcdac_clk_init(dev, dev_init);
-	if (status < 0)
+	if (status < 0) {
+		xil_printf("[ERROR] Clock init failed: %d\n\r", status);
 		return status;
+	}
+	xil_printf("[SETUP] Clock initialized successfully\n\r");
 
+	xil_printf("[SETUP] Initializing JESD204...\n\r");
 	status = fmcdac_jesd_init(dev_init);
-	if (status < 0)
+	if (status < 0) {
+		xil_printf("[ERROR] JESD init failed: %d\n\r", status);
 		return status;
+	}
+	xil_printf("[SETUP] JESD initialized successfully\n\r");
 
 	dev_init->ad9144_param.lane_rate_kbps = 10000000;
-	dev_init->ad9144_param.spi3wire = 1;
+	dev_init->ad9144_param.spi3wire = 0;  // Use 4-wire SPI (enables SDO for reads)
 #ifdef JESD_FSM_ON
 	dev_init->ad9144_param.num_converters =
 		fmcdac_init.jtx_link_rx.converters_per_device;
@@ -621,7 +665,7 @@ static int fmcdac_setup(struct fmcdac_dev *dev,
 	/* change the default JESD configurations, if required */
 	fmcdac_reconfig(&dev_init->ad9144_param,
 			 &dev_init->ad9144_xcvr_param,
-			 &dev_init->ad9516_param.ad9516_st.pdata);
+			 dev_init->ad9516_param.ad9516_st.pdata);
 
 	status = fmcdac_dac_init(&fmcdac, &fmcdac_init);
 	if (status < 0)
@@ -629,35 +673,42 @@ static int fmcdac_setup(struct fmcdac_dev *dev,
 
 	/* Reconfigure the default JESD configurations */
 
+	xil_printf("[SETUP] Configuring AD9516 clock distribution...\n\r");
 	/* setup clocks */
-	status = ad9516_setup(&dev->ad9516_device, dev_init->ad9516_param);
+	status = ad9516_setup(&dev->ad9516_dev, dev_init->ad9516_param);
 	if (status != 0) {
-		printf("error: ad9516_setup() failed\n");
+		xil_printf("[ERROR] ad9516_setup() failed with status: %d\n\r", status);
 		return status;
 	}
+	xil_printf("[SETUP] AD9516 configured successfully\n\r");
+
 	// Recommended DAC JESD204 link startup sequence
 	//   1. FPGA JESD204 Link Layer
 	//   2. FPGA JESD204 PHY Layer
 	//   3. DAC
 	//
 
-
-
-
+	xil_printf("[SETUP] Configuring JESD204 transceivers...\n\r");
 	status = fmcdac_trasnceiver_setup(&fmcdac, &fmcdac_init);
-	if (status != 0)
-		return status;
-
-#ifdef JESD_FSM_ON
-	status = ad9144_setup_jesd_fsm(&dev->ad9144_device, &dev_init->ad9144_param);
-	if (status) {
-		printf("error: ad9144_setup_jesd_fsm() failed\n");
+	if (status != 0) {
+		xil_printf("[ERROR] Transceiver setup failed: %d\n\r", status);
 		return status;
 	}
+	xil_printf("[SETUP] Transceivers configured successfully\n\r");
+
+#ifdef JESD_FSM_ON
+	xil_printf("[SETUP] Configuring AD9144 with JESD FSM...\n\r");
+	status = ad9144_setup_jesd_fsm(&dev->ad9144_device, &dev_init->ad9144_param);
+	if (status) {
+		xil_printf("error: ad9144_setup_jesd_fsm() failed\n");
+		return status;
+	}
+	xil_printf("[SETUP] AD9144 FSM setup completed\n\r");
 #else
+	xil_printf("[SETUP] Configuring AD9144 (legacy mode)...\n\r");
 	status = ad9144_setup_legacy(&dev->ad9144_device, &dev_init->ad9144_param);
 	if (status != 0) {
-		printf("error: ad9144_setup_legacy() failed\n");
+		xil_printf("error: ad9144_setup_legacy() failed\n");
 		return status;
 	}
 #endif
@@ -704,9 +755,11 @@ static int fmcdac_setup(struct fmcdac_dev *dev,
 
 	status = axi_dac_init(&dev->ad9144_core, &dev_init->ad9144_core_param);
 	if (status != 0) {
-		printf("axi_dac_init() error: %s\n", dev_init->ad9144_core_param.name);
+		xil_printf("[ERROR] axi_dac_init() failed: %s\n\r", dev_init->ad9144_core_param.name);
 		return status;
 	}
+	xil_printf("[SETUP] AXI DAC core initialized successfully\n\r");
+	xil_printf("[SETUP] FMCDAC setup completed successfully!\n\r");
 
 	return status;
 }
@@ -716,9 +769,21 @@ int main(void)
 	//unsigned int *data = (unsigned int *)ADC_DDR_BASEADDR;
 	int status;
 
+	/* Very first print to test UART - using xil_printf */
+	xil_printf("\n\n\r*** UART TEST - XIL_PRINTF ***\n\r");
+	xil_printf("*** Switching to xil_printf for all output ***\n\r");
+	
+	xil_printf("\n\r==============================================\n\r");
+	xil_printf("FMCDAC Application Started\n\r");
+	xil_printf("==============================================\n\r");
+
 	status = fmcdac_setup(&fmcdac, &fmcdac_init);
-	if (status < 0)
+	if (status < 0) {
+		xil_printf("[FATAL] fmcdac_setup failed with status: %d\n\r", status);
 		return status;
+	}
+
+	xil_printf("\n\r[MAIN] Setup completed successfully!\n\r");
 
 #ifdef JESD_FSM_ON
 	pr_info("Using JESD FSM.\n");
@@ -750,7 +815,9 @@ int main(void)
 	jesd204_fsm_start(topology_tx, JESD204_LINKS_ALL);
 #endif
 
+	xil_printf("\n\r[TEST] Starting FMCDAC tests...\n\r");
 	fmcdac_test(&fmcdac, &fmcdac_init);
+	xil_printf("[TEST] Tests completed\n\r");
 
 
 
@@ -825,6 +892,10 @@ int main(void)
 #endif
 
 	fmcdac_remove(&fmcdac);
+
+	xil_printf("\n\r==============================================\n\r");
+	xil_printf("FMCDAC Application Completed Successfully\n\r");
+	xil_printf("==============================================\n\r");
 
 	return 0;
 }

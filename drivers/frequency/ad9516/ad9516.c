@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <errno.h>
 #include "no_os_delay.h"
-#include "no_os_alloc.h"
 #include "ad9516.h"
 
 
@@ -24,7 +23,7 @@ int32_t ad9516_setup(struct ad9516_dev **device,
 		AD9516_REG_LVPECL_OUT5
 	};
 
-	dev = (struct ad9516_dev *)no_os_malloc(sizeof(*dev));
+	dev = (struct ad9516_dev *)malloc(sizeof(*dev));
 	if (!dev) {
 		printf("Memory allocation for 'dev' failed.\n");
 		return -1;
@@ -38,9 +37,37 @@ int32_t ad9516_setup(struct ad9516_dev **device,
 	// doesnot do anything, remove it 
 	if (ret) {
 		printf("SPI initialization failed with error code: %d\n", ret);
-		no_os_free(dev);
+		free(dev);
 		return ret;
 	}
+
+	printf("[AD9516] Enabling SDO (4-wire SPI mode) before reading PART ID...\n");
+	/* Enable SDO output (4-wire mode) - CRITICAL for AD9516 to drive MISO line */
+	/* AD9516 defaults to 3-wire mode with SDO disabled, causing 0xFF reads */
+	/* Write to register 0x000 (SERIAL_PORT_CONFIG) to enable SDO */
+	
+	/* Try multiple writes to ensure SDO gets enabled */
+	uint8_t sdo_enable_buffer[3];
+	
+	/* First attempt: Enable SDO + Long Instruction */
+	sdo_enable_buffer[0] = 0x00;  /* High byte of address 0x000 (write mode, bit 15=0) */
+	sdo_enable_buffer[1] = 0x00;  /* Low byte of address 0x000 */
+	sdo_enable_buffer[2] = 0x99;  /* Data: SDO_ACTIVE(0x81) + LONG_INSTRUCTION(0x18) = 0x99 */
+	
+	printf("[AD9516] Writing 0x%02X to register 0x0000 (enable SDO)...\n", sdo_enable_buffer[2]);
+	ret = no_os_spi_write_and_read(dev->spi_desc, sdo_enable_buffer, 3);
+	if (ret < 0) {
+		printf("[AD9516] SDO enable write returned error: %d (continuing anyway)\n", ret);
+	}
+	
+	/* Small delay to let SDO stabilize */
+	no_os_mdelay(10);
+	
+	/* Second write: Confirm SDO active without soft reset */
+	sdo_enable_buffer[2] = 0x81;  /* Just SDO_ACTIVE bit */
+	printf("[AD9516] Confirming SDO with value 0x%02X...\n", sdo_enable_buffer[2]);
+	ret = no_os_spi_write_and_read(dev->spi_desc, sdo_enable_buffer, 3);
+	no_os_mdelay(10);
 
 	printf("Reading PART ID from register address: 0x%X\n", AD9516_REG_PART_ID);
   
@@ -48,10 +75,29 @@ int32_t ad9516_setup(struct ad9516_dev **device,
 	ret = ad9516_read(dev, AD9516_REG_PART_ID, &reg_value);
 	if (ret) {
 		printf("Failed to read PART ID register. Error code: %d\n", ret);
+		printf("[AD9516] CRITICAL: SDO may still be disabled or hardware issue\n");
+		printf("[AD9516] Check: 1) AD9516 power rails, 2) SPI CS0 routing, 3) MISO connection\n");
 		return ret;
 	}
+	
+	printf("[AD9516] PART ID read successful: 0x%02X\n", reg_value);
+	
 	if (reg_value != dev->ad9516_type) {
 		printf("PART ID mismatch. Expected: 0x%X, Got: 0x%X\n", dev->ad9516_type, reg_value);
+		
+		if (reg_value == 0xFF) {
+			printf("[AD9516] ERROR: Still reading 0xFF - SDO not enabled or hardware fault\n");
+			printf("[AD9516] Possible causes:\n");
+			printf("  1. AD9516 not powered (check VDD pins with multimeter)\n");
+			printf("  2. CS0 not reaching AD9516 CS pin (probe with scope)\n");
+			printf("  3. MISO stuck high (check FMC level translator)\n");
+			printf("  4. Wrong chip variant on board (check silkscreen)\n");
+		} else if (reg_value == 0x00) {
+			printf("[AD9516] ERROR: Reading 0x00 - possible short or wrong device\n");
+		} else {
+			printf("[AD9516] ERROR: Unexpected part ID - wrong chip or variant\n");
+		}
+		
 		return -EFAULT;
 	}
 
@@ -195,7 +241,7 @@ int32_t ad9516_remove(struct ad9516_dev *dev)
 
 	ret = no_os_spi_remove(dev->spi_desc);
 
-	no_os_free(dev);
+	free(dev);
 
 	return ret;
 }

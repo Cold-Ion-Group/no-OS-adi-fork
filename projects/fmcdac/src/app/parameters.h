@@ -28,15 +28,6 @@
 #define TX_XCVR_BASEADDR			XPAR_AXI_AD9144_XCVR_BASEADDR
 #define TX_XCVR_HIGHADDR            XPAR_AXI_AD9144_XCVR_HIGHADDR
 
-#define TX_PLL_BASEADDR				AD9144_JESD204_LANE_PLL_RECONFIG_BASE
-
-
-
-#define TX_ADXCFG_0_BASEADDR			AVL_ADXCFG_0_RCFG_S0_BASE
-#define TX_ADXCFG_1_BASEADDR			AVL_ADXCFG_1_RCFG_S0_BASE
-#define TX_ADXCFG_2_BASEADDR			AVL_ADXCFG_2_RCFG_S0_BASE
-#define TX_ADXCFG_3_BASEADDR			AVL_ADXCFG_3_RCFG_S0_BASE
-
 
 #define SPI_BASEADDR				XPAR_AXI_SPI_BASEADDR
 #define SPI_HIGHADDR                XPAR_AXI_SPI_HIGHADDR
@@ -47,11 +38,12 @@
 
 // add the corresponding SPI links if required to debug. 
 
-#define GPIO_CLKD_SYNC			(GPIO_OFFSET + 20)
-#define GPIO_DAC_RESET			(GPIO_OFFSET + 19)
-#define GPIO_DAC_TXEN			(GPIO_OFFSET + 18)
 #define GPIO_DAC_CTRL_1			(GPIO_OFFSET + 22)
 #define GPIO_DAC_CTRL_0			(GPIO_OFFSET + 21)
+
+#define GPIO_DAC_TXEN			(GPIO_OFFSET + 41)
+#define GPIO_DAC_RESET			(GPIO_OFFSET + 40)
+#define GPIO_CLKD_SYNC			(GPIO_OFFSET + 38)
 
 // all clocks are differential, and only 4 outputs from the clocks are present. 
 enum ad9516_channels {

@@ -14,7 +14,6 @@ SRCS += $(PROJECT)/src/app/fmcdac.c \
         $(DRIVERS)/api/no_os_spi.c \
         $(DRIVERS)/api/no_os_gpio.c \
         $(NO-OS)/util/no_os_util.c \
-        $(NO-OS)/util/no_os_alloc.c \
         $(NO-OS)/jesd204/jesd204-core.c \
         $(NO-OS)/jesd204/jesd204-fsm.c
 
@@ -49,8 +48,3 @@ INCS += $(INCLUDE)/no_os_axi_io.h \
         $(INCLUDE)/jesd204.h \
         $(NO-OS)/jesd204/jesd204-priv.h \
         $(INCLUDE)/no_os_alloc.h
-
-# Clean step to remove build artifacts
-.PHONY: clean
-clean:
-	rm -rf build *.o *.elf *.bin *.map *.log

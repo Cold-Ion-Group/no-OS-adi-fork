@@ -1,8 +1,15 @@
-* text=auto
+* text=auto eol=lf
 
-*.c text
-*.cpp text
-*.h text
-*.txt text
-*.xml text
-Makefile text
+*.c text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.txt text eol=lf
+*.xml text eol=lf
+Makefile text eol=lf
+
+# Binary files (no conversion)
+*.bin binary
+*.elf binary
+*.hex binary
+*.bit binary
+*.pdf binary

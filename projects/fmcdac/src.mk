@@ -4,6 +4,7 @@
 
 SRCS += $(PROJECT)/src/app/fmcdac.c \
         $(DRIVERS)/frequency/ad9516/ad9516.c \
+        $(DRIVERS)/si5328/si5328drv.c \
         $(DRIVERS)/axi_core/axi_dac_core/axi_dac_core.c \
         $(DRIVERS)/axi_core/axi_dmac/axi_dmac.c \
         $(DRIVERS)/axi_core/clk_axi_clkgen/clk_axi_clkgen.c \
@@ -33,6 +34,7 @@ INCS += $(PROJECT)/src/app/app_config.h \
         $(DRIVERS)/io-expander/demux_spi.h \
         $(DRIVERS)/frequency/ad9516/ad9516.h \
         $(DRIVERS)/frequency/ad9516/ad9516_cfg.h \
+        $(DRIVERS)/si5328/si5328drv.h \
         $(DRIVERS)/dac/ad9144/ad9144.h
 
 INCS += $(PLATFORM_DRIVERS)/$(PLATFORM)_spi.h \

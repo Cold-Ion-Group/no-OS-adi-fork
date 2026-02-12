@@ -79,6 +79,7 @@ struct ad9144_jesd204_priv {
 #define AD9144_MOD_TYPE_COARSE4		(0x2 << 2)
 #define AD9144_MOD_TYPE_COARSE8		(0x3 << 2)
 #define AD9144_MOD_TYPE_MASK		(0x3 << 2)
+#define DACPLLT5_VCO_VAR(x)		((x) & 0x0F)
 
 /***************************************************************************//**
  * @brief ad9144_spi_read
@@ -150,6 +151,36 @@ int32_t ad9144_spi_check_status(struct ad9144_dev *dev,
 	return -1;
 }
 
+static int32_t ad9144_wait_dacpll_lock(struct ad9144_dev *dev,
+				       uint16_t timeout_ms,
+				       uint8_t *status_out)
+{
+	uint16_t timeout = 0;
+	uint8_t status = 0;
+
+	do {
+		ad9144_spi_read(dev, REG_DACPLLSTATUS, &status);
+		if (status & 0xC0) {
+			if (status_out)
+				*status_out = status;
+			return -1;
+		}
+		if ((status & (CP_CAL_VALID | RFPLL_LOCK)) ==
+		    (CP_CAL_VALID | RFPLL_LOCK)) {
+			if (status_out)
+				*status_out = status;
+			return 0;
+		}
+		timeout++;
+		no_os_mdelay(1);
+	} while (timeout < timeout_ms);
+
+	if (status_out)
+		*status_out = status;
+
+	return -1;
+}
+
 struct ad9144_reg_seq {
 	uint16_t reg;
 	uint16_t val;
@@ -166,7 +197,7 @@ int32_t ad9144_spi_write_seq(struct ad9144_dev *dev,
 		seq++;
 	}
 
-	return 0;
+	return ret;
 }
 
 /*
@@ -308,15 +339,18 @@ static int32_t ad9144_pll_setup(struct ad9144_dev *dev,
 				const struct ad9144_init_param *init_param)
 {
 	uint32_t fref, fdac;
+	uint32_t fref_in_khz;
 	uint32_t lo_div_mode;
 	uint32_t ref_div_mode = 0;
 	uint8_t vco_param[3];
 	uint32_t bcount;
 	uint32_t fvco;
+	uint8_t pll_status = 0;
 	int32_t ret;
 
 	fref = init_param->pll_ref_frequency_khz;
 	fdac = init_param->pll_dac_frequency_khz;
+	fref_in_khz = fref;
 
 	if (fref > 1000000 || fref < 35000)
 		return -1;
@@ -343,16 +377,24 @@ static int32_t ad9144_pll_setup(struct ad9144_dev *dev,
 		ref_div_mode++;
 	}
 
+	printf("[AD9144] pll_calc fref=%lu kHz fdac=%lu kHz ref_div_mode=%lu lo_div_mode=%lu\n",
+	       (unsigned long)fref_in_khz, (unsigned long)fdac,
+	       (unsigned long)ref_div_mode, (unsigned long)lo_div_mode);
+	printf("[AD9144] pll_calc ref_div=%lu pfd=%lu kHz bcount=%lu fvco=%lu kHz\n",
+	       (unsigned long)(1U << ref_div_mode),
+	       (unsigned long)(fref_in_khz / (1U << ref_div_mode)),
+	       (unsigned long)bcount, (unsigned long)fvco);
+
 	if (fvco < 6300000) {
-		vco_param[0] = 0x08;
+		vco_param[0] = DACPLLT5_VCO_VAR(0x8);
 		vco_param[1] = 0x03;
 		vco_param[2] = 0x07;
 	} else if (fvco < 7250000) {
-		vco_param[0] = 0x09;
+		vco_param[0] = DACPLLT5_VCO_VAR(0x9);
 		vco_param[1] = 0x03;
 		vco_param[2] = 0x06;
 	} else {
-		vco_param[0] = 0x09;
+		vco_param[0] = DACPLLT5_VCO_VAR(0x9);
 		vco_param[1] = 0x13;
 		vco_param[2] = 0x06;
 	}
@@ -368,11 +410,72 @@ static int32_t ad9144_pll_setup(struct ad9144_dev *dev,
 	ad9144_spi_write(dev, REG_DACPLLTB, vco_param[1]);
 	ad9144_spi_write(dev, REG_DACPLLT18, vco_param[2]);
 
-	ad9144_spi_write(dev, REG_DACPLLCNTRL, 0x10);
+	{
+		uint8_t rb = 0;
+		uint8_t rb_alt = 0;
+		ad9144_spi_read(dev, REG_DACLOGENCNTRL, &rb);
+		printf("[AD9144] LO_DIV (0x08B)=0x%02X\n", rb);
+		ad9144_spi_read(dev, REG_DACLDOCNTRL1, &rb);
+		printf("[AD9144] REF_DIV (0x08C)=0x%02X\n", rb);
+		ad9144_spi_read(dev, REG_DACINTEGERWORD0, &rb);
+		printf("[AD9144] BCOUNT (0x085)=0x%02X\n", rb);
+		ad9144_spi_write(dev, REG_DACPLLT5, DACPLLT5_VCO_VAR(0x8));
+		ad9144_spi_read(dev, REG_DACPLLT5, &rb_alt);
+		ad9144_spi_write(dev, REG_DACPLLT5, vco_param[0]);
+		ad9144_spi_read(dev, REG_DACPLLT5, &rb);
+		printf("[AD9144] DACPLLT5 (0x1B5)=0x%02X (test 0x%02X -> 0x%02X)\n",
+		       rb, DACPLLT5_VCO_VAR(0x8), rb_alt);
+		ad9144_spi_read(dev, REG_DACPLLTB, &rb);
+		printf("[AD9144] DACPLLTB (0x1BB)=0x%02X\n", rb);
+		ad9144_spi_read(dev, REG_DACPLLT18, &rb);
+		printf("[AD9144] DACPLLT18 (0x1C5)=0x%02X\n", rb);
+	}
 
-	ret = ad9144_spi_check_status(dev, REG_DACPLLSTATUS, 0x22, 0x22);
-	if (ret == -1)
-		printf("%s : DAC PLL NOT locked!.\n", __func__);
+	/* Enable DAC PLL and give it a brief settling time before polling */
+	ad9144_spi_write(dev, REG_DACPLLCNTRL, 0x10);
+	no_os_mdelay(5);
+	{
+		uint8_t st = 0;
+		uint8_t i;
+		for (i = 0; i < 5; i++) {
+			ad9144_spi_read(dev, REG_DACPLLSTATUS, &st);
+			printf("[AD9144] DACPLLSTATUS (0x084)=0x%02X\n", st);
+			no_os_mdelay(1);
+		}
+		ad9144_spi_read(dev, REG_DACPLLCNTRL, &st);
+		printf("[AD9144] DACPLLCNTRL (0x083)=0x%02X\n", st);
+		ad9144_spi_read(dev, REG_PLL_STATUS, &st);
+		printf("[AD9144] PLL_STATUS (0x281)=0x%02X\n", st);
+	}
+
+	ret = ad9144_wait_dacpll_lock(dev, 100, &pll_status);
+	if (ret == -1) {
+		uint8_t ldiv = 0, refdiv = 0, bcnt = 0, pll_cntrl = 0;
+		ad9144_spi_read(dev, REG_DACLOGENCNTRL, &ldiv);
+		ad9144_spi_read(dev, REG_DACLDOCNTRL1, &refdiv);
+		ad9144_spi_read(dev, REG_DACINTEGERWORD0, &bcnt);
+		ad9144_spi_read(dev, REG_DACPLLCNTRL, &pll_cntrl);
+		printf("%s : DAC PLL NOT locked! status=0x%02X (cal_valid=%u lock=%u lock_alt=%u over_lo=%u over_hi=%u) lo_div=0x%02X ref_div=0x%02X bcount=0x%02X ctrl=0x%02X\n",
+		       __func__, pll_status, !!(pll_status & 0x20),
+		       !!(pll_status & 0x02), !!(pll_status & 0x10),
+		       !!(pll_status & 0x40),
+		       !!(pll_status & 0x80), ldiv, refdiv, bcnt, pll_cntrl);
+		if (pll_status & 0xC0) {
+			/* If calibration hit band edge, try a re-calibration */
+			ad9144_spi_write(dev, REG_DACPLLCNTRL, 0x10);
+			no_os_mdelay(1);
+			ad9144_spi_write(dev, REG_DACPLLCNTRL, 0x90);
+			no_os_mdelay(5);
+			ret = ad9144_wait_dacpll_lock(dev, 100, &pll_status);
+			if (ret == -1) {
+				printf("%s : DAC PLL re-cal failed, status=0x%02X (cal_valid=%u lock=%u lock_alt=%u over_lo=%u over_hi=%u)\n",
+				       __func__, pll_status, !!(pll_status & 0x20),
+				       !!(pll_status & 0x02), !!(pll_status & 0x10),
+				       !!(pll_status & 0x40), !!(pll_status & 0x80));
+			}
+		}
+
+	}
 
 	return ret;
 }
@@ -613,15 +716,15 @@ static int ad9144_setup_pll(struct ad9144_dev *dev)
 	}
 
 	if (fvco < 6300000) {
-		vco_param[0] = 0x8;
+		vco_param[0] = DACPLLT5_VCO_VAR(0x8);
 		vco_param[1] = 0x3;
 		vco_param[2] = 0x7;
 	} else if (fvco < 7250000) {
-		vco_param[0] = 0x9;
+		vco_param[0] = DACPLLT5_VCO_VAR(0x9);
 		vco_param[1] = 0x3;
 		vco_param[2] = 0x6;
 	} else {
-		vco_param[0] = 0x9;
+		vco_param[0] = DACPLLT5_VCO_VAR(0x9);
 		vco_param[1] = 0x13;
 		vco_param[2] = 0x6;
 	}
@@ -1023,8 +1126,11 @@ int32_t ad9144_setup_legacy(struct ad9144_dev **device,
 	ad9144_spi_write_seq(dev, ad9144_optimal_serdes_settings,
 			     NO_OS_ARRAY_SIZE(ad9144_optimal_serdes_settings));
 
-	if (init_param->pll_enable)
-		ad9144_pll_setup(dev, init_param);
+	if (init_param->pll_enable) {
+		ret = ad9144_pll_setup(dev, init_param);
+		if (ret)
+			return ret;
+	}
 
 	// digital data path
 
@@ -1089,14 +1195,35 @@ int32_t ad9144_setup_legacy(struct ad9144_dev **device,
 	no_os_mdelay(20);
 
 	ret = ad9144_spi_check_status(dev, REG_PLL_STATUS, 0x01, 0x01);
-	if (ret == -1)
-		printf("%s : PLL NOT locked!.\n", __func__);
+	if (ret == -1) {
+		printf("%s : SERDES PLL NOT locked!.\n", __func__);
+		printf("SERDES PLL lock is CRITICAL for CDR operation and JESD204B link.\n");
+		printf("Without SERDES PLL lock, CDR cannot recover clock from incoming data.\n");
+		printf("Check: 1) Reference clock input (245.76 MHz)\n");
+		printf("       2) REG_REF_CLK_DIVIDER_LDO (0x289) programming\n");
+		printf("       3) REG_SYNTH_ENABLE_CNTRL (0x280) = 0x05 for calibration\n");
+		printf("       4) Lane rate compatibility with SERDES PLL range\n");
+		return -1;  // FAIL EARLY - link cannot work without SERDES PLL
+	}
+
+	if (init_param->pll_enable) {
+		ret = ad9144_wait_dacpll_lock(dev, 100, NULL);
+		if (ret == -1) {
+			printf("%s : DAC PLL NOT locked!.\n", __func__);
+			printf("DAC PLL generates sample clock from reference.\n");
+			printf("Check: 1) Reference clock frequency matches pll_ref_frequency_khz\n");
+			printf("       2) PLL divider settings for target DAC frequency\n");
+			// Note: DAC PLL failure is less critical than SERDES PLL for link sync
+			// Continue anyway to allow debugging, but link may still fail
+		}
+	}
 
 	ad9144_spi_write(dev, REG_EQ_BIAS_REG, 0x62);	// equalizer
 
 	// data link layer
 
-	ad9144_spi_write(dev, REG_GENERAL_JRX_CTRL_1, 0x01);	// subclass-1
+	ad9144_spi_write(dev, REG_GENERAL_JRX_CTRL_1,
+			 init_param->jesd204_subclass ? 0x01 : 0x00);
 	ad9144_spi_write(dev, REG_LMFC_DELAY_0, 0x00);	// lmfc delay
 	ad9144_spi_write(dev, REG_LMFC_DELAY_1, 0x00);	// lmfc delay
 	ad9144_spi_write(dev, REG_LMFC_VAR_0, 0x0a);	// receive buffer delay
@@ -1104,6 +1231,12 @@ int32_t ad9144_setup_legacy(struct ad9144_dev **device,
 	ad9144_spi_write(dev, REG_SYNC_CTRL, 0x01);	// sync-oneshot mode
 	ad9144_spi_write(dev, REG_SYNC_CTRL, 0x81);	// sync-enable
 	ad9144_spi_write(dev, REG_SYNC_CTRL, 0xc1);	// sysref-armed
+	
+	/* DEBUG: Print lane_mux values before XBAR programming */
+	printf("[AD9144][XBAR-DEBUG] init_param->lane_mux[] = {%d, %d, %d, %d, %d, %d, %d, %d}\n",
+	       init_param->lane_mux[0], init_param->lane_mux[1], init_param->lane_mux[2], init_param->lane_mux[3],
+	       init_param->lane_mux[4], init_param->lane_mux[5], init_param->lane_mux[6], init_param->lane_mux[7]);
+	
 	ad9144_spi_write(dev, REG_XBAR(0),
 			 SRC_LANE0(init_param->lane_mux[0]) |
 			 SRC_LANE1(init_param->lane_mux[1]));
@@ -1116,6 +1249,40 @@ int32_t ad9144_setup_legacy(struct ad9144_dev **device,
 	ad9144_spi_write(dev, REG_XBAR(3),
 			 SRC_LANE6(init_param->lane_mux[6]) |
 			 SRC_LANE7(init_param->lane_mux[7]));
+
+	/* Verify lane crossbar programming */
+	uint8_t xbar_rb[4];
+	ad9144_spi_read(dev, REG_XBAR(0), &xbar_rb[0]);
+	ad9144_spi_read(dev, REG_XBAR(1), &xbar_rb[1]);
+	ad9144_spi_read(dev, REG_XBAR(2), &xbar_rb[2]);
+	ad9144_spi_read(dev, REG_XBAR(3), &xbar_rb[3]);
+	uint8_t xbar_exp[4] = {
+		SRC_LANE0(init_param->lane_mux[0]) | SRC_LANE1(init_param->lane_mux[1]),
+		SRC_LANE2(init_param->lane_mux[2]) | SRC_LANE3(init_param->lane_mux[3]),
+		SRC_LANE4(init_param->lane_mux[4]) | SRC_LANE5(init_param->lane_mux[5]),
+		SRC_LANE6(init_param->lane_mux[6]) | SRC_LANE7(init_param->lane_mux[7])
+	};
+	printf("[AD9144] Lane XBAR: wrote [0x%02X 0x%02X 0x%02X 0x%02X], readback [0x%02X 0x%02X 0x%02X 0x%02X]\n",
+	       xbar_exp[0], xbar_exp[1], xbar_exp[2], xbar_exp[3],
+	       xbar_rb[0], xbar_rb[1], xbar_rb[2], xbar_rb[3]);
+	if (xbar_rb[0] != xbar_exp[0] || xbar_rb[1] != xbar_exp[1]) {
+		printf("[AD9144] *** WARNING: XBAR mismatch may cause ILAS checksum errors! ***\n");
+		printf("[AD9144] Expected lane mapping: L0->%u L1->%u L2->%u L3->%u\n",
+		       init_param->lane_mux[0], init_param->lane_mux[1],
+		       init_param->lane_mux[2], init_param->lane_mux[3]);
+		printf("[AD9144] Actual lane mapping: L0->%u L1->%u L2->%u L3->%u\n",
+		       xbar_rb[0] & 0x7, (xbar_rb[0] >> 4) & 0x7,
+		       xbar_rb[1] & 0x7, (xbar_rb[1] >> 4) & 0x7);
+	}
+
+	/* Lane polarity inversion (0x334): bit[n] = 1 inverts lane n
+	 * Try inverting lane 2 if frame sync fails on that lane.
+	 * Set init_param->lane_invert_mask or use default 0x00.
+	 */
+	uint8_t lane_invert = init_param->lane_invert_mask;
+	ad9144_spi_write(dev, REG_JESD_BIT_INVERSE_CTRL, lane_invert);
+	printf("[AD9144] Lane polarity invert (0x334) = 0x%02X\n", lane_invert);
+
 	ad9144_spi_write(dev, REG_GENERAL_JRX_CTRL_0, 0x01);	// enable link
 
 	// dac calibration
@@ -1287,36 +1454,137 @@ int32_t ad9144_status(struct ad9144_dev *dev)
 int32_t ad9144_short_pattern_test(struct ad9144_dev *dev,
 				  const struct ad9144_init_param *init_param)
 {
-
 	uint32_t dac = 0;
 	uint32_t sample = 0;
-	int32_t ret = 0;
+	int32_t errors = 0;
+	uint8_t ctrl;
+	uint8_t fail_before = 0;
+	uint8_t fail_after = 0;
 
 	for (dac = 0; dac < dev->num_converters; dac++) {
 		for (sample = 0; sample < 4; sample++) {
-			ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0,
-					 ((sample << 4) | (dac << 2) | 0x00));
-			ad9144_spi_write(dev, REG_SHORT_TPL_TEST_2,
-					 (init_param->stpl_samples[dac][sample]>>8));
-			ad9144_spi_write(dev, REG_SHORT_TPL_TEST_1,
-					 (init_param->stpl_samples[dac][sample]>>0));
-			ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0,
-					 ((sample << 4) | (dac << 2) | 0x01));
-			ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0,
-					 ((sample << 4) | (dac << 2) | 0x03));
-			ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0,
-					 ((sample << 4) | (dac << 2) | 0x01));
+			/* DATASHEET-COMPLIANT SEQUENCE:
+			 * 1. Set converter/sample select
+			 * 2. Program expected sample
+			 * 3. Enable STPL
+			 * 4. Toggle reset (0→1→0) while enabled
+			 * 5. Read fail flag
+			 */
+			ctrl = SHORT_TPL_SP_SEL(sample) | SHORT_TPL_M_SEL(dac);
 
-			ret = ad9144_spi_check_status(dev,
-						      REG_SHORT_TPL_TEST_3,
-						      0x01, 0x00);
-			if (ret == -1)
-				printf("%s : short-pattern-test mismatch (%#06lx, %#06lx, %#06lx)!.\n",
-				       __func__, dac, sample,
-				       init_param->stpl_samples[dac][sample]);
+			/* Step 1: Set DAC and sample select (en=0, rst=0) */
+			ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0, ctrl);
+
+			/* Step 2: Program expected pattern (MSB then LSB) */
+			ad9144_spi_write(dev, REG_SHORT_TPL_TEST_2,
+					 (init_param->stpl_samples[dac][sample] >> 8));
+			ad9144_spi_write(dev, REG_SHORT_TPL_TEST_1,
+					 (init_param->stpl_samples[dac][sample] >> 0));
+
+			/* Verify STPL register writes */
+			{
+				uint8_t rb_ctrl, rb_lsb, rb_msb, rb_fail;
+				ad9144_spi_read(dev, REG_SHORT_TPL_TEST_0, &rb_ctrl);
+				ad9144_spi_read(dev, REG_SHORT_TPL_TEST_1, &rb_lsb);
+				ad9144_spi_read(dev, REG_SHORT_TPL_TEST_2, &rb_msb);
+				ad9144_spi_read(dev, REG_SHORT_TPL_TEST_3, &rb_fail);
+				if ((rb_ctrl != ctrl) || (rb_lsb != (init_param->stpl_samples[dac][sample] & 0xFF)) ||
+				    (rb_msb != (init_param->stpl_samples[dac][sample] >> 8))) {
+					printf("[STPL-RB] dac%lu.s%lu MISMATCH: ctrl=0x%02X(exp=0x%02X) pat=0x%02X%02X(exp=0x%04X) fail=0x%02X\n",
+					       (unsigned long)dac, (unsigned long)sample,
+					       rb_ctrl, ctrl, rb_msb, rb_lsb,
+					       init_param->stpl_samples[dac][sample], rb_fail);
+				}
+			}
+
+			/* Step 3: Enable STPL test (en=1, rst=0) */
+			ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0,
+					 ctrl | SHORT_TPL_TEST_EN);
+			no_os_mdelay(1); /* Brief settling before reset pulse */
+
+			/* Step 4: Pulse reset while enabled (en=1, rst=1→0) */
+			ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0,
+					 ctrl | SHORT_TPL_TEST_EN | SHORT_TPL_TEST_RESET);
+			no_os_mdelay(1);
+			ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0,
+					 ctrl | SHORT_TPL_TEST_EN);
+
+			/* Step 5: Wait for comparison to complete */
+			no_os_mdelay(10);
+
+			/* Step 6: Read fail flag */
+			ad9144_spi_read(dev, REG_SHORT_TPL_TEST_3, &fail_after);
+			fail_before = 0; /* Not used in corrected sequence */
+
+			/* Step 7: Disable test (en=0, rst=0) */
+			ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0, ctrl);
+
+			if (fail_after & SHORT_TPL_FAIL) {
+				printf("%s : STPL FAIL dac=%lu sample=%lu "
+				       "expected=0x%04lx fail=0x%02x\n",
+				       __func__,
+				       (unsigned long)dac, (unsigned long)sample,
+				       (unsigned long)init_param->stpl_samples[dac][sample],
+				       fail_after);
+
+				/* Binary probe: try well-known values to find what AD9144 actually receives */
+				{
+					static const uint16_t probes[] = {
+						0x0000, 0xFFFF, 0x5555, 0xAAAA,
+						0x1234, 0x8000, 0x0001, 0x7FFF,
+						/* Also try the expected values from the other DAC/sample */
+						0xA1A0, 0xB1B0, 0xC1C0, 0xD1D0,
+						/* Byte-swapped variants */
+						0xA0A1, 0xB0B1, 0xC0C1, 0xD0D1,
+						/* Single-byte patterns */
+						0x00FF, 0xFF00, 0x0F0F, 0xF0F0
+					};
+					uint32_t pi;
+					uint8_t pf;
+					int found_match = 0;
+					for (pi = 0; pi < sizeof(probes)/sizeof(probes[0]); pi++) {
+						ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0, ctrl);
+						ad9144_spi_write(dev, REG_SHORT_TPL_TEST_2,
+								 (probes[pi] >> 8));
+						ad9144_spi_write(dev, REG_SHORT_TPL_TEST_1,
+								 (probes[pi] >> 0));
+						ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0,
+								 ctrl | SHORT_TPL_TEST_EN);
+						no_os_mdelay(1);
+						ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0,
+								 ctrl | SHORT_TPL_TEST_EN | SHORT_TPL_TEST_RESET);
+						no_os_mdelay(1);
+						ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0,
+								 ctrl | SHORT_TPL_TEST_EN);
+						no_os_mdelay(10);
+						ad9144_spi_read(dev, REG_SHORT_TPL_TEST_3, &pf);
+						ad9144_spi_write(dev, REG_SHORT_TPL_TEST_0, ctrl);
+						if (!(pf & SHORT_TPL_FAIL)) {
+							printf("         PROBE MATCH: dac%lu.s%lu "
+							       "AD9144 receives 0x%04X\n",
+							       (unsigned long)dac,
+							       (unsigned long)sample,
+							       probes[pi]);
+							found_match = 1;
+						}
+					}
+					if (!found_match) {
+						printf("         PROBE: no match from %lu candidates "
+						       "(data may be non-static or link unstable)\n",
+						       (unsigned long)(sizeof(probes)/sizeof(probes[0])));
+					}
+				}
+				errors++;
+			} else {
+				printf("%s : STPL PASS dac=%lu sample=%lu "
+				       "value=0x%04lx\n",
+				       __func__,
+				       (unsigned long)dac, (unsigned long)sample,
+				       (unsigned long)init_param->stpl_samples[dac][sample]);
+			}
 		}
 	}
-	return 0;
+	return errors ? -errors : 0;
 }
 
 /***************************************************************************//**
@@ -1355,4 +1623,3 @@ int32_t ad9144_datapath_prbs_test(struct ad9144_dev *dev,
 
 	return ret;
 }
-

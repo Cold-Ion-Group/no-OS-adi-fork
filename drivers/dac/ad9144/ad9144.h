@@ -1362,6 +1362,7 @@ struct ad9144_init_param {
 	uint8_t		jesd204_subclass;
 	uint8_t		jesd204_scrambling;
 	uint8_t		lane_mux[8];
+	uint8_t		lane_invert_mask;  /* Per-lane polarity inversion: bit[n]=1 inverts lane n */
 
 	/* Whether to enable the internal DAC PLL (0=disable, 1=enable) */
 	uint8_t		pll_enable;

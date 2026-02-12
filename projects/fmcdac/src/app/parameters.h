@@ -52,4 +52,26 @@ enum ad9516_channels {
     DAC_FPGA_CLK,        // Output 9: Clock from the FPGA
     DAC_FPGA_SYSREF      // Output 7: System reference clock for the FPGA
 };
+
+/* AD9516 output indices for each role (OUT0..OUT9) */
+#define AD9516_OUT_DAC_CLK	1
+#define AD9516_OUT_DAC_SYSREF	6
+#define AD9516_OUT_FPGA_CLK	9
+#define AD9516_OUT_FPGA_SYSREF	7
+
+/* KCU116 I2C mux + Si5328 settings */
+#if defined(XPAR_AXI_IIC_MAIN_DEVICE_ID)
+#define I2C_DEVICE_ID			XPAR_AXI_IIC_MAIN_DEVICE_ID
+#elif defined(XPAR_AXI_IIC_0_DEVICE_ID)
+#define I2C_DEVICE_ID			XPAR_AXI_IIC_0_DEVICE_ID
+#else
+#error "I2C device ID not defined in xparameters.h"
+#endif
+
+#define I2C_MUX_ADDRESS			0x74
+#define I2C_MUX_SI5328_CHANNEL		0x10
+#define SI5328_I2C_ADDRESS		0x69
+#define SI5328_CLKIN_FREQ_HZ		114285000U
+#define SI5328_CLKOUT_FREQ_HZ		245760000U
+#define SI5328_LOCK_TIMEOUT_MS		30000U
 #endif

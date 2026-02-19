@@ -20,6 +20,16 @@
 #include "axi_jesd204_tx.h"
 #include "si5328drv.h"
 
+/* Stringify NO_OS_VERSION — the Makefile's -D quotes may not survive
+ * the Windows shell, so we force stringification here. */
+#define _XSTR(x) #x
+#define _STR(x)  _XSTR(x)
+#ifdef NO_OS_VERSION
+#define BUILD_VERSION_STR _STR(NO_OS_VERSION)
+#else
+#define BUILD_VERSION_STR "unknown"
+#endif
+
 // no IIO support included for now
 
 #ifdef JESD_FSM_ON
@@ -2626,6 +2636,43 @@ static int fmcdac_setup(struct fmcdac_dev *dev,
 	return status;
 }
 
+/**
+ * @brief Print consolidated boot banner with build version and configuration.
+ *
+ * Prints all critical configuration constants at startup so every UART log
+ * is self-describing and can be compared against manifest.json.
+ */
+static void print_boot_banner(void)
+{
+	/* Build identification */
+	xil_printf("[BANNER] Build: %s  %s %s\n\r",
+		   BUILD_VERSION_STR, __DATE__, __TIME__);
+
+	/* JESD link parameters */
+	xil_printf("[BANNER] JESD: subclass=%d  lane_rate=9830400 kbps"
+		   "  ref=122880 kHz  DAC=983040 kHz\n\r",
+		   1 /* jesd204_subclass */);
+
+	/* Clock source */
+	const char *clk_src;
+	switch (g_clk_mode) {
+	case FMCDAC_CLK_DISTRIBUTE: clk_src = "AD9516 distribute"; break;
+	case FMCDAC_CLK_SYNTHESIZE: clk_src = "AD9516 synthesize"; break;
+	case FMCDAC_CLK_EXTERNAL:   clk_src = "external bypass";   break;
+	default:                    clk_src = "unknown";            break;
+	}
+	xil_printf("[BANNER] Clock: %s  out_clk_sel=OUTCLK_PMA  PLL=%s\n\r",
+		   clk_src, g_pll_lock_only ? "lock-test" : "on");
+
+	/* Lane crossbar and polarity */
+	xil_printf("[BANNER] Lanes: mux={4,5,6,7,0,1,2,3}"
+		   "  polarity_invert=0x04  scrambling=1\n\r");
+
+	/* JESD204B transport layer */
+	xil_printf("[BANNER] DAC: M=2 L=4 F=1 S=1 HD=1"
+		   " N=16 N'=16 K=32\n\r");
+}
+
 int main(void)
 {
 	//unsigned int *data = (unsigned int *)ADC_DDR_BASEADDR;
@@ -2638,6 +2685,7 @@ int main(void)
 	xil_printf("\n\r==============================================\n\r");
 	xil_printf("FMCDAC Application Started\n\r");
 	xil_printf("==============================================\n\r");
+	print_boot_banner();
 
 	status = fmcdac_setup(&fmcdac, &fmcdac_init);
 	if (status < 0) {

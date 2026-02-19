@@ -1,0 +1,51 @@
+﻿{
+    "project":  "fmcdac_kcu116",
+    "created":  "2026-02-19T21:25:50+08:00",
+    "firmware":  {
+                     "repo":  "Cold-Ion-Group/no-OS-adi-fork",
+                     "branch":  "tmp-dump",
+                     "commit":  "26fd0f30b424a700703bff6d85df60fba3f8cfc5",
+                     "describe":  "heads/tmp-dump-0-g26fd0f30b-modified",
+                     "dirty":  true
+                 },
+    "hdl":  {
+                "file":  "system_top.xsa",
+                "sha256":  "39f6ca62a748b56a2ccda1e7c07b28785b62e447b406c9c1ccb5dd422b39f43a"
+            },
+    "submodules":  {
+                       "libraries/mbedtls":  "f8c01a1a386de1129cf377d4a4d3246da4b0d41f",
+                       "libraries/mqtt/paho.mqtt.embedded-c":  "29ab2aa29c5e47794284376d7f8386cfd54c3eed",
+                       "libraries/iio/libtinyiiod":  "440e4252f9e57340eda5d4741299d77093af7a72"
+                   },
+    "build_config":  {
+                         "jesd_subclass":  1,
+                         "jesd_mode":  4,
+                         "lane_rate_kbps":  9830400,
+                         "dac_freq_khz":  983040,
+                         "ref_freq_khz":  122880,
+                         "interpolation":  1,
+                         "scrambling":  1,
+                         "num_converters":  2,
+                         "num_lanes":  4,
+                         "octets_per_frame":  1,
+                         "frames_per_multiframe":  32,
+                         "bits_per_sample":  16,
+                         "high_density":  1,
+                         "lane_mux":  [
+                                          4,
+                                          5,
+                                          6,
+                                          7,
+                                          0,
+                                          1,
+                                          2,
+                                          3
+                                      ],
+                         "lane_polarity_invert":  "0x04"
+                     },
+    "toolchain":  {
+                      "vivado":  "2023.2",
+                      "vitis":  "not found",
+                      "mb_gcc":  "microblaze-xilinx-elf-gcc.exe (GCC) 12.2.0"
+                  }
+}

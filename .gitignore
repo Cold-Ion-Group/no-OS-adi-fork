@@ -32,6 +32,7 @@ local_variables.mk
 *.clk
 *.stp
 *.json
+!projects/fmcdac/manifest.json
 *.analytics
 /garbage_dump/
 /projects/*/.log/

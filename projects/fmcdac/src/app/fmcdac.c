@@ -128,6 +128,9 @@ static void fmcdac_hold_for_probe(const char *reason);
 static void fmcdac_ad9516_signature_toggle(struct fmcdac_dev *dev);
 static void fmcdac_ad9144_jesd_sanity(struct ad9144_dev *dev,
 				      const struct ad9144_init_param *init_param);
+static void fmcdac_sysref_verify(struct fmcdac_dev *dev);
+static void fmcdac_latency_readback(struct fmcdac_dev *dev);
+static int fmcdac_phy_prbs_test(struct fmcdac_dev *dev);
 static void fmcdac_flush_input(void);
 
 static int fmcdac_gpio_init(struct fmcdac_dev *dev)
@@ -618,8 +621,28 @@ static int fmcdac_ad9516_program_outputs(struct fmcdac_dev *dev,
 	if (g_pll_lock_only)
 		fpga_ref_khz = dac_ref_khz;
 
-	/* Use SYSREF = dac_ref / 8 (e.g., 49.152 MHz -> 6.144 MHz). */
-	sysref_khz = dac_ref_khz / 8;
+	/*
+	 * SYSREF frequency = fDAC / (K * S)
+	 * For Mode 4: K=32, S=1  =>  983040 / 32 = 30720 kHz (30.72 MHz)
+	 * Use actual DAC sample rate as fDAC source.
+	 */
+	{
+		uint32_t K = dev_init->ad9144_jesd_param.frames_per_multiframe;
+		uint32_t S = 1; /* samples_per_converter_per_frame for Mode 4 */
+		uint32_t fdac_khz;
+
+		if (dev_init->ad9144_param.pll_enable &&
+		    dev_init->ad9144_param.pll_dac_frequency_khz)
+			fdac_khz = dev_init->ad9144_param.pll_dac_frequency_khz;
+		else
+			fdac_khz = dac_ref_khz;
+
+		if (K == 0) K = 32; /* safety fallback */
+		sysref_khz = fdac_khz / (K * S);
+		xil_printf("[AD9516] SYSREF: fDAC=%lu kHz  K=%lu  S=%lu  =>  sysref=%lu kHz\n\r",
+			   (unsigned long)fdac_khz, (unsigned long)K,
+			   (unsigned long)S, (unsigned long)sysref_khz);
+	}
 
 	if (dev->ad9516_dev->ad9516_st.pdata->ref_sel_pin_en)
 		ref_freq_hz = dev->ad9516_dev->ad9516_st.pdata->ref_sel_pin ?
@@ -745,8 +768,10 @@ static int fmcdac_ad9516_program_outputs(struct fmcdac_dev *dev,
 			   (unsigned long)!!(div4_3 & AD9516_BYPASS_DIVIDER_1),
 			   (unsigned long)!!(div4_3 & AD9516_BYPASS_DIVIDER_2));
 
-		/* Force divider bypass for pass-through at 122.88 MHz.
-		 * Without bypass, default ÷4 gives 30.72 MHz — QPLL can't lock. */
+		/* Force divider bypass for FPGA REFCLK at 122.88 MHz.
+		 * DIV4 (OUT8/9) needs bypass so QPLL gets 122.88 MHz.
+		 * DIV3 (OUT6/7) must NOT be bypassed — ad9516_frequency()
+		 * sets SYSREF dividers for 30.72 MHz target. */
 		uint32_t byp_mask = AD9516_BYPASS_DIVIDER_1 | AD9516_BYPASS_DIVIDER_2;
 
 		if ((div4_3 & byp_mask) != byp_mask) {
@@ -755,19 +780,20 @@ static int fmcdac_ad9516_program_outputs(struct fmcdac_dev *dev,
 			xil_printf("[AD9516] DIV4 (OUT8/9) FORCED BYPASS (0x%02lX -> 0x%02lX)\n\r",
 				   (unsigned long)div4_3, (unsigned long)new_div4);
 		}
-		if ((div3_3 & byp_mask) != byp_mask) {
-			uint32_t new_div3 = div3_3 | byp_mask;
-			ad9516_write(dev->ad9516_dev, AD9516_REG_LVDS_CMOS_DIVIDER_3_3, new_div3);
-			xil_printf("[AD9516] DIV3 (OUT6/7) FORCED BYPASS (0x%02lX -> 0x%02lX)\n\r",
-				   (unsigned long)div3_3, (unsigned long)new_div3);
-		}
+		/* DIV3 (OUT6/7 SYSREF): leave as programmed by ad9516_frequency() */
+		xil_printf("[AD9516] DIV3 (OUT6/7) using frequency-driver dividers (no force bypass)\n\r");
 
 		ad9516_update(dev->ad9516_dev);
 		no_os_mdelay(10);
 
-		/* Verify after bypass */
+		/* Verify final divider state for both groups */
+		ad9516_read(dev->ad9516_dev, AD9516_REG_LVDS_CMOS_DIVIDER_3_3, &div3_3);
 		ad9516_read(dev->ad9516_dev, AD9516_REG_LVDS_CMOS_DIVIDER_4_3, &div4_3);
-		xil_printf("[AD9516] DIV4 after fix=0x%02lX (byp1=%lu byp2=%lu)\n\r",
+		xil_printf("[AD9516] FINAL DIV3 (OUT6/7)=0x%02lX (byp1=%lu byp2=%lu)\n\r",
+			   (unsigned long)div3_3,
+			   (unsigned long)!!(div3_3 & AD9516_BYPASS_DIVIDER_1),
+			   (unsigned long)!!(div3_3 & AD9516_BYPASS_DIVIDER_2));
+		xil_printf("[AD9516] FINAL DIV4 (OUT8/9)=0x%02lX (byp1=%lu byp2=%lu)\n\r",
 			   (unsigned long)div4_3,
 			   (unsigned long)!!(div4_3 & AD9516_BYPASS_DIVIDER_1),
 			   (unsigned long)!!(div4_3 & AD9516_BYPASS_DIVIDER_2));
@@ -1142,6 +1168,173 @@ static void fmcdac_ad9144_jesd_sanity(struct ad9144_dev *dev,
 		   cdr, plldiv, pll_status);
 }
 
+/* ===== Subclass 1 Diagnostic Functions ===== */
+
+/**
+ * @brief Verify SYSREF capture and subclass configuration after link-up.
+ *
+ * Reads AD9144 and AXI JESD TX SYSREF/subclass registers and emits
+ * warnings if the configuration is inconsistent with Subclass 1 operation.
+ */
+static void fmcdac_sysref_verify(struct fmcdac_dev *dev)
+{
+	uint8_t sysref_actrl0 = 0;
+	uint8_t sync_ctrl = 0, sync_status = 0;
+	uint8_t jrx_ctrl1 = 0;
+	uint8_t ils_np = 0;
+	uint32_t tx_sysref_conf = 0, tx_sysref_status = 0;
+	uint8_t local_subclass, ilas_subclassv;
+
+	if (!dev || !dev->ad9144_device)
+		return;
+
+	xil_printf("\n\r[SYSREF-VERIFY] Subclass 1 Verification:\n\r");
+
+	/* AD9144 SYSREF analog control */
+	ad9144_spi_read(dev->ad9144_device, REG_SYSREF_ACTRL0, &sysref_actrl0);
+	xil_printf("[SYSREF-VERIFY] SYSREF_ACTRL0 (0x081) = 0x%02X (PD_SYSREF=%u SYSREF_RISE=%u HYS_ON=%u)\n\r",
+		   sysref_actrl0,
+		   !!(sysref_actrl0 & PD_SYSREF),
+		   !!(sysref_actrl0 & SYSREF_RISE),
+		   !!(sysref_actrl0 & HYS_ON));
+	if (sysref_actrl0 & PD_SYSREF)
+		xil_printf("[WARN] SYSREF buffer is powered down (PD_SYSREF=1)\n\r");
+
+	/* SYNC control and status */
+	ad9144_spi_read(dev->ad9144_device, REG_SYNC_CTRL, &sync_ctrl);
+	ad9144_spi_read(dev->ad9144_device, REG_SYNC_STATUS, &sync_status);
+	xil_printf("[SYSREF-VERIFY] SYNC_CTRL (0x03A) = 0x%02X  SYNC_STATUS (0x03B) = 0x%02X\n\r",
+		   sync_ctrl, sync_status);
+
+	/* Local subclass from JRX_CTRL_1 */
+	ad9144_spi_read(dev->ad9144_device, REG_GENERAL_JRX_CTRL_1, &jrx_ctrl1);
+	local_subclass = jrx_ctrl1 & 0x07;
+	xil_printf("[SYSREF-VERIFY] JRX_CTRL_1 (0x301) = 0x%02X (local subclass=%u)\n\r",
+		   jrx_ctrl1, local_subclass);
+
+	/* ILAS SUBCLASSV from ILS_NP (0x458) bits [7:5] */
+	ad9144_spi_read(dev->ad9144_device, REG_ILS_NP, &ils_np);
+	ilas_subclassv = (ils_np >> 5) & 0x07;
+	xil_printf("[SYSREF-VERIFY] ILS_NP (0x458) = 0x%02X (ILAS SUBCLASSV=%u N'-1=%u)\n\r",
+		   ils_np, ilas_subclassv, ils_np & 0x1F);
+	if (ilas_subclassv != 1)
+		xil_printf("[WARN] ILAS SUBCLASSV=%u (expected 1 for Subclass 1)\n\r",
+			   ilas_subclassv);
+
+	/* AXI JESD TX SYSREF registers */
+	tx_sysref_conf = Xil_In32(TX_JESD_BASEADDR + 0x100);
+	tx_sysref_status = Xil_In32(TX_JESD_BASEADDR + 0x108);
+	xil_printf("[SYSREF-VERIFY] TX SYSREF_CONF (0x100) = 0x%08lX (disabled=%lu)\n\r",
+		   (unsigned long)tx_sysref_conf,
+		   (unsigned long)(tx_sysref_conf & 0x1));
+	xil_printf("[SYSREF-VERIFY] TX SYSREF_STATUS (0x108) = 0x%08lX\n\r",
+		   (unsigned long)tx_sysref_status);
+	if (tx_sysref_conf & 0x1)
+		xil_printf("[WARN] TX SYSREF disabled bit is set in Subclass 1 mode\n\r");
+	if (tx_sysref_status & 0x2)
+		xil_printf("[WARN] TX SYSREF alignment error detected\n\r");
+
+	xil_printf("[SYSREF-VERIFY] Done.\n\r");
+}
+
+/**
+ * @brief Read deterministic-latency registers for cross-boot comparison.
+ *
+ * Prints a compact one-line signature from AD9144 dynamic link latency
+ * and LMFC variable registers.
+ */
+static void fmcdac_latency_readback(struct fmcdac_dev *dev)
+{
+	uint8_t dyn0 = 0, dyn1 = 0;
+	uint8_t var0 = 0, var1 = 0;
+
+	if (!dev || !dev->ad9144_device)
+		return;
+
+	ad9144_spi_read(dev->ad9144_device, REG_DYN_LINK_LATENCY_0, &dyn0);
+	ad9144_spi_read(dev->ad9144_device, REG_DYN_LINK_LATENCY_1, &dyn1);
+	ad9144_spi_read(dev->ad9144_device, REG_LMFC_VAR_0, &var0);
+	ad9144_spi_read(dev->ad9144_device, REG_LMFC_VAR_1, &var1);
+
+	xil_printf("[LATENCY] dyn0=0x%02X dyn1=0x%02X var0=0x%02X var1=0x%02X\n\r",
+		   dyn0, dyn1, var0, var1);
+}
+
+/**
+ * @brief PHY-level PRBS test using AD9144 PHY PRBS register block.
+ *
+ * Uses registers 0x315-0x31D. The PHY PRBS checker requires the FPGA TX
+ * to generate a matching PHY-level PRBS pattern. If that source is not
+ * configured, the test is skipped gracefully.
+ *
+ * @return 0 on pass or skip, negative on error.
+ */
+static int fmcdac_phy_prbs_test(struct fmcdac_dev *dev)
+{
+	/* PHY PRBS control bit definitions are in ad9144.h:
+	 * PHY_TEST_RESET, PHY_TEST_START, PHY_PRBS_PAT_SEL() */
+
+	uint8_t test_en = 0, test_ctrl = 0, test_status = 0;
+	uint8_t err_lo = 0, err_mid = 0, err_hi = 0;
+	uint32_t err_count;
+
+	if (!dev || !dev->ad9144_device)
+		return -1;
+
+	xil_printf("\n\r[PHY-PRBS] PHY-Level PRBS Test:\n\r");
+
+	/*
+	 * Gate check: the FPGA TX side must be generating PHY-level PRBS
+	 * patterns for the AD9144 checker to work. In our current bitstream
+	 * the TX sources DDS/datapath data, not PHY PRBS. We run the test
+	 * but warn that results may not be meaningful.
+	 */
+	xil_printf("[PHY-PRBS] NOTE: TX-side PHY PRBS pattern source not confirmed.\n\r");
+	xil_printf("[PHY-PRBS]       Results may show errors if TX is not generating PRBS.\n\r");
+
+	/* Enable PRBS test on all 4 lanes (bits[3:0]) */
+	ad9144_spi_write(dev->ad9144_device, REG_PHY_PRBS_TEST_EN, 0x0F);
+
+	/* Select PRBS7 pattern (0x00) and reset the checker */
+	ad9144_spi_write(dev->ad9144_device, REG_PHY_PRBS_TEST_CTRL,
+			 PHY_PRBS_PAT_SEL(0) | PHY_TEST_RESET);
+	no_os_mdelay(1);
+
+	/* Start the test */
+	ad9144_spi_write(dev->ad9144_device, REG_PHY_PRBS_TEST_CTRL,
+			 PHY_PRBS_PAT_SEL(0) | PHY_TEST_START);
+	no_os_mdelay(100);
+
+	/* Read results */
+	ad9144_spi_read(dev->ad9144_device, REG_PHY_PRBS_TEST_EN, &test_en);
+	ad9144_spi_read(dev->ad9144_device, REG_PHY_PRBS_TEST_CTRL, &test_ctrl);
+	ad9144_spi_read(dev->ad9144_device, REG_PHY_PRBS_TEST_ERRCNT_LOBITS, &err_lo);
+	ad9144_spi_read(dev->ad9144_device, REG_PHY_PRBS_TEST_ERRCNT_MIDBITS, &err_mid);
+	ad9144_spi_read(dev->ad9144_device, REG_PHY_PRBS_TEST_ERRCNT_HIBITS, &err_hi);
+	ad9144_spi_read(dev->ad9144_device, REG_PHY_PRBS_TEST_STATUS, &test_status);
+
+	err_count = ((uint32_t)err_hi << 16) | ((uint32_t)err_mid << 8) | err_lo;
+
+	xil_printf("[PHY-PRBS] test_en=0x%02X ctrl=0x%02X status=0x%02X err_count=%lu\n\r",
+		   test_en, test_ctrl, test_status, (unsigned long)err_count);
+
+	/* Disable PHY PRBS test */
+	ad9144_spi_write(dev->ad9144_device, REG_PHY_PRBS_TEST_EN, 0x00);
+	ad9144_spi_write(dev->ad9144_device, REG_PHY_PRBS_TEST_CTRL, 0x00);
+
+	if (err_count == 0 && (test_status & 0x01))
+		xil_printf("[PHY-PRBS] PASSED (no errors, sync OK)\n\r");
+	else if (err_count > 0)
+		xil_printf("[PHY-PRBS] FAILED: %lu errors detected\n\r",
+			   (unsigned long)err_count);
+	else
+		xil_printf("[PHY-PRBS] SKIPPED/INCONCLUSIVE: TX pattern source likely not active\n\r");
+
+	return (err_count == 0) ? 0 : -(int)err_count;
+
+
+}
+
 static int fmcdac_jesd_init(struct fmcdac_init_param *dev_init)
 {
 	dev_init->ad9144_xcvr_param = (struct adxcvr_init) {
@@ -1165,7 +1358,7 @@ static int fmcdac_jesd_init(struct fmcdac_init_param *dev_init)
 		.bits_per_sample = 16,
 		.high_density = true,
 		.control_bits_per_sample = 0,
-		.subclass = 0,
+		.subclass = 1,
 		.device_clk_khz = 9830400/40,   /* 245760 kHz link clock */
 		.lane_clk_khz = 9830400
 	};
@@ -1183,7 +1376,7 @@ static int fmcdac_jesd_init(struct fmcdac_init_param *dev_init)
 		.converters_per_device = 2,
 		.control_bits_per_sample = 2,
 		.lanes_per_device = 4,
-		.subclass = 0,
+		.subclass = 1,
 		.version = 2,
 	};
 	fmcdac_init.jrx_link_tx = jrx_link_tx;
@@ -1919,6 +2112,11 @@ skip_stpl_zero:
 		xil_printf("[TEST] PRBS15 test PASSED\n\r");
 	}
 
+	/* ===== Subclass 1 Diagnostics (after stable link + datapath PRBS) ===== */
+	fmcdac_sysref_verify(dev);
+	fmcdac_latency_readback(dev);
+	fmcdac_phy_prbs_test(dev);
+
 	/* DDS tone test - validates data path for NCO/CORDIC development */
 	force_dds_tone(dev);
 
@@ -2285,7 +2483,7 @@ static int fmcdac_setup(struct fmcdac_dev *dev,
 	dev_init->ad9144_param.pll_enable = 1;
 	dev_init->ad9144_param.pll_ref_frequency_khz = 122880;
 	dev_init->ad9144_param.pll_dac_frequency_khz = 983040;
-	dev_init->ad9144_param.jesd204_subclass = 0;
+	dev_init->ad9144_param.jesd204_subclass = 1;
 	dev_init->ad9144_param.jesd204_scrambling = 1;
 	dev_init->ad9144_param.jesd204_mode = 4;
 	/* 122.88 MHz REFCLK from AD9516, AD9144 PLL -> 983.04 MSPS */

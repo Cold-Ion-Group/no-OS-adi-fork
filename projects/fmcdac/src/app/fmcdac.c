@@ -129,6 +129,7 @@ static void fmcdac_ad9516_signature_toggle(struct fmcdac_dev *dev);
 static void fmcdac_ad9144_jesd_sanity(struct ad9144_dev *dev,
 				      const struct ad9144_init_param *init_param);
 static void fmcdac_sysref_verify(struct fmcdac_dev *dev);
+static int fmcdac_sysref_tune(struct fmcdac_dev *dev);
 static void fmcdac_latency_readback(struct fmcdac_dev *dev);
 static int fmcdac_phy_prbs_test(struct fmcdac_dev *dev);
 static void fmcdac_flush_input(void);
@@ -1238,6 +1239,123 @@ static void fmcdac_sysref_verify(struct fmcdac_dev *dev)
 }
 
 /**
+ * @brief Sweep SYSREF edge and LMFC offset to clear alignment error.
+ *
+ * Tries in order:
+ *   1. Toggle AD9144 SYSREF edge (rising vs falling)
+ *   2. Sweep AXI JESD TX SYSREF_LMFC_OFFSET 0..(K-1)
+ *   3. Combine opposite edge + offset sweep
+ *
+ * For each candidate, clears SYSREF status (W1C), waits for re-capture,
+ * and checks if the alignment error bit clears.
+ *
+ * @return 0 if alignment error cleared, -1 if all options exhausted.
+ */
+static int fmcdac_sysref_tune(struct fmcdac_dev *dev)
+{
+	uint8_t orig_actrl0 = 0;
+	uint32_t sysref_status;
+	uint32_t offset;
+	uint32_t K = 32; /* frames_per_multiframe */
+	int found = 0;
+
+	if (!dev || !dev->ad9144_device)
+		return -1;
+
+	/* Read initial state */
+	sysref_status = Xil_In32(TX_JESD_BASEADDR + 0x108);
+	if ((sysref_status & 0x01) && !(sysref_status & 0x02)) {
+		xil_printf("[SYSREF-TUNE] No alignment error - skipping tune\n\r");
+		return 0;
+	}
+
+	ad9144_spi_read(dev->ad9144_device, REG_SYSREF_ACTRL0, &orig_actrl0);
+	xil_printf("\n\r[SYSREF-TUNE] Alignment error detected. Starting phase sweep...\n\r");
+	xil_printf("[SYSREF-TUNE] Original SYSREF_ACTRL0=0x%02X (edge=%s)\n\r",
+		   orig_actrl0, (orig_actrl0 & SYSREF_RISE) ? "rising" : "falling");
+
+	/*
+	 * Trial helper: clear SYSREF status (W1C), wait for re-capture, check.
+	 * Returns 1 if alignment error is cleared.
+	 */
+	#define SYSREF_TRIAL_OK() ({ \
+		Xil_Out32(TX_JESD_BASEADDR + 0x108, 0x03); /* W1C clear */ \
+		no_os_mdelay(50); /* wait for new SYSREF edges */ \
+		sysref_status = Xil_In32(TX_JESD_BASEADDR + 0x108); \
+		((sysref_status & 0x01) && !(sysref_status & 0x02)); \
+	})
+
+	/* --- Phase 1: Try opposite edge, offset=0 --- */
+	{
+		uint8_t try_edge = orig_actrl0 ^ SYSREF_RISE; /* toggle edge */
+		ad9144_spi_write(dev->ad9144_device, REG_SYSREF_ACTRL0, try_edge);
+		Xil_Out32(TX_JESD_BASEADDR + 0x104, 0); /* offset=0 */
+		if (SYSREF_TRIAL_OK()) {
+			xil_printf("[SYSREF-TUNE] FIXED: edge=%s offset=0 (status=0x%08lX)\n\r",
+				   (try_edge & SYSREF_RISE) ? "rising" : "falling",
+				   (unsigned long)sysref_status);
+			found = 1;
+			goto done;
+		}
+		/* Restore original edge */
+		ad9144_spi_write(dev->ad9144_device, REG_SYSREF_ACTRL0, orig_actrl0);
+	}
+
+	/* --- Phase 2: Sweep LMFC offset with original edge --- */
+	for (offset = 0; offset < K; offset++) {
+		Xil_Out32(TX_JESD_BASEADDR + 0x104, offset);
+		if (SYSREF_TRIAL_OK()) {
+			xil_printf("[SYSREF-TUNE] FIXED: edge=%s offset=%lu (status=0x%08lX)\n\r",
+				   (orig_actrl0 & SYSREF_RISE) ? "rising" : "falling",
+				   (unsigned long)offset,
+				   (unsigned long)sysref_status);
+			found = 1;
+			goto done;
+		}
+	}
+
+	/* --- Phase 3: Sweep LMFC offset with opposite edge --- */
+	{
+		uint8_t try_edge = orig_actrl0 ^ SYSREF_RISE;
+		ad9144_spi_write(dev->ad9144_device, REG_SYSREF_ACTRL0, try_edge);
+		for (offset = 1; offset < K; offset++) { /* offset=0 already tried in phase 1 */
+			Xil_Out32(TX_JESD_BASEADDR + 0x104, offset);
+			if (SYSREF_TRIAL_OK()) {
+				xil_printf("[SYSREF-TUNE] FIXED: edge=%s offset=%lu (status=0x%08lX)\n\r",
+					   (try_edge & SYSREF_RISE) ? "rising" : "falling",
+					   (unsigned long)offset,
+					   (unsigned long)sysref_status);
+				found = 1;
+				goto done;
+			}
+		}
+		/* Restore if nothing worked */
+		ad9144_spi_write(dev->ad9144_device, REG_SYSREF_ACTRL0, orig_actrl0);
+		Xil_Out32(TX_JESD_BASEADDR + 0x104, 0);
+	}
+
+done:
+	if (!found) {
+		xil_printf("[SYSREF-TUNE] FAILED: could not clear alignment error after full sweep\n\r");
+		return -1;
+	}
+
+	/* Final readback to confirm */
+	{
+		uint8_t final_actrl0 = 0;
+		uint32_t final_offset = Xil_In32(TX_JESD_BASEADDR + 0x104);
+		ad9144_spi_read(dev->ad9144_device, REG_SYSREF_ACTRL0, &final_actrl0);
+		xil_printf("[SYSREF-TUNE] Final config: SYSREF_ACTRL0=0x%02X (edge=%s) LMFC_OFFSET=%lu\n\r",
+			   final_actrl0,
+			   (final_actrl0 & SYSREF_RISE) ? "rising" : "falling",
+			   (unsigned long)final_offset);
+	}
+
+	#undef SYSREF_TRIAL_OK
+	return 0;
+}
+
+/**
  * @brief Read deterministic-latency registers for cross-boot comparison.
  *
  * Prints a compact one-line signature from AD9144 dynamic link latency
@@ -2113,6 +2231,7 @@ skip_stpl_zero:
 	}
 
 	/* ===== Subclass 1 Diagnostics (after stable link + datapath PRBS) ===== */
+	fmcdac_sysref_tune(dev);
 	fmcdac_sysref_verify(dev);
 	fmcdac_latency_readback(dev);
 	fmcdac_phy_prbs_test(dev);
@@ -2741,7 +2860,7 @@ static int fmcdac_setup(struct fmcdac_dev *dev,
 	dev->ad9144_device->link_config.subclass = fmcdac_init.jtx_link_rx.subclass;
 	dev->ad9144_device->link_config.jesd_version = fmcdac_init.jtx_link_rx.version;
 
-	dev->ad9144_device->link_config.sysref.capture_falling_edge = 1;
+	dev->ad9144_device->link_config.sysref.capture_falling_edge = 0;
 	dev->ad9144_device->link_config.sysref.mode = JESD204_SYSREF_ONESHOT;
 
 	dev->ad9144_device->link_config.lane_ids = calloc(

@@ -1191,6 +1191,112 @@ static void fmcdac_ad9144_jesd_sanity(struct ad9144_dev *dev,
 		   cdr, plldiv, pll_status);
 }
 
+/* ===== Link Soak Test (A-04) ===== */
+
+/* Uncomment to enable long-duration soak test after normal boot tests.
+ * Configure SOAK_DURATION_HOURS for desired runtime (default 8h). */
+/* #define ENABLE_SOAK */
+#define SOAK_DURATION_HOURS  8
+#define SOAK_POLL_INTERVAL_MS  1000
+#define SOAK_PRBS_INTERVAL_S   900  /* 15 minutes */
+
+#ifdef ENABLE_SOAK
+/**
+ * @brief Long-duration link stability soak test.
+ *
+ * Polls jesd_link_fully_synced() every SOAK_POLL_INTERVAL_MS for
+ * SOAK_DURATION_HOURS. Runs datapath PRBS7 checks every
+ * SOAK_PRBS_INTERVAL_S seconds. Logs any link drop or PRBS failure
+ * with a timestamp (seconds since soak start).
+ *
+ * @return 0 if no failures, -N where N is total failure count.
+ */
+static int fmcdac_soak(struct fmcdac_dev *dev,
+		       struct fmcdac_init_param *dev_init)
+{
+	uint32_t total_polls = 0;
+	uint32_t link_fails = 0;
+	uint32_t prbs_fails = 0;
+	uint32_t elapsed_s = 0;
+	uint32_t target_s = (uint32_t)SOAK_DURATION_HOURS * 3600U;
+	uint32_t polls_per_sec = 1000 / SOAK_POLL_INTERVAL_MS;
+	uint32_t next_prbs_s = SOAK_PRBS_INTERVAL_S;
+	uint32_t st;
+	int status;
+
+	xil_printf("\n\r[SOAK] Starting %u-hour link soak test (%lu s, poll every %u ms)\n\r",
+		   SOAK_DURATION_HOURS, (unsigned long)target_s, SOAK_POLL_INTERVAL_MS);
+	xil_printf("[SOAK] PRBS check every %u s (%u min)\n\r",
+		   SOAK_PRBS_INTERVAL_S, SOAK_PRBS_INTERVAL_S / 60);
+
+	while (elapsed_s < target_s) {
+		/* Poll link status */
+		if (!jesd_link_fully_synced(dev, &st)) {
+			link_fails++;
+			xil_printf("[SOAK] LINK-FAIL at t=%lu s: st=0x%08lX (fail #%lu)\n\r",
+				   (unsigned long)elapsed_s, (unsigned long)st,
+				   (unsigned long)link_fails);
+		}
+		total_polls++;
+
+		/* Periodic PRBS check */
+		if (elapsed_s >= next_prbs_s) {
+			dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_PN7;
+			dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_PN7;
+			axi_dac_data_setup(dev->ad9144_core);
+			no_os_mdelay(200);
+
+			dev_init->ad9144_param.prbs_type = AD9144_PRBS7;
+			status = ad9144_datapath_prbs_test(dev->ad9144_device,
+							    &dev_init->ad9144_param);
+			if (status < 0) {
+				prbs_fails++;
+				xil_printf("[SOAK] PRBS-FAIL at t=%lu s (fail #%lu)\n\r",
+					   (unsigned long)elapsed_s,
+					   (unsigned long)prbs_fails);
+			}
+
+			/* Restore DDS output */
+			dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_DDS;
+			dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_DDS;
+			axi_dac_data_setup(dev->ad9144_core);
+
+			next_prbs_s = elapsed_s + SOAK_PRBS_INTERVAL_S;
+		}
+
+		/* Heartbeat every 300 seconds (5 min) */
+		if (elapsed_s > 0 && (elapsed_s % 300) == 0 &&
+		    (total_polls % polls_per_sec) == 0) {
+			xil_printf("[SOAK] t=%lu/%lu s  polls=%lu  link_fails=%lu  prbs_fails=%lu\n\r",
+				   (unsigned long)elapsed_s, (unsigned long)target_s,
+				   (unsigned long)total_polls,
+				   (unsigned long)link_fails,
+				   (unsigned long)prbs_fails);
+		}
+
+		no_os_mdelay(SOAK_POLL_INTERVAL_MS);
+
+		/* Approximate elapsed time (mdelay is not wall-clock accurate) */
+		if ((total_polls % polls_per_sec) == 0)
+			elapsed_s++;
+	}
+
+	xil_printf("\n\r[SOAK] ===== SOAK COMPLETE =====\n\r");
+	xil_printf("[SOAK] Duration target: %u hours (%lu s)\n\r",
+		   SOAK_DURATION_HOURS, (unsigned long)target_s);
+	xil_printf("[SOAK] Total polls: %lu\n\r", (unsigned long)total_polls);
+	xil_printf("[SOAK] Link failures: %lu\n\r", (unsigned long)link_fails);
+	xil_printf("[SOAK] PRBS failures: %lu\n\r", (unsigned long)prbs_fails);
+
+	if (link_fails == 0 && prbs_fails == 0)
+		xil_printf("[SOAK] RESULT: PASS\n\r");
+	else
+		xil_printf("[SOAK] RESULT: FAIL\n\r");
+
+	return (link_fails + prbs_fails) ? -(int)(link_fails + prbs_fails) : 0;
+}
+#endif /* ENABLE_SOAK */
+
 /* ===== Subclass 1 Diagnostic Functions ===== */
 
 /**
@@ -3158,6 +3264,12 @@ int main(void)
 #endif
 
 	/* force_dds_tone() runs DDS sweep internally */
+
+#ifdef ENABLE_SOAK
+	/* A-04: Long soak test — runs after normal boot tests pass.
+	 * Uncomment #define ENABLE_SOAK above to activate. */
+	fmcdac_soak(&fmcdac, &fmcdac_init);
+#endif
 
 	fmcdac_remove(&fmcdac);
 

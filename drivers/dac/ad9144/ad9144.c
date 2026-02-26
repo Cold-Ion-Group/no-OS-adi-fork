@@ -1118,7 +1118,7 @@ int32_t ad9144_setup_legacy(struct ad9144_dev **device,
 	ad9144_spi_write(dev, REG_PWRCNTRL0, 0x00);	// dacs - power up everything
 	ad9144_spi_write(dev, REG_CLKCFG0, 0x00);	// clocks - power up everything
 	ad9144_spi_write(dev, REG_SYSREF_ACTRL0,
-			 SYSREF_RISE);	// sysref - power up/rising edge
+			 SYSREF_RISE);	// sysref - power up/rising edge (tune flips to falling after link-up)
 
 	// required device configurations
 	ad9144_spi_write_seq(dev, ad9144_required_device_config,

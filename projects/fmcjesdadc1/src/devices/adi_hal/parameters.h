@@ -2,6 +2,7 @@
  *   @file   parameters.h
  *   @brief  Platform dependent parameters.
  *   @author Antoniu Miclaus (antoniu.miclaus@analog.com)
+ *   @author Prerna Baranwal, modified, for kcu116 and ad9144 
 ********************************************************************************
  * Copyright 2020(c) Analog Devices, Inc.
  *
@@ -50,6 +51,7 @@
 
 #define GPIO_OFFSET				0
 
+// TO DO base address for the DAC may be added here 
 #define ADC_DDR_BASEADDR			(XPAR_AXI_DDR_CNTRL_BASEADDR + 0x800000)
 #else
 #define SPI_DEVICE_ID				XPAR_XSPIPS_0_DEVICE_ID

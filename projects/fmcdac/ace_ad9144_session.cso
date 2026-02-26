@@ -1,0 +1,427 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Session Name="Session" AppVersion="" FileVersion="" xmlns="AnalogDevices/Csa/Configuration/Schemas/Session.xsd">
+  <Elements>
+    <Element Id="Scripts">
+      <ScriptManager xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="AnalogDevices/Csa/Scripting/Sessions/ScriptManagerSessionElement.Schema.xsd">
+        <Scripts />
+      </ScriptManager>
+    </Element>
+    <Element Id="EvalSystem">
+      <System xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" Name="System" xmlns="AnalogDevices/Csa/Evaluation/Sessions/EvalSystemSessionElement.Schema.xsd">
+        <Subsystems>
+          <Subsystem Name="Subsystem_1">
+            <Components>
+              <Component ComponentId="AD9144FmcBoard" Name="AD9144-FMC-EBZ">
+                <Info Name="AD9144-FMC-EBZ" Description="AD9144 Evaluation Board" />
+                <SavedState>
+                  <Board Id="AD9144FmcBoard" Version="1.2020.4400" xmlns="">
+                    <Chips>
+                      <Chip Id="Chip.AD9144.AD9144" InstanceName="AD9144" Version="1.2020.4400">
+                        <Parameter Id="virtual-parameter-FDAC" Value="1500000000" Type="System.Decimal" />
+                        <Parameter Id="virtual-parameter-FClk" Value="1500000000" Type="System.Decimal" />
+                        <Parameter Id="virtual-parameter-FVco" Value="12000000000" Type="System.Decimal" />
+                        <Parameter Id="virtual-parameter-FPfd" Value="93750000" Type="System.Decimal" />
+                        <Parameter Id="virtual-parameter-Fs/2" Value="750000000" Type="System.Decimal" />
+                        <Parameter Id="virtual-parameter-Fs/4" Value="375000000" Type="System.Decimal" />
+                        <Parameter Id="virtual-parameter-Fs/8" Value="187500000" Type="System.Decimal" />
+                        <Parameter Id="virtual-parameter-duc_0_nco_freq" Value="93750000" Type="System.Decimal" />
+                        <Parameter Id="virtual-parameter-duc_0_nco_phase" Value="0" Type="System.Decimal" />
+                        <Parameter Id="virtual-parameter-duc_1_nco_freq" Value="93750000" Type="System.Decimal" />
+                        <Parameter Id="virtual-parameter-duc_1_nco_phase" Value="0" Type="System.Decimal" />
+                        <Parameter Id="virtual-parameter-RefClk" Value="750000000" Type="System.Decimal" />
+                        <Parameter Id="virtual-parameter-Fin" Value="0" Type="System.Decimal" />
+                        <Parameter Id="virtual-parameter-SetupLinks" Value="1" Type="System.Int32" />
+                        <Parameter Id="virtual-parameter-SetupJESDmode" Value="0" Type="System.Int32" />
+                        <Parameter Id="virtual-parameter-SetupClass1" Value="false" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-SetupInterpolationMode" Value="1" Type="System.Byte" />
+                        <Parameter Id="virtual-parameter-IDigGain0" Value="2.698" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-IDigGain1" Value="2.698" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-QDigGain0" Value="2.698" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-QDigGain1" Value="2.698" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-PhaseAdj0" Value="0" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-PhaseAdj1" Value="0" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-ILsbsOffset0" Value="0" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-ILsbsOffset1" Value="0" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-QLsbsOffset0" Value="0" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-QLsbsOffset1" Value="0" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-ISixteenthsOffset0" Value="0" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-ISixteenthsOffset1" Value="0" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-QSixteenthsOffset0" Value="0" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-QSixteenthsOffset1" Value="0" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-DacGain0" Value="20.48" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-DacGain1" Value="20.48" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-DacGain2" Value="20.48" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-DacGain3" Value="20.48" Type="System.Double" />
+                        <Parameter Id="virtual-parameter-EN_SERDIN0" Value="true" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-EN_SERDIN1" Value="true" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-EN_SERDIN2" Value="true" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-EN_SERDIN3" Value="true" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-EN_SERDIN4" Value="true" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-EN_SERDIN5" Value="true" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-EN_SERDIN6" Value="true" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-EN_SERDIN7" Value="true" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-DAC_Cal_Select0" Value="false" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-DAC_Cal_Select1" Value="false" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-DAC_Cal_Select2" Value="true" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-DAC_Cal_Select3" Value="true" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-Cal_Pass" Value="false" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-Cal_Error" Value="true" Type="System.Boolean" />
+                        <Parameter Id="virtual-parameter-pll_switch_position" Value="0" Type="System.Int32" />
+                        <Parameter Id="virtual-parameter-jesd_clock_multiplier" Value="40" Type="System.Int32" />
+                        <RegisterMap UniqueId="0.digital" Address="0" Count="78">
+                          <Register Address="13" Value="20,20" />
+                          <Register Address="14" Value="08,08" />
+                          <Register Address="1F" Value="0" />
+                          <Register Address="20" Value="0" />
+                          <Register Address="21" Value="0" />
+                          <Register Address="22" Value="0" />
+                          <Register Address="23" Value="0" />
+                          <Register Address="24" Value="0" />
+                          <Register Address="25" Value="0" />
+                          <Register Address="26" Value="0" />
+                          <Register Address="30" Value="0" />
+                          <Register Address="34" Value="0,0" />
+                          <Register Address="38" Value="0,0" />
+                          <Register Address="39" Value="0,0" />
+                          <Register Address="3A" Value="0,0" />
+                          <Register Address="3B" Value="0,0" />
+                          <Register Address="3C" Value="0,0" />
+                          <Register Address="3D" Value="0,0" />
+                          <Register Address="50" Value="0,0" />
+                          <Register Address="51" Value="0,0" />
+                          <Register Address="52" Value="0,0" />
+                          <Register Address="53" Value="0,0" />
+                          <Register Address="54" Value="0,0" />
+                          <Register Address="60" Value="0,0" />
+                          <Register Address="61" Value="0,0" />
+                          <Register Address="62" Value="0,0" />
+                          <Register Address="63" Value="0,0" />
+                          <Register Address="64" Value="0,0" />
+                          <Register Address="110" Value="0,0" />
+                          <Register Address="111" Value="0A0,0A0" />
+                          <Register Address="112" Value="1" />
+                          <Register Address="113" Value="0,0" />
+                          <Register Address="114" Value="0,0" />
+                          <Register Address="115" Value="0,0" />
+                          <Register Address="116" Value="0,0" />
+                          <Register Address="117" Value="0,0" />
+                          <Register Address="118" Value="0,0" />
+                          <Register Address="119" Value="10,10" />
+                          <Register Address="11A" Value="0,0" />
+                          <Register Address="11B" Value="0,0" />
+                          <Register Address="11C" Value="0,0" />
+                          <Register Address="11D" Value="0,0" />
+                          <Register Address="11F" Value="080,080" />
+                          <Register Address="121" Value="0F,0F" />
+                          <Register Address="122" Value="0,0" />
+                          <Register Address="123" Value="0FF,0FF" />
+                          <Register Address="124" Value="0FF,0FF" />
+                          <Register Address="12D" Value="46,46" />
+                          <Register Address="12E" Value="0,0" />
+                          <Register Address="12F" Value="20" />
+                          <Register Address="132" Value="0" />
+                          <Register Address="133" Value="0" />
+                          <Register Address="134" Value="0" />
+                          <Register Address="135" Value="0,0" />
+                          <Register Address="136" Value="0,0" />
+                          <Register Address="137" Value="0,0" />
+                          <Register Address="138" Value="0,0" />
+                          <Register Address="139" Value="0,0" />
+                          <Register Address="13A" Value="0,0" />
+                          <Register Address="13B" Value="0,0" />
+                          <Register Address="13C" Value="0EA,0EA" />
+                          <Register Address="13D" Value="0A,0A" />
+                          <Register Address="13E" Value="0EA,0EA" />
+                          <Register Address="13F" Value="0A,0A" />
+                          <Register Address="140" Value="4,4" />
+                          <Register Address="141" Value="0,0" />
+                          <Register Address="142" Value="09,09" />
+                          <Register Address="143" Value="0,0" />
+                          <Register Address="146" Value="0,0" />
+                          <Register Address="147" Value="0,0" />
+                          <Register Address="14B" Value="0,0" />
+                          <Register Address="14C" Value="0,0" />
+                          <Register Address="14D" Value="0,0" />
+                          <Register Address="520" Value="1C" />
+                          <Register Address="521" Value="0,0" />
+                          <Register Address="522" Value="0,0" />
+                          <Register Address="523" Value="0,0" />
+                          <Register Address="524" Value="0,0" />
+                        </RegisterMap>
+                        <RegisterMap UniqueId="0.analog" Address="0" Count="34">
+                          <Register Address="11" Value="7C" />
+                          <Register Address="12" Value="0" />
+                          <Register Address="40" Value="0" />
+                          <Register Address="41" Value="0" />
+                          <Register Address="42" Value="0" />
+                          <Register Address="43" Value="0" />
+                          <Register Address="44" Value="0" />
+                          <Register Address="45" Value="0" />
+                          <Register Address="46" Value="0" />
+                          <Register Address="47" Value="0" />
+                          <Register Address="80" Value="0F8" />
+                          <Register Address="81" Value="10" />
+                          <Register Address="82" Value="0" />
+                          <Register Address="83" Value="0" />
+                          <Register Address="84" Value="0" />
+                          <Register Address="85" Value="08" />
+                          <Register Address="87" Value="088" />
+                          <Register Address="88" Value="088" />
+                          <Register Address="89" Value="08" />
+                          <Register Address="8A" Value="20" />
+                          <Register Address="8B" Value="2" />
+                          <Register Address="8C" Value="1" />
+                          <Register Address="E2" Value="0" />
+                          <Register Address="E5" Value="24" />
+                          <Register Address="E7" Value="30" />
+                          <Register Address="E8" Value="08" />
+                          <Register Address="E9" Value="0,0,0,0" />
+                          <Register Address="ED" Value="26,26,26,22" />
+                          <Register Address="1B4" Value="78" />
+                          <Register Address="1B5" Value="083" />
+                          <Register Address="1B6" Value="4A" />
+                          <Register Address="1BB" Value="0C" />
+                          <Register Address="1BD" Value="0" />
+                          <Register Address="1C4" Value="33" />
+                        </RegisterMap>
+                        <RegisterMap UniqueId="0.base" Address="0" Count="6">
+                          <Register Address="0" Value="0" />
+                          <Register Address="3" Value="4" />
+                          <Register Address="4" Value="44" />
+                          <Register Address="5" Value="091" />
+                          <Register Address="6" Value="2" />
+                          <Register Address="8" Value="3" />
+                        </RegisterMap>
+                        <RegisterMap UniqueId="200.jesd_analog" Address="200" Count="21">
+                          <Register Address="200" Value="1" />
+                          <Register Address="201" Value="0" />
+                          <Register Address="203" Value="0" />
+                          <Register Address="206" Value="1" />
+                          <Register Address="230" Value="28" />
+                          <Register Address="232" Value="0" />
+                          <Register Address="268" Value="62" />
+                          <Register Address="280" Value="0" />
+                          <Register Address="281" Value="0" />
+                          <Register Address="289" Value="0" />
+                          <Register Address="291" Value="46" />
+                          <Register Address="29C" Value="17" />
+                          <Register Address="29F" Value="33" />
+                          <Register Address="2A4" Value="4B" />
+                          <Register Address="2A5" Value="0" />
+                          <Register Address="2A7" Value="0" />
+                          <Register Address="2AA" Value="0C3" />
+                          <Register Address="2AB" Value="093" />
+                          <Register Address="2AE" Value="0" />
+                          <Register Address="2B1" Value="0C3" />
+                          <Register Address="2B2" Value="093" />
+                        </RegisterMap>
+                        <RegisterMap UniqueId="300.jesd_digital" Address="300" Count="31">
+                          <Register Address="300" Value="0" />
+                          <Register Address="301" Value="1" />
+                          <Register Address="302" Value="0" />
+                          <Register Address="303" Value="0" />
+                          <Register Address="304" Value="0" />
+                          <Register Address="305" Value="0" />
+                          <Register Address="306" Value="6" />
+                          <Register Address="307" Value="6" />
+                          <Register Address="308" Value="08" />
+                          <Register Address="309" Value="1A" />
+                          <Register Address="30A" Value="2C" />
+                          <Register Address="30B" Value="3E" />
+                          <Register Address="30C" Value="0" />
+                          <Register Address="30D" Value="0" />
+                          <Register Address="312" Value="0" />
+                          <Register Address="314" Value="0" />
+                          <Register Address="315" Value="0" />
+                          <Register Address="316" Value="0" />
+                          <Register Address="317" Value="0" />
+                          <Register Address="318" Value="0" />
+                          <Register Address="319" Value="0" />
+                          <Register Address="31A" Value="0" />
+                          <Register Address="31B" Value="0" />
+                          <Register Address="31C" Value="0" />
+                          <Register Address="31D" Value="0FF" />
+                          <Register Address="32C" Value="0" />
+                          <Register Address="32D" Value="0" />
+                          <Register Address="32E" Value="0" />
+                          <Register Address="32F" Value="0" />
+                          <Register Address="333" Value="0" />
+                          <Register Address="334" Value="0" />
+                        </RegisterMap>
+                        <RegisterMap UniqueId="400.jesd_qbd" Address="400" Count="72">
+                          <Register Address="400" Value="0,0" />
+                          <Register Address="401" Value="0,0" />
+                          <Register Address="402" Value="0,0" />
+                          <Register Address="403" Value="0,0" />
+                          <Register Address="404" Value="0,0" />
+                          <Register Address="405" Value="0,0" />
+                          <Register Address="406" Value="0,0" />
+                          <Register Address="407" Value="0,0" />
+                          <Register Address="408" Value="0,0" />
+                          <Register Address="409" Value="0,0" />
+                          <Register Address="40A" Value="0,0" />
+                          <Register Address="40B" Value="0,0" />
+                          <Register Address="40C" Value="0,0" />
+                          <Register Address="40D" Value="0,0" />
+                          <Register Address="40E" Value="0,0" />
+                          <Register Address="412" Value="0,0" />
+                          <Register Address="415" Value="0,0" />
+                          <Register Address="416" Value="0,0" />
+                          <Register Address="41A" Value="0,0" />
+                          <Register Address="41D" Value="0,0" />
+                          <Register Address="41E" Value="0,0" />
+                          <Register Address="422" Value="0,0" />
+                          <Register Address="425" Value="0,0" />
+                          <Register Address="426" Value="0,0" />
+                          <Register Address="42A" Value="0,0" />
+                          <Register Address="42D" Value="0,0" />
+                          <Register Address="42E" Value="0,0" />
+                          <Register Address="432" Value="0,0" />
+                          <Register Address="435" Value="0,0" />
+                          <Register Address="436" Value="0,0" />
+                          <Register Address="43A" Value="0,0" />
+                          <Register Address="43D" Value="0,0" />
+                          <Register Address="43E" Value="0,0" />
+                          <Register Address="442" Value="0,0" />
+                          <Register Address="445" Value="0,0" />
+                          <Register Address="446" Value="0,0" />
+                          <Register Address="450" Value="0,0" />
+                          <Register Address="451" Value="0,0" />
+                          <Register Address="452" Value="0,0" />
+                          <Register Address="453" Value="083,083" />
+                          <Register Address="454" Value="0,0" />
+                          <Register Address="455" Value="1F,1F" />
+                          <Register Address="456" Value="1,1" />
+                          <Register Address="457" Value="0F,0F" />
+                          <Register Address="458" Value="2F,2F" />
+                          <Register Address="459" Value="20,20" />
+                          <Register Address="45A" Value="080,080" />
+                          <Register Address="45B" Value="0,0" />
+                          <Register Address="45C" Value="0,0" />
+                          <Register Address="45D" Value="45,45" />
+                          <Register Address="46B" Value="0,0" />
+                          <Register Address="46B" Value="0,0" />
+                          <Register Address="46C" Value="0F,0F" />
+                          <Register Address="46D" Value="0,0" />
+                          <Register Address="46D" Value="0,0" />
+                          <Register Address="46E" Value="0,0" />
+                          <Register Address="46E" Value="0,0" />
+                          <Register Address="46F" Value="0,0" />
+                          <Register Address="46F" Value="0,0" />
+                          <Register Address="470" Value="0,0" />
+                          <Register Address="471" Value="0,0" />
+                          <Register Address="472" Value="0,0" />
+                          <Register Address="473" Value="0,0" />
+                          <Register Address="476" Value="1,1" />
+                          <Register Address="477" Value="0,0" />
+                          <Register Address="478" Value="1,1" />
+                          <Register Address="47A" Value="0,0" />
+                          <Register Address="47A" Value="0,0" />
+                          <Register Address="47B" Value="08,08" />
+                          <Register Address="47C" Value="0FF,0FF" />
+                          <Register Address="47D" Value="0F,0F" />
+                          <Register Address="47E" Value="0,0" />
+                        </RegisterMap>
+                        <PageGroup UniqueId="M1" ActivePageIndex="1" />
+                        <PageGroup UniqueId="M2" ActivePageIndex="1" />
+                        <PageGroup UniqueId="M4" ActivePageIndex="3" />
+                        <Children />
+                      </Chip>
+                      <Chip Id="Chip.AD9516.AD9516" InstanceName="AD9516" Version="1.2019.51200">
+                        <RegisterMap UniqueId="0.RegMap1" Address="0" Count="66">
+                          <Register Address="0" Value="099" />
+                          <Register Address="2" Value="0" />
+                          <Register Address="3" Value="1" />
+                          <Register Address="4" Value="0" />
+                          <Register Address="10" Value="0D7" />
+                          <Register Address="11" Value="1" />
+                          <Register Address="12" Value="0" />
+                          <Register Address="13" Value="0" />
+                          <Register Address="14" Value="3" />
+                          <Register Address="15" Value="0" />
+                          <Register Address="16" Value="6" />
+                          <Register Address="17" Value="0" />
+                          <Register Address="18" Value="6" />
+                          <Register Address="19" Value="0" />
+                          <Register Address="1A" Value="0" />
+                          <Register Address="1B" Value="0" />
+                          <Register Address="1C" Value="0" />
+                          <Register Address="1D" Value="0" />
+                          <Register Address="1E" Value="0" />
+                          <Register Address="1F" Value="0" />
+                          <Register Address="A0" Value="1" />
+                          <Register Address="A1" Value="0" />
+                          <Register Address="A2" Value="0" />
+                          <Register Address="A3" Value="1" />
+                          <Register Address="A4" Value="0" />
+                          <Register Address="A5" Value="0" />
+                          <Register Address="A6" Value="1" />
+                          <Register Address="A7" Value="0" />
+                          <Register Address="A8" Value="0" />
+                          <Register Address="A9" Value="1" />
+                          <Register Address="AA" Value="0" />
+                          <Register Address="AB" Value="0" />
+                          <Register Address="F0" Value="08" />
+                          <Register Address="F1" Value="0A" />
+                          <Register Address="F2" Value="08" />
+                          <Register Address="F3" Value="0A" />
+                          <Register Address="F4" Value="08" />
+                          <Register Address="F5" Value="0A" />
+                          <Register Address="140" Value="42" />
+                          <Register Address="141" Value="43" />
+                          <Register Address="142" Value="42" />
+                          <Register Address="143" Value="43" />
+                          <Register Address="190" Value="0" />
+                          <Register Address="191" Value="080" />
+                          <Register Address="192" Value="0" />
+                          <Register Address="193" Value="0BB" />
+                          <Register Address="194" Value="0" />
+                          <Register Address="195" Value="0" />
+                          <Register Address="196" Value="0" />
+                          <Register Address="197" Value="0" />
+                          <Register Address="198" Value="0" />
+                          <Register Address="199" Value="22" />
+                          <Register Address="19A" Value="0" />
+                          <Register Address="19B" Value="11" />
+                          <Register Address="19C" Value="0" />
+                          <Register Address="19D" Value="0" />
+                          <Register Address="19E" Value="22" />
+                          <Register Address="19F" Value="0" />
+                          <Register Address="1A0" Value="11" />
+                          <Register Address="1A1" Value="0" />
+                          <Register Address="1A2" Value="0" />
+                          <Register Address="1A3" Value="0" />
+                          <Register Address="1E0" Value="2" />
+                          <Register Address="1E1" Value="0" />
+                          <Register Address="230" Value="0" />
+                          <Register Address="232" Value="0" />
+                        </RegisterMap>
+                        <Children />
+                      </Chip>
+                    </Chips>
+                    <StateControls AllowStatePolling="false" />
+                  </Board>
+                </SavedState>
+              </Component>
+            </Components>
+            <Connections />
+          </Subsystem>
+        </Subsystems>
+      </System>
+    </Element>
+    <Element Id="Controllers">
+      <Controller Name="AD9144-FMC-EBZ" HardwareID="456&amp;7029&amp;793230AA" Path="Root::System.Subsystem_1.AD9144-FMC-EBZ" xmlns="" />
+    </Element>
+    <Element Id="Macros">
+      <MacroManager xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="AnalogDevices/Csa/Evaluation/UI/Models/Sessions/MacroManagerSessionElement.Schema.xsd">
+        <Macros />
+      </MacroManager>
+    </Element>
+    <Element Id="Views" ActiveWorkspaceElement="Root::System.Subsystem_1.AD9144-FMC-EBZ.AD9144" WorkspaceElements="Root::,Root::System,Root::System.Subsystem_1.AD9144-FMC-EBZ,Root::System.Subsystem_1.AD9144-FMC-EBZ.AD9144,Root::VectorGenerator,Root::System.Subsystem_1.AD9144-FMC-EBZ.AD9144.AD9144 Memory Map" />
+    <Element Id="VectorGenerator">
+      <VectorGenerator xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" Name="VectorGenerator" xmlns="AnalogDevices/Csa/VectorGenerator/Sessions/VectorGeneratorSessionElement.Schema.xsd">
+        <Vectors />
+      </VectorGenerator>
+    </Element>
+  </Elements>
+</Session>

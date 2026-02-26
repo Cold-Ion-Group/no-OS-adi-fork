@@ -1,0 +1,13 @@
+19:19:24 INFO  : Launching XSCT server: xsct.bat -n  -interactive C:\Users\fpga_\Desktop\adi\no-OS\projects\fmcdac\temp_xsdb_launch_script.tcl
+19:19:24 INFO  : Platform repository initialization has completed.
+19:19:24 INFO  : Registering command handlers for Vitis TCF services
+19:19:26 INFO  : XSCT server has started successfully.
+19:19:26 INFO  : plnx-install-location is set to ''
+19:19:26 INFO  : Successfully done setting XSCT server connection channel  
+19:19:26 INFO  : Successfully done query RDI_DATADIR 
+19:19:26 INFO  : Successfully done setting workspace for the tool. 
+19:20:00 INFO  : Result from executing command 'getProjects': system_top
+19:20:00 INFO  : Result from executing command 'getPlatforms': 
+19:20:00 WARN  : An unexpected exception occurred in the module 'platform project logging'
+19:20:00 INFO  : Platform 'system_top' is added to custom repositories.
+19:20:01 INFO  : Platform 'system_top' is added to custom repositories.

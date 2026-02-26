@@ -1,0 +1,22 @@
+{
+      "xilinx": {
+            "demo": {
+                  "flags": "",
+                  "hardware": [
+                        "fmcdac_kcu116"
+                  ]
+            },
+            "dma_example": {
+                  "flags" : "NEW_CFLAGS=-DDAC_DMA_EXAMPLE",
+                  "hardware": [
+                        "fmcdac_kcu116"
+                  ]
+            },
+            "iio": {
+                  "flags": "TINYIIOD=y",
+                  "hardware": [
+                        "fmcdac_kcu116"
+                  ]
+            }
+      }
+}

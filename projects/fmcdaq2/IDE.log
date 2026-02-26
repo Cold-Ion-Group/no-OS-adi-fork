@@ -1,0 +1,34 @@
+18:18:33 INFO  : Platform repository initialization has completed.
+18:18:33 INFO  : Launching XSCT server: xsct.bat -n  -interactive C:\Users\fpga_\Desktop\adi\no-OS\projects\fmcdaq2\temp_xsdb_launch_script.tcl
+18:18:33 INFO  : Registering command handlers for Vitis TCF services
+18:18:35 INFO  : XSCT server has started successfully.
+18:18:35 INFO  : Successfully done setting XSCT server connection channel  
+18:18:35 INFO  : plnx-install-location is set to ''
+18:18:35 INFO  : Successfully done query RDI_DATADIR 
+18:18:35 INFO  : Successfully done setting workspace for the tool. 
+18:19:50 INFO  : Result from executing command 'getProjects': kcu105
+18:19:50 INFO  : Result from executing command 'getPlatforms': 
+18:19:50 WARN  : An unexpected exception occurred in the module 'platform project logging'
+18:19:50 INFO  : Platform 'kcu105' is added to custom repositories.
+18:19:51 INFO  : Platform 'kcu105' is added to custom repositories.
+18:51:35 INFO  : Connected to target on host '127.0.0.1' and port '3121'.
+18:51:35 WARN  : Part name present in the hardware specification 'xcku040-ffva1156-2-e' doesn't match the one present on the target 'xcku5p'.
+18:51:55 INFO  : ----------------XSDB Script----------------
+connect -url tcp:127.0.0.1:3121
+----------------End of Script----------------
+
+19:16:05 INFO  : Launching XSCT server: xsct.bat -n  -interactive C:\Users\fpga_\Desktop\adi\no-OS\projects\fmcdaq2\temp_xsdb_launch_script.tcl
+19:16:07 INFO  : Platform repository initialization has completed.
+19:16:07 INFO  : Registering command handlers for Vitis TCF services
+19:16:08 INFO  : XSCT server has started successfully.
+19:16:10 INFO  : Successfully done setting XSCT server connection channel  
+19:16:10 INFO  : plnx-install-location is set to ''
+19:16:10 INFO  : Successfully done query RDI_DATADIR 
+19:16:10 INFO  : Successfully done setting workspace for the tool. 
+19:17:37 INFO  : Result from executing command 'getProjects': kcu105;system_top
+19:17:37 INFO  : Result from executing command 'getPlatforms': kcu105|C:/Users/fpga_/Desktop/adi/no-OS/projects/fmcdaq2/kcu105/export/kcu105/kcu105.xpfm
+19:17:37 WARN  : An unexpected exception occurred in the module 'platform project logging'
+19:17:37 INFO  : Platform 'system_top' is added to custom repositories.
+19:17:38 INFO  : Platform 'system_top' is added to custom repositories.
+19:18:37 ERROR : An unexpected exception occurred in the module 'reading platform'
+19:18:37 WARN  : Failed to update project references for project test

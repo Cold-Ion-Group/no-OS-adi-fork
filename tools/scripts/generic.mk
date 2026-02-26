@@ -166,42 +166,6 @@ endif
 include $(NO-OS)/tools/scripts/xilinx.mk
 endif
 
-ifeq 'altera' '$(PLATFORM)'
-HARDWARE := $(filter %.sopcinfo, $(HARDWARE))
-ifeq '' '$(HARDWARE)'
-$(error 'No HARDWARE for altera found. Add .sopcinfo file')
-endif
-include $(NO-OS)/tools/scripts/altera.mk
-endif
-
-ifeq 'aducm3029' '$(PLATFORM)'
-HARDWARE := $(filter pinmux_config.c, $(HARDWARE))
-ifeq '' '$(HARDWARE)'
-$(error 'No HARDWARE for aducm3029 found. Add pinmux_config.c file')
-endif
-include $(NO-OS)/tools/scripts/aducm.mk
-endif
-
-ifeq 'stm32' '$(PLATFORM)'
-HARDWARE := $(filter %.ioc, $(HARDWARE))
-ifeq '' '$(HARDWARE)'
-$(error 'No HARDWARE for stm32 found. Add .ioc file.')
-endif
-include $(NO-OS)/tools/scripts/stm32.mk
-endif
-
-ifeq 'linux' '$(PLATFORM)'
-include $(NO-OS)/tools/scripts/linux.mk
-endif
-
-ifeq 'maxim' '$(PLATFORM)'
-include $(NO-OS)/tools/scripts/maxim.mk
-endif
-
-ifeq 'pico' '$(PLATFORM)'
-include $(NO-OS)/tools/scripts/pico.mk
-endif
-
 #------------------------------------------------------------------------------
 #                            COMMON COMPILER FLAGS                             
 #------------------------------------------------------------------------------

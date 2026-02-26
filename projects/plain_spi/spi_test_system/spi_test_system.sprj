@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="ASCII"?>
+<systemproject:SystemProject xmi:version="2.0" xmlns:xmi="http://www.omg.org/XMI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:sdkproject="http://www.xilinx.com/sdkproject" xmlns:systemproject="http://www.xilinx.com/systemproject" name="spi_test_system" platform="C:/Users/fpga_/Desktop/adi/no-OS/projects/plain_spi/system_top/export/system_top/system_top.xpfm" platformUID="xilinx:kcu116::0.0(custom)" sysConfig="system_top" runtime="cpp" rootFSLocation="" linuxImage="" sysroot="">
+  <configuration name="Debug" id="com.xilinx.sdx.system.managedbuilder.debugConfiguration.2002459152">
+    <configBuildOptions xsi:type="systemproject:SystemOptions">
+      <applications name="spi_test" domainName="standalone_sys_mb" domainPrettyName="standalone_sys_mb" appBuildConfig="Debug"/>
+      <options xsi:type="sdkproject:SdkOptions" generateSdCard="true"/>
+    </configBuildOptions>
+    <lastBuildOptions xsi:type="systemproject:SystemOptions">
+      <applications name="spi_test" domainName="standalone_sys_mb" domainPrettyName="standalone_sys_mb" appBuildConfig="Debug"/>
+      <options xsi:type="sdkproject:SdkOptions" generateSdCard="true"/>
+    </lastBuildOptions>
+  </configuration>
+  <configuration name="Release" id="com.xilinx.sdx.system.managedbuilder.releaseConfiguration.514947365">
+    <configBuildOptions xsi:type="systemproject:SystemOptions">
+      <applications name="spi_test" domainName="standalone_sys_mb" domainPrettyName="standalone_sys_mb" appBuildConfig="Release"/>
+      <options xsi:type="sdkproject:SdkOptions" generateSdCard="true"/>
+    </configBuildOptions>
+  </configuration>
+</systemproject:SystemProject>

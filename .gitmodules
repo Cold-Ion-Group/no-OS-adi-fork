@@ -1,6 +1,6 @@
 [submodule "libraries/mbedtls"]
 	path = libraries/mbedtls
-	url = https://github.com/ARMmbed/mbedtls
+	url = git@github.com:Cold-Ion-Group/mbedtls-fork.git
 [submodule "libraries/mqtt/paho.mqtt.embedded-c"]
 	path = libraries/mqtt/paho.mqtt.embedded-c
 	url = https://github.com/eclipse/paho.mqtt.embedded-c

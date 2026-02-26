@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="ASCII"?>
+<systemproject:SystemProject xmi:version="2.0" xmlns:xmi="http://www.omg.org/XMI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:systemproject="http://www.xilinx.com/systemproject" name="hello_world_system" platform="C:/Users/fpga_/Desktop/adi/no-OS/projects/plain_spi/interface_with_spi_1/export/interface_with_spi_1/interface_with_spi_1.xpfm" platformUID="xilinx:kcu116:name:0.0(custom)" sysConfig="interface_with_spi_1" runtime="cpp" rootFSLocation="" linuxImage="" sysroot="">
+  <configuration name="Emulation-SW" id="com.xilinx.sdx.system.managedbuilder.swemu.configuration.1543196575">
+    <configBuildOptions xsi:type="systemproject:SystemOptions">
+      <applications name="hello_world" domainName="standalone_microblaze_mcs_0_microblaze_I" domainPrettyName="standalone_microblaze_mcs_0_microblaze_I" appBuildConfig="Debug"/>
+    </configBuildOptions>
+    <lastBuildOptions xsi:type="systemproject:SystemOptions">
+      <applications name="hello_world" domainName="standalone_microblaze_mcs_0_microblaze_I" domainPrettyName="standalone_microblaze_mcs_0_microblaze_I" appBuildConfig="Debug"/>
+    </lastBuildOptions>
+  </configuration>
+  <configuration name="Emulation-HW" id="com.xilinx.sdx.system.managedbuilder.hwemu.configuration.1875999967">
+    <configBuildOptions xsi:type="systemproject:SystemOptions" target="hw_emu">
+      <applications name="hello_world" domainName="standalone_microblaze_mcs_0_microblaze_I" domainPrettyName="standalone_microblaze_mcs_0_microblaze_I" appBuildConfig="Debug"/>
+    </configBuildOptions>
+  </configuration>
+  <configuration name="Hardware" id="com.xilinx.sdx.system.managedbuilder.hw.configuration.26432175">
+    <configBuildOptions xsi:type="systemproject:SystemOptions" target="hw">
+      <applications name="hello_world" domainName="standalone_microblaze_mcs_0_microblaze_I" domainPrettyName="standalone_microblaze_mcs_0_microblaze_I" appBuildConfig="Debug"/>
+    </configBuildOptions>
+  </configuration>
+</systemproject:SystemProject>

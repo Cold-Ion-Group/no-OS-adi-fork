@@ -1,0 +1,291 @@
+*** UART TEST - XIL_PRINTF ***
+*** Switching to xil_printf for all output ***
+
+==============================================
+FMCDAC Application Started
+==============================================
+[SETUP] Starting FMCDAC setup...
+[SETUP] Initializing GPIO...
+[SETUP] GPIO initialized successfully
+[SETUP] Initializing SPI...
+[SPI] Configuring SPI parameters...
+[SPI] AD9516 chip_select = 0 (maps to spi_csn_clk)
+[SPI] AD9144 chip_select = 1 (maps to spi_csn_dac)
+[SPI] SPI_DEVICE_ID = 0
+[SPI] SPI clock speed = 2000000 Hz
+[SPI] SPI mode = 0 (should be 0 for MODE_0)
+[SPI] Verify AXI SPI has exactly 2 CS lines enabled in Vivado
+[SETUP] SPI initialized successfully
+[SETUP] Initializing I2C...
+[I2C] device_id=0 base=0x41600000
+[SETUP] I2C initialized successfully
+[I2C] mux 0x74 ACK (state=0x10)
+[SETUP] Si5328 skipped — GTH REFCLK from AD9516 (122.88 MHz)
+[SETUP] Initializing Clock (AD9516)...
+[TEST] Testing SPI communication...
+[TEST] SPI initialized for test
+[TEST] SPI read result: ret=0, data=0x00 0x00 0x41
+[SETUP] Clock configuration prepared
+[SETUP] Initializing JESD204...
+[SETUP] JESD initialized successfully
+Clock configurations:
+        1 - Clock distributor (external CLK input, use DAC PLL)
+        2 - Synthesizer (AD9516 PLL/VCO)
+        3 - External clock (bypass DAC PLL)
+        7 - Clock-only debug (AD9516 distribution only)
+choose an option [default 1]:
+Available sampling rates:
+        1 - DAC 983 MSPS (PLL on)
+        2 - DAC 983 MSPS (PLL on)
+        3 - DAC  500 MSPS
+        4 - DAC  600 MSPS
+        5 - DAC 2000 MSPS (2x interpolation)
+        6 - DAC PLL lock-only test (49.152 MHz ref, skip XCVR/JESD)
+choose an option [default 1]:
+1 - DAC 983 MSPS (PLL)
+[SETUP] Configuring AD9516 clock distribution...
+[AD9516] Enabling SDO (4-wire SPI mode) before reading PART ID...
+[AD9516] Writing 0x99 to register 0x0000 (enable SDO)...
+[AD9516] Confirming SDO with value 0x81...
+Reading PART ID from register address: 0x10003
+[AD9516] PART ID read successful: 0x41
+[AD9516] pll_calc ref=122880 kHz r=0 p=0 a=0 b=0 pfd=0 kHz fvco=0 kHz
+[AD9516] VCO target: 2457600 kHz (vco_div=1)
+[AD9516] Outputs programmed (OUT1/OUT6/OUT9/OUT7): CLK=122880 kHz SYSREF=15360 kHz FPGA_CLK=122880 kHz FPGA_SYSREF=15360 kHz
+[AD9516] OUT1 power-up (0x0A -> 0x08)
+[AD9516] OUT6 (DAC_SYSREF) reg=0x42: pd=0 lvds=0 current=1 invert=2
+[AD9516] OUT7 (FPGA_SYSREF) reg=0x43: pd=1 lvds=0 current=1 invert=2
+[AD9516] OUT7 (FPGA_SYSREF) FORCED POWER-UP (0x43 -> 0x42)
+[AD9516] OUT8 (unused) reg=0x42: pd=0 lvds=0 current=1 invert=2
+[AD9516] OUT9 (FPGA_CLK) reg=0x43: pd=1 lvds=0 current=1 invert=2
+[AD9516] OUT9 (FPGA_CLK) FORCED POWER-UP (0x43 -> 0x42)
+[AD9516] LVDS DIV3 ctrl=0x00 (byp1=0 byp2=0)
+[AD9516] LVDS DIV4 ctrl=0x00 (byp1=0 byp2=0)
+[AD9516] DIV4 (OUT8/9) FORCED BYPASS (0x00 -> 0x30)
+[AD9516] DIV3 (OUT6/7) FORCED BYPASS (0x00 -> 0x30)
+[AD9516] DIV4 after fix=0x30 (byp1=1 byp2=1)
+[AD9516] External CLK mode; PLL disabled, skipping lock wait
+[AD9516] Readback 0x0000 (0x0000)=0x99
+[AD9516] Readback 0x0001 (0x0001)=0x00
+[AD9516] Readback PFD_CP (0x0010)=0x7D
+[AD9516] Readback R_CNT (0x0012)=0x0001 (14-bit value=1)
+[AD9516] Readback A_CNT (0x0013)=0x00
+[AD9516] Readback B_CNT (0x0015)=0x0003 (13-bit value=3)
+[AD9516] Readback PLL_CTRL1 (0x0016)=0x06
+[AD9516] Readback PLL_CTRL2 (0x0017)=0x00
+[AD9516] Readback PLL_CTRL3 (0x0018)=0x06
+[AD9516] Readback PLL_CTRL6 (0x001B)=0xA0
+[AD9516] Readback PLL_CTRL7 (0x001C)=0x03
+[AD9516] Readback PLL_RB (0x001F)=0x0E
+[AD9516] Readback OUT1 (0x00F1)=0x08
+[AD9516] Readback DIV0_0 (0x0190)=0x00
+[AD9516] Readback DIV0_1 (0x0191)=0x80
+[AD9516] Readback DIV0_2 (0x0192)=0x00
+[AD9516] Readback VCO_DIV (0x01E0)=0x02
+[AD9516] Readback INPUT_CLKS (0x01E1)=0x01
+[AD9516] Readback UPDATE (0x0232)=0x00
+[SETUP] AD9516 configured successfully
+[SETUP] Configuring JESD204 transceivers...
+ad9144_xcvr: OK (9830400 kHz)
+[SETUP] Transceivers configured successfully
+[SETUP] Configuring AD9144 (legacy mode)...
+[AD9144] pll_calc fref=122880 kHz fdac=983040 kHz ref_div_mode=1 lo_div_mode=2
+[AD9144] pll_calc ref_div=2 pfd=61440 kHz bcount=8 fvco=7864320 kHz
+[AD9144] LO_DIV (0x08B)=0x02
+[AD9144] REF_DIV (0x08C)=0x01
+[AD9144] BCOUNT (0x085)=0x08
+[AD9144] DACPLLT5 (0x1B5)=0x09 (test 0x08 -> 0x08)
+[AD9144] DACPLLTB (0x1BB)=0x13
+[AD9144] DACPLLT18 (0x1C5)=0x06
+[AD9144] DACPLLSTATUS (0x084)=0x22
+[AD9144] DACPLLSTATUS (0x084)=0x22
+[AD9144] DACPLLSTATUS (0x084)=0x22
+[AD9144] DACPLLSTATUS (0x084)=0x22
+[AD9144] DACPLLSTATUS (0x084)=0x22
+[AD9144] DACPLLCNTRL (0x083)=0x10
+[AD9144] PLL_STATUS (0x281)=0x00
+[AD9144][XBAR-DEBUG] init_param->lane_mux[] = {4, 5, 6, 7, 0, 1, 2, 3}
+[AD9144] Lane XBAR: wrote [0x2C 0x3E 0x08 0x1A], readback [0x2C 0x3E 0x08 0x1A]
+[AD9144] Lane polarity invert (0x334) = 0x04
+[JESD] Sanity: deskew=0x0F cgs=0x0F frame=0x0F chksum=0x0F ilas=0x0F
+[JESD] L0: cgs=1 frame=1 chksum=1 ilas=1
+[JESD] L1: cgs=1 frame=1 chksum=1 ilas=1
+[JESD] L2: cgs=1 frame=1 chksum=1 ilas=1
+[JESD] L3: cgs=1 frame=1 chksum=1 ilas=1
+[JESD] SERDES: CDR(0x230)=0x28 PLLDIV(0x289)=0x04 PLL_STATUS(0x281)=0x0B
+
+[LINK-DEBUG] AD9144 Receiver-Side Status:
+[LINK-DEBUG] SERDES PLL status (0x281) = 0x0B (locked=1)
+[LINK-DEBUG] CDR operating mode (0x230) = 0x28
+[LINK-DEBUG] JRX_CTRL_0 (0x300) = 0x01 (link_en=1)
+[LINK-DEBUG] JRX_CTRL_1 (0x301) = 0x00 (subclass=0)
+[LINK-DEBUG] SYNC_CTRL (0x03A) = 0x81
+[LINK-DEBUG] SYNC_STATUS (0x03B) = 0x0D
+[LINK-DEBUG] CGS       (0x470) = 0x0F (expect 0x0F for 4 lanes)
+[LINK-DEBUG] Frame Sync(0x471) = 0x0F (expect 0x0F for 4 lanes)
+[LINK-DEBUG] Checksum  (0x472) = 0x0F (expect 0x0F for 4 lanes)
+[LINK-DEBUG] Init Sync (0x473) = 0x0F (expect 0x0F for 4 lanes)
+[LINK-DEBUG] FPGA TX link_status (0x280) = 0x00000013 (state=DATA)
+[LINK-DEBUG] FPGA TX SYNC~ = DEASSERTED (good)
+[LINK-DEBUG] FPGA TX link_state (0x0C4) = 0x00000000
+[LINK-DEBUG] XCVR status (0x14) = 0x00000001
+[LINK-DEBUG]   Expected: CPLLs locked, TX buffers up, resets deasserted
+[LINK-DEBUG] All lanes achieved CGS - K28.5 detected successfully
+[LINK-DEBUG] *** SUCCESS: All lanes in sync (CGS+Frame+Checksum+ILAS)! ***
+[LINK-DEBUG] XBAR0 (0x308) = 0x2C, XBAR1 (0x309) = 0x3E
+[LINK-DEBUG] Lane invert (0x334) = 0x04
+[LINK-DEBUG] ==========================================
+
+ad9144_dac: Successfully initialized (983056640 Hz)
+[SETUP] AXI DAC core initialized successfully
+
+[K-DEBUG] JESD204B Configuration Verification:
+[K-DEBUG] FPGA JESD TX Base: 0x44A90000
+[K-DEBUG] Register 0x210 (CONF0) = 0x0000001F
+[K-DEBUG]   Octets/Multiframe = 32 (K*F)
+[K-DEBUG]   Octets/Frame (F) = 1
+[K-DEBUG]   Frames/Multiframe (K) = 32
+[K-DEBUG] AD9144 REG_ILS_K (0x455) = 0x1F (K=32)
+[K-DEBUG] AD9144 REG_ILS_F (0x454) = 0x00 (F=1)
+[K-DEBUG] Byte Clock = 245760 kHz
+[K-DEBUG] Expected LMFC (FPGA) = 7680 kHz
+[K-DEBUG] Expected LMFC (AD9144) = 7680 kHz
+[K-DEBUG] K parameter match confirmed: K=32
+[K-DEBUG] Raw register bit analysis:
+[K-DEBUG]   Bits [7:0]  = 0x1F (value=31, K*F=32)
+[K-DEBUG]   Bits [9:0]  = 0x01F (value=31, K*F=32)
+[K-DEBUG]   Bits [25:16] = 0x000 (F-1=0, F=1)
+[K-DEBUG] ==========================================
+
+[SETUP] FMCDAC setup completed successfully!
+
+[MAIN] Setup completed successfully!
+
+[TEST] Starting FMCDAC tests...
+[ENUM-CHECK] AXI DAC data select: DDS=0 SED=1 ZERO=3 PN7=4 PN15=5 PN23=6 PN31=7
+ad9144_jesd status:
+        Link is enabled
+        Measured Link Clock: 245.764 MHz
+        Reported Link Clock: 245.760 MHz
+        Lane rate: 9830.400 MHz
+        Lane rate / 40: 245.760 MHz
+        LMFC rate: 30.720 MHz
+        SYNC~: deasserted
+        Link status: DATA
+        SYSREF captured: disabled
+        SYSREF alignment error: disabled
+
+[K-DEBUG] POST-LINK-START Register Verification:
+[K-DEBUG] CONF0 after link start = 0x0000001F
+[K-DEBUG]   Bits [7:0]  = 0x1F (K*F = 32)
+[K-DEBUG]   Bits [9:0]  = 0x01F (K*F = 32)
+[K-DEBUG] LMFC calculated from bits[7:0]  = 30720 kHz
+[K-DEBUG] LMFC calculated from bits[9:0]  = 30720 kHz
+[K-DEBUG] LMFC reported by status output = 30720 kHz
+[K-DEBUG] Hardware correctly using bits[7:0] (K*F=32)
+[K-DEBUG] ==========================================
+
+[TEST] FPGA link=DATA  CGS=0x0F  Frame=0x0F  Chksum=0x0F  InitSync=0x0F  (poll=0)
+[TEST] Link fully stable - FPGA DATA, AD9144 CGS+Frame+Chk all 0x0F
+
+[STPL-ZERO] Waiting for 5 consecutive stable link polls before STPL...
+[LINK-STABLE] Achieved 5 consecutive stable polls
+[STPL-ZERO] Using DDS mode with scale=0 for guaranteed zeros
+[STPL-ZERO] Readback: ch0_sel=0x00000000 ch1_sel=0x00000000 ch0_pat=0xB1B0A1A0 ch1_pat=0xD1D0C1C0
+[STPL-ZERO]           ch0_ctrl=0x00000000 ch1_ctrl=0x00000000 dds0_scale=0x00000001 dds1_scale=0x00000001
+[STPL-ZERO]           ch0_iqcor=0x00000000 ch1_iqcor=0x00000000
+[STPL-ZERO] HDL pattern format: pat[31:16]=s1, pat[15:0]=s0, interleaved {s1,s0,s1,s0,...}
+[STPL-ZERO] For M=2 DPW=4: DAC0 sees samples from ch0, DAC1 from ch1
+[STPL-ZERO] Link: FPGA=0x00000013 (DATA) CGS=0x0F Frame=0x0F Chk=0x0F ILAS=0x0F poll=0
+[STPL-ZERO] DAC0: expect=0x0000  fail=0x00  PASS
+[STPL-ZERO] DAC1: expect=0x0000  fail=0x00  PASS
+[STPL-ZERO] Zero pattern PASSES - test mechanism works!
+
+[STPL-PATTERN] Waiting for 5 consecutive stable link polls before SED pattern test...
+[LINK-STABLE] Achieved 5 consecutive stable polls
+[STPL-DIAG] AXI DAC core base=0x44A04000  num_channels=2
+[STPL-DIAG] FPGA ch0: pat_reg=0xB1B0A1A0  sel_reg=0x00000001
+[STPL-DIAG] FPGA ch1: pat_reg=0xD1D0C1C0  sel_reg=0x00000001
+[STPL-DIAG] FPGA ch2: pat_reg=0xDEADDEAD  sel_reg=0xDEADDEAD (NOT in HDL)
+[STPL-DIAG] FPGA ch3: pat_reg=0xDEADDEAD  sel_reg=0xDEADDEAD (NOT in HDL)
+[STPL-DIAG] AD9144 num_converters=2  STPL expected:
+[STPL-DIAG]   DAC0: s0=0xA1A0 s1=0xB1B0 s2=0xA1A0 s3=0xB1B0
+[STPL-DIAG]   DAC1: s0=0xC1C0 s1=0xD1D0 s2=0xC1C0 s3=0xD1D0
+[STPL-DIAG] AD9144 ILS: SCR_L=0x83 (SCR=1 L=4) M=2 N=16 N'=16 S=1 HD=1 CF=0
+[STPL-DIAG] AD9144 ILS raw: 0x453=0x83 0x459=0x20 0x45A=0x80
+[STPL-DIAG] PRE-TEST link: FPGA=0x00000013 (DATA) CGS=0x0F Frame=0x0F Chk=0x0F ILAS=0x0F poll=0
+[STPL-DIAG] JESD TX data_path_width reg (0x14) = 0x00000402 (synth_dpw=4 tpl_dpw=4)
+ad9144_short_pattern_test : STPL PASS dac=0 sample=0 value=0xa1a0
+ad9144_short_pattern_test : STPL PASS dac=0 sample=1 value=0xb1b0
+ad9144_short_pattern_test : STPL PASS dac=0 sample=2 value=0xa1a0
+ad9144_short_pattern_test : STPL PASS dac=0 sample=3 value=0xb1b0
+ad9144_short_pattern_test : STPL PASS dac=1 sample=0 value=0xc1c0
+ad9144_short_pattern_test : STPL PASS dac=1 sample=1 value=0xd1d0
+ad9144_short_pattern_test : STPL PASS dac=1 sample=2 value=0xc1c0
+ad9144_short_pattern_test : STPL PASS dac=1 sample=3 value=0xd1d0
+[TEST] PN7 link: CGS=0x0F Frame=0x0F poll=0
+[TEST] PRBS7 test PASSED
+[TEST] PN15 link: CGS=0x0F Frame=0x0F poll=0
+[TEST] PRBS15 test PASSED
+[DDS] AXI DAC core: clock_hz=983056640 Hz, num_channels=2
+[DDS] IOUTFS set: DAC0/DAC1 gain = 0x01FF
+[DDS] GPIO before: TRI=0xFFFFFFFF DATA=0x00600000
+[DDS] GPIO after:  TRI=0xFF9FFFFF DATA=0x00600000 (dac_ctrl=3)
+[DDS] ch0 tone0 set_freq(10000000 Hz) ret=0
+[DDS] ch0 tone0 set_scale(800000) ret=0
+[DDS] ch0 datasel=DDS ret=0
+[DDS] ch1 tone2 set_freq(10000000 Hz) ret=0
+[DDS] ch1 tone2 set_scale(800000) ret=0
+[DDS] ch1 datasel=DDS ret=0
+[DDS-DIAG] AXI DAC register dump:
+[DDS-DIAG] ch0: SCALE[0x400]=0x00003333 (sc=0x3333) INCR[0x404]=0x0000029B (ftw=0x029B init=0x0000) SEL[0x418]=0x00000000
+[DDS-DIAG] ch1: SCALE[0x440]=0x00003333 (sc=0x3333) INCR[0x444]=0x0000029B (ftw=0x029B init=0x0000) SEL[0x458]=0x00000000
+[DDS-DIAG] PWRCNTRL0=0x00 CLKCFG0=0x00 DACPLLSTATUS=0x22
+[DDS-DIAG] DACGAIN0=0x01FF DACGAIN1=0x01FF
+[DDS] Setup complete. Starting frequency sweep...
+[SWEEP] 39 steps, SWEEP_HOLD_MS=50 (tune if timing is off)
+[SWEEP]  10 MHz  (ftw=0x029B)
+[SWEEP]  15 MHz  (ftw=0x03E7)
+[SWEEP]  20 MHz  (ftw=0x0535)
+[SWEEP]  25 MHz  (ftw=0x0683)
+[SWEEP]  30 MHz  (ftw=0x07CF)
+[SWEEP]  35 MHz  (ftw=0x091D)
+[SWEEP]  40 MHz  (ftw=0x0A6B)
+[SWEEP]  45 MHz  (ftw=0x0BB7)
+[SWEEP]  50 MHz  (ftw=0x0D05)
+[SWEEP]  55 MHz  (ftw=0x0E53)
+[SWEEP]  60 MHz  (ftw=0x0F9F)
+[SWEEP]  65 MHz  (ftw=0x10ED)
+[SWEEP]  70 MHz  (ftw=0x123B)
+[SWEEP]  75 MHz  (ftw=0x1387)
+[SWEEP]  80 MHz  (ftw=0x14D5)
+[SWEEP]  85 MHz  (ftw=0x1623)
+[SWEEP]  90 MHz  (ftw=0x176F)
+[SWEEP]  95 MHz  (ftw=0x18BD)
+[SWEEP] 100 MHz  (ftw=0x1A0B)
+[SWEEP] 105 MHz  (ftw=0x1B57)
+[SWEEP] 110 MHz  (ftw=0x1CA5)
+[SWEEP] 115 MHz  (ftw=0x1DF3)
+[SWEEP] 120 MHz  (ftw=0x1F3F)
+[SWEEP] 125 MHz  (ftw=0x208D)
+[SWEEP] 130 MHz  (ftw=0x21DB)
+[SWEEP] 135 MHz  (ftw=0x2327)
+[SWEEP] 140 MHz  (ftw=0x2475)
+[SWEEP] 145 MHz  (ftw=0x25C3)
+[SWEEP] 150 MHz  (ftw=0x270F)
+[SWEEP] 155 MHz  (ftw=0x285D)
+[SWEEP] 160 MHz  (ftw=0x29AB)
+[SWEEP] 165 MHz  (ftw=0x2AF7)
+[SWEEP] 170 MHz  (ftw=0x2C45)
+[SWEEP] 175 MHz  (ftw=0x2D93)
+[SWEEP] 180 MHz  (ftw=0x2EDF)
+[SWEEP] 185 MHz  (ftw=0x302D)
+[SWEEP] 190 MHz  (ftw=0x317B)
+[SWEEP] 195 MHz  (ftw=0x32C7)
+[SWEEP] 200 MHz  (ftw=0x3415)
+[SWEEP] Done. Holding max frequency...
+[TEST] All tests PASSED
+
+==============================================
+FMCDAC Application Completed Successfully
+==============================================

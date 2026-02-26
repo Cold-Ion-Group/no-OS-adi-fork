@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="ASCII"?>
+<systemproject:SystemProject xmi:version="2.0" xmlns:xmi="http://www.omg.org/XMI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:sdkproject="http://www.xilinx.com/sdkproject" xmlns:systemproject="http://www.xilinx.com/systemproject" name="kcu116_system" platform="C:/Users/fpga_/Desktop/adi/no-OS/projects/fmcdac/system_top/export/system_top/system_top.xpfm" platformUID="xilinx:kcu116::0.0(custom)" sysConfig="system_top" runtime="cpp" rootFSLocation="" linuxImage="" sysroot="">
+  <configuration name="Debug" id="com.xilinx.sdx.system.managedbuilder.debugConfiguration.322028020">
+    <configBuildOptions xsi:type="systemproject:SystemOptions">
+      <applications name="kcu116" domainName="standalone_sys_mb" domainPrettyName="standalone_sys_mb" appBuildConfig="Debug"/>
+      <options xsi:type="sdkproject:SdkOptions" generateSdCard="true"/>
+    </configBuildOptions>
+  </configuration>
+  <configuration name="Release" id="com.xilinx.sdx.system.managedbuilder.releaseConfiguration.366713456">
+    <configBuildOptions xsi:type="systemproject:SystemOptions">
+      <applications name="kcu116" domainName="standalone_sys_mb" domainPrettyName="standalone_sys_mb" appBuildConfig="Release"/>
+      <options xsi:type="sdkproject:SdkOptions" generateSdCard="true"/>
+    </configBuildOptions>
+  </configuration>
+</systemproject:SystemProject>

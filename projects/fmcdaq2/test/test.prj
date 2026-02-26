@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="ASCII"?>
+<sdkproject:SdkProject xmi:version="2.0" xmlns:xmi="http://www.omg.org/XMI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:sdkproject="http://www.xilinx.com/sdkproject" name="test" location="C:/Users/fpga_/Desktop/adi/no-OS/projects/fmcdaq2/test" platform="C:/Users/fpga_/Desktop/adi/no-OS/projects/fmcdaq2/kcu105/export/kcu105/kcu105.xpfm" platformUID="xilinx:kcu105::0.0(custom)" systemProject="test_system" sysConfig="kcu105" runtime="cpp" cpu="standalone_sys_mb" cpuInstance="sys_mb" os="standalone" mssSignature="6df6c0f54ed9f7342c3494f3d6573a3f">
+  <configuration name="Debug" id="xilinx.gnu.mb.exe.debug.390093463" dirty="true">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <configuration name="Release" id="xilinx.gnu.mb.exe.release.1485632821" dirty="true">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <template appTemplateName="empty_application"/>
+</sdkproject:SdkProject>

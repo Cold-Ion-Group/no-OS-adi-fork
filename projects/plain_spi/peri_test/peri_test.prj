@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="ASCII"?>
+<sdkproject:SdkProject xmi:version="2.0" xmlns:xmi="http://www.omg.org/XMI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:sdkproject="http://www.xilinx.com/sdkproject" name="peri_test" location="C:/Users/fpga_/Desktop/adi/no-OS/projects/plain_spi/peri_test" platform="C:/Users/fpga_/Desktop/adi/no-OS/projects/plain_spi/basic_interfaces_wrapper/export/basic_interfaces_wrapper/basic_interfaces_wrapper.xpfm" platformUID="xilinx:kcu116:name:0.0(custom)" systemProject="peri_test_system" sysConfig="basic_interfaces_wrapper" runtime="cpp" cpu="standalone_microblaze_0" cpuInstance="microblaze_0" os="standalone" mssSignature="88332186a49e1178eb928df55a806544">
+  <configuration name="Debug" id="xilinx.gnu.mb.exe.debug.1944851635">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+    <lastBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <configuration name="Release" id="xilinx.gnu.mb.exe.release.2139650111" dirty="true">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <template appTemplateName="peripheral_tests"/>
+</sdkproject:SdkProject>

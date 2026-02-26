@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="ASCII"?>
+<sdkproject:SdkProject xmi:version="2.0" xmlns:xmi="http://www.omg.org/XMI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:sdkproject="http://www.xilinx.com/sdkproject" name="mbp" location="C:/Users/fpga_/Desktop/adi/no-OS/projects/plain_spi/mbp" platform="C:/Users/fpga_/Desktop/adi/no-OS/projects/plain_spi/mb_preset_wrapper/export/mb_preset_wrapper/mb_preset_wrapper.xpfm" platformUID="xilinx:kcu116::0.0(custom)" systemProject="mbp_system" sysConfig="mb_preset_wrapper" runtime="cpp" cpu="standalone_microblaze_0" cpuInstance="microblaze_0" os="standalone" mssSignature="bb3c7a3b296051f95249fbb10ae36632">
+  <configuration name="Debug" id="xilinx.gnu.mb.exe.debug.1713491952">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+    <lastBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <configuration name="Release" id="xilinx.gnu.mb.exe.release.565809880" dirty="true">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <template appTemplateName="peripheral_tests"/>
+</sdkproject:SdkProject>

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="ASCII"?>
+<sdkproject:SdkProject xmi:version="2.0" xmlns:xmi="http://www.omg.org/XMI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:sdkproject="http://www.xilinx.com/sdkproject" name="no-os" location="C:/Users/fpga_/Desktop/adi/no-OS/projects/plain_spi/no-os" platform="C:/Users/fpga_/Desktop/adi/no-OS/projects/plain_spi/baare_metal_ex/export/baare_metal_ex/baare_metal_ex.xpfm" platformUID="xilinx:kcu116::0.0(custom)" systemProject="no-os_system" sysConfig="baare_metal_ex" runtime="C/C++" cpu="standalone_domain" cpuInstance="microblaze_0" os="standalone" mssSignature="b3168af7917eff1dcf0a940a800a1f86">
+  <configuration name="Debug" id="xilinx.gnu.mb.exe.debug.428312720">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+    <lastBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <configuration name="Release" id="xilinx.gnu.mb.exe.release.1477106829" dirty="true">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <template appTemplateName="hello_world"/>
+</sdkproject:SdkProject>

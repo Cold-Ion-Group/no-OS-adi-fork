@@ -1,0 +1,66 @@
+# Golden Register Dump
+# Captured: 2026-02-14 | Firmware: 973d79cc2 | Board: KCU116 + AD-FMCDAC1-EBZ
+# All values from UART boot log (golden/uart_boot_log.txt)
+
+## AD9516 Clock Distributor
+AD9516_SERIAL_CTRL   (0x0000) = 0x99   # SDO enabled, 4-wire SPI
+AD9516_PART_ID       (0x0003) = 0x41   # Matches AD9516 PART ID
+AD9516_PFD_CP        (0x0010) = 0x7D
+AD9516_R_CNT         (0x0012) = 0x0001 # (14-bit value=1)
+AD9516_A_CNT         (0x0013) = 0x00
+AD9516_B_CNT         (0x0015) = 0x0003 # (13-bit value=3)
+AD9516_PLL_CTRL1     (0x0016) = 0x06
+AD9516_PLL_CTRL2     (0x0017) = 0x00
+AD9516_PLL_CTRL3     (0x0018) = 0x06
+AD9516_PLL_CTRL6     (0x001B) = 0xA0
+AD9516_PLL_CTRL7     (0x001C) = 0x03
+AD9516_PLL_RB        (0x001F) = 0x0E
+AD9516_OUT1          (0x00F1) = 0x08   # DAC_CLK output, powered up
+AD9516_DIV0_0        (0x0190) = 0x00
+AD9516_DIV0_1        (0x0191) = 0x80
+AD9516_DIV0_2        (0x0192) = 0x00
+AD9516_VCO_DIV       (0x01E0) = 0x02
+AD9516_INPUT_CLKS    (0x01E1) = 0x01
+AD9516_UPDATE        (0x0232) = 0x00
+
+## AD9144 DAC
+AD9144_DACPLLSTATUS  (0x084)  = 0x22   # cal_valid, lock bits
+AD9144_DACPLLCNTRL   (0x083)  = 0x10
+AD9144_PLL_STATUS    (0x281)  = 0x0B   # SERDES PLL locked
+AD9144_CDR_MODE      (0x230)  = 0x28
+AD9144_JRX_CTRL_0    (0x300)  = 0x01   # link_en=1
+AD9144_JRX_CTRL_1    (0x301)  = 0x00   # subclass=0
+AD9144_SYNC_CTRL     (0x03A)  = 0x81
+AD9144_SYNC_STATUS   (0x03B)  = 0x0D
+AD9144_CGS_FLAG      (0x470)  = 0x0F   # All 4 lanes CGS OK
+AD9144_FRAME_FLAG    (0x471)  = 0x0F   # All 4 lanes frame sync OK
+AD9144_CHKSUM_FLAG   (0x472)  = 0x0F   # All 4 lanes checksum OK
+AD9144_ILAS_FLAG     (0x473)  = 0x0F   # All 4 lanes ILAS OK
+AD9144_XBAR0         (0x308)  = 0x2C
+AD9144_XBAR1         (0x309)  = 0x3E
+AD9144_LANE_INVERT   (0x334)  = 0x04   # Lane 2 polarity inverted
+
+## AD9144 ILS (ILAS-reported parameters)
+AD9144_ILS_SCR_L     (0x453)  = 0x83   # SCR=1, L=4
+AD9144_ILS_F         (0x454)  = 0x00   # F=1
+AD9144_ILS_K         (0x455)  = 0x1F   # K=32
+AD9144_ILS_NP        (0x459)  = 0x20   # N'=16, subclassv
+AD9144_ILS_HD        (0x45A)  = 0x80   # HD=1, CF=0
+
+## FPGA JESD TX Core
+JESD_TX_CONF0        (0x210)  = 0x0000001F  # K*F=32, F=1
+JESD_TX_LINK_STATUS  (0x280)  = 0x00000013  # state=DATA, SYNC~ deasserted
+JESD_TX_LINK_STATE   (0x0C4)  = 0x00000000
+
+## FPGA XCVR
+XCVR_STATUS          (0x14)   = 0x00000001  # CPLLs locked
+
+## AXI DAC Core (DDS steady-state @ 10 MHz)
+DAC_CH0_SCALE        (0x400)  = 0x00003333  # DDS scale
+DAC_CH0_INCR         (0x404)  = 0x0000029B  # FTW for 10 MHz
+DAC_CH0_SEL          (0x418)  = 0x00000000  # DDS data source
+DAC_CH1_SCALE        (0x440)  = 0x00003333
+DAC_CH1_INCR         (0x444)  = 0x0000029B
+DAC_CH1_SEL          (0x458)  = 0x00000000
+AD9144_DACGAIN0              = 0x01FF
+AD9144_DACGAIN1              = 0x01FF

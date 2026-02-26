@@ -1,63 +1,12 @@
-/***************************************************************************//**
- *   @file   AD9516.c
- *   @brief  Implementation of AD9516 Driver.
- *   @author DBogdan (dragos.bogdan@analog.com)
- *   @author Prerna Baranwal, modified for kcu116 and ad9144
-********************************************************************************
- * Copyright 2012(c) Analog Devices, Inc.
- *
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *  - Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  - Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in
- *    the documentation and/or other materials provided with the
- *    distribution.
- *  - Neither the name of Analog Devices, Inc. nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *  - The use of this software may or may not infringe the patent rights
- *    of one or more patent holders.  This license does not release you
- *    from the requirement that you obtain separate licenses from these
- *    patent holders to use this software.
- *  - Use of the software either in source or binary form, must be run
- *    on or directly connected to an Analog Devices Inc. component.
- *
- * THIS SOFTWARE IS PROVIDED BY ANALOG DEVICES "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, NON-INFRINGEMENT,
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL ANALOG DEVICES BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, INTELLECTUAL PROPERTY RIGHTS, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*******************************************************************************/
 
-/******************************************************************************/
-/***************************** Include Files **********************************/
-/******************************************************************************/
 #include <stdlib.h>
 #include <errno.h>
 #include "no_os_delay.h"
 #include "ad9516.h"
 
 
-/***************************************************************************//**
- * @brief Initializes the AD9516.
- *
- * @param device     - The device structure.
- * @param init_param - The structure that contains the device initial
- * 		       parameters.
- *
- * @return Returns 0 in case of success or negative error code.
-*******************************************************************************/
 int32_t ad9516_setup(struct ad9516_dev **device,
-		     struct ad9516_init_param *init_param)
+		     struct ad9516_init_param init_param)
 {
 	int32_t		    ret = 0;
 	int8_t		    index = 0;
@@ -80,36 +29,83 @@ int32_t ad9516_setup(struct ad9516_dev **device,
 		return -1;
 	}
 
-	dev->ad9516_st = init_param->ad9516_st;
-	dev->ad9516_type = init_param->ad9516_type;
+	dev->ad9516_st = init_param.ad9516_st;
+	dev->ad9516_type = init_param.ad9516_type;
 
 	/* Initializes the SPI peripheral */
-	ret = no_os_spi_init(&dev->spi_desc, &init_param->spi_init);
+	ret = no_os_spi_init(&dev->spi_desc, &init_param.spi_init);
+	// doesnot do anything, remove it 
 	if (ret) {
 		printf("SPI initialization failed with error code: %d\n", ret);
+		free(dev);
 		return ret;
 	}
 
+	printf("[AD9516] Enabling SDO (4-wire SPI mode) before reading PART ID...\n");
+	/* Enable SDO output (4-wire mode) - CRITICAL for AD9516 to drive MISO line */
+	/* AD9516 defaults to 3-wire mode with SDO disabled, causing 0xFF reads */
+	/* Write to register 0x000 (SERIAL_PORT_CONFIG) to enable SDO */
+	
+	/* Try multiple writes to ensure SDO gets enabled */
+	uint8_t sdo_enable_buffer[3];
+	
+	/* First attempt: Enable SDO + Long Instruction */
+	sdo_enable_buffer[0] = 0x00;  /* High byte of address 0x000 (write mode, bit 15=0) */
+	sdo_enable_buffer[1] = 0x00;  /* Low byte of address 0x000 */
+	sdo_enable_buffer[2] = 0x99;  /* Data: SDO_ACTIVE(0x81) + LONG_INSTRUCTION(0x18) = 0x99 */
+	
+	printf("[AD9516] Writing 0x%02X to register 0x0000 (enable SDO)...\n", sdo_enable_buffer[2]);
+	ret = no_os_spi_write_and_read(dev->spi_desc, sdo_enable_buffer, 3);
+	if (ret < 0) {
+		printf("[AD9516] SDO enable write returned error: %d (continuing anyway)\n", ret);
+	}
+	
+	/* Small delay to let SDO stabilize */
+	no_os_mdelay(10);
+	
+	/* Second write: Confirm SDO active without soft reset */
+	sdo_enable_buffer[2] = 0x81;  /* Just SDO_ACTIVE bit */
+	printf("[AD9516] Confirming SDO with value 0x%02X...\n", sdo_enable_buffer[2]);
+	ret = no_os_spi_write_and_read(dev->spi_desc, sdo_enable_buffer, 3);
+	no_os_mdelay(10);
+
 	printf("Reading PART ID from register address: 0x%X\n", AD9516_REG_PART_ID);
-    ret = ad9516_read(dev, AD9516_REG_PART_ID, &reg_value);
-    if (ret) {
-    printf("Failed to read PART ID register. Error code: %d\n", ret);
-    return ret;
-    }
-printf("PART ID read: 0x%X\n", reg_value);
+  
 
 	ret = ad9516_read(dev, AD9516_REG_PART_ID, &reg_value);
 	if (ret) {
 		printf("Failed to read PART ID register. Error code: %d\n", ret);
+		printf("[AD9516] CRITICAL: SDO may still be disabled or hardware issue\n");
+		printf("[AD9516] Check: 1) AD9516 power rails, 2) SPI CS0 routing, 3) MISO connection\n");
 		return ret;
 	}
+	
+	printf("[AD9516] PART ID read successful: 0x%02X\n", reg_value);
+	
 	if (reg_value != dev->ad9516_type) {
 		printf("PART ID mismatch. Expected: 0x%X, Got: 0x%X\n", dev->ad9516_type, reg_value);
+		
+		if (reg_value == 0xFF) {
+			printf("[AD9516] ERROR: Still reading 0xFF - SDO not enabled or hardware fault\n");
+			printf("[AD9516] Possible causes:\n");
+			printf("  1. AD9516 not powered (check VDD pins with multimeter)\n");
+			printf("  2. CS0 not reaching AD9516 CS pin (probe with scope)\n");
+			printf("  3. MISO stuck high (check FMC level translator)\n");
+			printf("  4. Wrong chip variant on board (check silkscreen)\n");
+		} else if (reg_value == 0x00) {
+			printf("[AD9516] ERROR: Reading 0x00 - possible short or wrong device\n");
+		} else {
+			printf("[AD9516] ERROR: Unexpected part ID - wrong chip or variant\n");
+		}
+		
 		return -EFAULT;
 	}
 
-	/* Configure serial port for long instructions and reset the serial interface. */
-	ret = ad9516_write(dev, AD9516_REG_SERIAL_PORT_CONFIG, AD9516_SOFT_RESET | AD9516_LONG_INSTRUCTION);
+	/* Configure serial port for long instructions and reset the serial interface.
+	 * Keep SDO active so subsequent register reads work. */
+	ret = ad9516_write(dev, AD9516_REG_SERIAL_PORT_CONFIG,
+			   AD9516_SOFT_RESET | AD9516_LONG_INSTRUCTION |
+			   AD9516_SDO_ACTIVE);
 	if (ret < 0) {
 		printf("Failed to write to SERIAL PORT CONFIG register. Error code: %d\n", ret);
 		return ret;
@@ -121,7 +117,8 @@ printf("PART ID read: 0x%X\n", reg_value);
 	}
 
 	/* Clear AD9516_SOFT_RESET bit to complete reset operation. */
-	ret = ad9516_write(dev, AD9516_REG_SERIAL_PORT_CONFIG, AD9516_LONG_INSTRUCTION);
+	ret = ad9516_write(dev, AD9516_REG_SERIAL_PORT_CONFIG,
+			   AD9516_LONG_INSTRUCTION | AD9516_SDO_ACTIVE);
 	if (ret < 0) {
 		printf("Failed to clear SOFT_RESET bit. Error code: %d\n", ret);
 		return ret;
@@ -142,6 +139,18 @@ printf("PART ID read: 0x%X\n", reg_value);
 	ret = ad9516_write(dev, AD9516_REG_PLL_CTRL_7, reg_value);
 	if (ret < 0) {
 		printf("Failed to write PLL reference mode. Error code: %d\n", ret);
+		return ret;
+	}
+
+	/* Enable frequency monitors for CLK/REF1/REF2 inputs. */
+	reg_value = AD9516_VCO_FREQ_MONITOR;
+	if (dev->ad9516_st.pdata->ref_1_power_on)
+		reg_value |= AD9516_REF1_FREQ_MONITOR;
+	if (dev->ad9516_st.pdata->ref_2_power_on)
+		reg_value |= AD9516_REF2_FREQ_MONITOR;
+	ret = ad9516_write(dev, AD9516_REG_PLL_CTRL_6, reg_value);
+	if (ret < 0) {
+		printf("Failed to write PLL_CTRL_6. Error code: %d\n", ret);
 		return ret;
 	}
 
@@ -186,8 +195,16 @@ printf("PART ID read: 0x%X\n", reg_value);
 
 	/* Check if VCO is selected as input. */
 	if (dev->ad9516_st.pdata->vco_clk_sel) {
+		int64_t vco_freq;
+
 		/* Sets the VCO frequency. */
-		ad9516_vco_frequency(dev, dev->ad9516_st.pdata->int_vco_freq);
+		vco_freq = ad9516_vco_frequency(dev,
+						dev->ad9516_st.pdata->int_vco_freq);
+		if (vco_freq < 0) {
+			printf("[AD9516] VCO frequency setup failed: %lld\n",
+			       (long long)vco_freq);
+			return (int32_t)vco_freq;
+		}
 
 		/* Activate PLL */
 		reg_value = AD9516_PLL_POWER_DOWN(0x0) | AD9516_CP_MODE(0x3) | AD9516_CP_CURRENT(0x7) | 0 * AD9516_PFD_POLARITY;
@@ -236,19 +253,19 @@ printf("PART ID read: 0x%X\n", reg_value);
 		no_os_mdelay(88);
 	}
 
+	/* Latch any buffered output settings. */
+	ret = ad9516_update(dev);
+	if (ret < 0) {
+		printf("Failed to update AD9516 after configuration. Error code: %d\n", ret);
+		return ret;
+	}
+
 	*device = dev;
 
 	return ret;
 }
 
 
-/***************************************************************************//**
- * @brief Free the resources allocated by ad9516_setup().
- *
- * @param dev - The device structure.
- *
- * @return 0 in case of success, negative error code otherwise.
-*******************************************************************************/
 int32_t ad9516_remove(struct ad9516_dev *dev)
 {
 	int32_t ret;
@@ -260,15 +277,6 @@ int32_t ad9516_remove(struct ad9516_dev *dev)
 	return ret;
 }
 
-/***************************************************************************//**
-* @brief Writes data into a register.
-*
-* @param dev      - The device structure.
-* @param reg_addr - The address of the register to be written.
-* @param reg_val  - The value to be written into the register.
-*
-* @return Returns 0 in case of success or negative error code.
-*******************************************************************************/
 int32_t ad9516_write(struct ad9516_dev *dev,
 		     uint32_t reg_addr,
 		     uint16_t reg_val)
@@ -297,15 +305,6 @@ int32_t ad9516_write(struct ad9516_dev *dev,
 	return ret;
 }
 
-/***************************************************************************//**
-* @brief Reads data from a register.
-*
-* @param dev      - The device structure.
-* @param reg_addr - The address of the register to be read.
-* @param reg_value - Pointer to the value to be read from the register.
-*
-* @return Returns the read data or negative error code.
-*******************************************************************************/
 int32_t ad9516_read(struct ad9516_dev *dev,
 		    uint32_t reg_addr,
 		    uint32_t *reg_value)
@@ -334,30 +333,12 @@ int32_t ad9516_read(struct ad9516_dev *dev,
 	return ret;
 }
 
-/***************************************************************************//**
- * @brief Transfers the contents of the buffer registers into the active
- *        registers.
- *
- * @param dev - The device structure.
- *
- * @return Returns 0 in case of success or negative error code.
-*******************************************************************************/
 int32_t ad9516_update(struct ad9516_dev *dev)
 {
 	return ad9516_write(dev,
 			    AD9516_REG_UPDATE_ALL_REGS,
 			    AD9516_UPDATE_ALL_REGS);
 }
-
-
-/***************************************************************************//**
- * @brief Sets the VCO frequency.
- *
- * @param dev       - The device structure.
- * @param frequency - The desired frequency value.
- *
- * @return vco_freq - The actual frequency value that was set.
-*******************************************************************************/
 int64_t ad9516_vco_frequency(struct ad9516_dev *dev,
 			     int64_t frequency)
 {
@@ -409,6 +390,8 @@ int64_t ad9516_vco_frequency(struct ad9516_dev *dev,
 		ref_freq = dev->ad9516_st.pdata->ref_2_en ?
 			   dev->ad9516_st.pdata->ref_2_freq : dev->
 			   ad9516_st.pdata->ref_1_freq;
+	if (ref_freq == 0)
+		return -EINVAL;
 	dev->ad9516_st.r_counter = 1;
 	pfd_freq = ref_freq / dev->ad9516_st.r_counter;
 	while(pfd_freq > AD9516_MAX_PFD_FREQ) {
@@ -447,6 +430,9 @@ int64_t ad9516_vco_frequency(struct ad9516_dev *dev,
 	ad9516_read(dev, AD9516_REG_PLL_CTRL_1, &reg_value);
 	if((int32_t)reg_value < 0)
 		return reg_value;
+	reg_value &= ~(AD9516_RESET_R_COUNTER |
+		       AD9516_RESET_A_B_COUNTERS |
+		       AD9516_RESET_ALL_COUNTERS);
 	reg_value &= ~AD9516_PRESCALER_P(0x7);
 	reg_value |= AD9516_PRESCALER_P(prescaler);
 	ad9516_write(dev, AD9516_REG_PLL_CTRL_1, reg_value);
@@ -470,15 +456,6 @@ int64_t ad9516_vco_frequency(struct ad9516_dev *dev,
 
 	return vco_freq;
 }
-
-/***************************************************************************//**
- * @brief Checks if the number can be decomposed into a product of two numbers
- *        smaller or equal to 32 each one.
- *
- * @param number - The number.
- *
- * @return Returns 1 if the number can't be decomposed or 0 otherwise.
-*******************************************************************************/
 int8_t dividers_checker(int32_t number)
 {
 	int32_t i = 0;
@@ -495,16 +472,6 @@ int8_t dividers_checker(int32_t number)
 
 	return 1;
 }
-
-/***************************************************************************//**
- * @brief Sets the frequency on the specified channel.
- *
- * @param dev       - The device structure.
- * @param channel   - The channel.
- * @param frequency - The desired frequency value.
- *
- * @return set_freq - The actual frequency value that was set.
-*******************************************************************************/
 int64_t ad9516_frequency(struct ad9516_dev *dev,
 			 int32_t channel,
 			 int64_t frequency)
@@ -527,12 +494,12 @@ int64_t ad9516_frequency(struct ad9516_dev *dev,
 
 	if(dev->ad9516_st.pdata->vco_clk_sel) {
 		/* VCO is selected as input. */
-		freq_to_chan_div = dev->ad9516_st.pdata->int_vco_freq;
-		freq_to_chan_div_backup = freq_to_chan_div;
-		/* VCO divider cannot be bypassed when VCO is selected as
-		 * input. */
-		dev->ad9516_st.vco_divider = 2;
-		freq_to_chan_div >>= 1;
+		freq_to_chan_div_backup = dev->ad9516_st.pdata->int_vco_freq;
+		/* VCO divider cannot be bypassed when VCO is selected as input. */
+		if (dev->ad9516_st.vco_divider < 2)
+			dev->ad9516_st.vco_divider = 2;
+		freq_to_chan_div = freq_to_chan_div_backup /
+				   dev->ad9516_st.vco_divider;
 	} else {
 		/* External Clock is selected as input. */
 		freq_to_chan_div = dev->ad9516_st.pdata->ext_clk_freq;
@@ -594,7 +561,7 @@ int64_t ad9516_frequency(struct ad9516_dev *dev,
 		}
 	}
 	freq_to_chan_div_backup = freq_to_chan_div;
-	if((channel >= 0) && (channel <= 7)) {
+	if((channel >= 0) && (channel <= 9)) {
 		if(divider == 0) {
 			divider = 1;
 			freq_0_divider = divider;
@@ -632,32 +599,37 @@ int64_t ad9516_frequency(struct ad9516_dev *dev,
 		}
 		if((channel >= 0) && (channel <= 5)) {
 			/* LVPECL Channels. */
+			int pair = channel / 2;
+			int32_t bypass_reg;
+			if (pair == 0)
+				bypass_reg = AD9516_REG_DIVIDER_0_1;
+			else if (pair == 1)
+				bypass_reg = AD9516_REG_DIVIDER_1_1;
+			else
+				bypass_reg = AD9516_REG_DIVIDER_2_1;
 			if(divider == 1) {
-				if(channel / 2) {
-					reg_address = AD9516_REG_DIVIDER_1_1;
-				} else {
-					reg_address = AD9516_REG_DIVIDER_0_1;
-				}
-				ad9516_read(dev, reg_address, &reg_value);
+				reg_address = bypass_reg;
+				ad9516_read(dev, bypass_reg, &reg_value);
 				if((int32_t)reg_value < 0) {
 					return reg_value;
 				}
 				reg_value |= AD9516_DIVIDER_BYPASS;
 			} else {
-				if(channel / 2) {
-					reg_address = AD9516_REG_DIVIDER_1_0;
-				} else {
+				if (pair == 0)
 					reg_address = AD9516_REG_DIVIDER_0_0;
+				else if (pair == 1)
+					reg_address = AD9516_REG_DIVIDER_1_0;
+				else
+					reg_address = AD9516_REG_DIVIDER_2_0;
 
-					ret = ad9516_read(dev, AD9516_REG_DIVIDER_0_1, &reg_value);
-					if (ret < 0)
-						return ret;
+				ret = ad9516_read(dev, bypass_reg, &reg_value);
+				if (ret < 0)
+					return ret;
 
-					reg_value &= ~AD9516_DIVIDER_BYPASS;
-					ret = ad9516_write(dev, AD9516_REG_DIVIDER_0_1, reg_value);
-					if (ret < 0)
-						return ret;
-				}
+				reg_value &= ~AD9516_DIVIDER_BYPASS;
+				ret = ad9516_write(dev, bypass_reg, reg_value);
+				if (ret < 0)
+					return ret;
 				/* The duty cycle closest to 50% is selected. */
 				reg_value =
 					AD9516_DIVIDER_LOW_CYCLES(((divider / 2) - 1)) |
@@ -670,15 +642,12 @@ int64_t ad9516_frequency(struct ad9516_dev *dev,
 			}
 		} else {
 			/* LVDS/CMOS Channels. */
+			int use_divider4 = (channel >= 8);
 			if(divider == 1) {
 				/* Bypass the dividers. */
-				if(channel / 6) {
-					reg_address =
-						AD9516_REG_LVDS_CMOS_DIVIDER_4_0;
-				} else {
-					reg_address =
-						AD9516_REG_LVDS_CMOS_DIVIDER_3_0;
-				}
+				reg_address = use_divider4 ?
+					      AD9516_REG_LVDS_CMOS_DIVIDER_4_0 :
+					      AD9516_REG_LVDS_CMOS_DIVIDER_3_0;
 				ad9516_read(dev, reg_address, &reg_value);
 				if((int32_t)reg_value < 0) {
 					return reg_value;
@@ -692,13 +661,9 @@ int64_t ad9516_frequency(struct ad9516_dev *dev,
 			} else {
 				if(divider <= 32) {
 					/* Bypass the divider 2. */
-					if(channel / 6) {
-						reg_address =
-							AD9516_REG_LVDS_CMOS_DIVIDER_4_1;
-					} else {
-						reg_address =
-							AD9516_REG_LVDS_CMOS_DIVIDER_3_1;
-					}
+					reg_address = use_divider4 ?
+						      AD9516_REG_LVDS_CMOS_DIVIDER_4_1 :
+						      AD9516_REG_LVDS_CMOS_DIVIDER_3_1;
 					ad9516_read(dev,
 						    reg_address,
 						    &reg_value);
@@ -712,13 +677,9 @@ int64_t ad9516_frequency(struct ad9516_dev *dev,
 					if(ret < 0) {
 						return ret;
 					}
-					if(channel / 6) {
-						reg_address =
-							AD9516_REG_LVDS_CMOS_DIVIDER_4_0;
-					} else {
-						reg_address =
-							AD9516_REG_LVDS_CMOS_DIVIDER_3_0;
-					}
+					reg_address = use_divider4 ?
+						      AD9516_REG_LVDS_CMOS_DIVIDER_4_0 :
+						      AD9516_REG_LVDS_CMOS_DIVIDER_3_0;
 					/* The duty cycle closest to 50% is selected. */
 					reg_value =
 						AD9516_LOW_CYCLES_DIVIDER_1(((divider /
@@ -744,13 +705,9 @@ int64_t ad9516_frequency(struct ad9516_dev *dev,
 							divider_1 /= divider_2;
 						}
 					} while(divider_1 > 32);
-					if(channel / 6) {
-						reg_address =
-							AD9516_REG_LVDS_CMOS_DIVIDER_4_0;
-					} else {
-						reg_address =
-							AD9516_REG_LVDS_CMOS_DIVIDER_3_0;
-					}
+					reg_address = use_divider4 ?
+						      AD9516_REG_LVDS_CMOS_DIVIDER_4_0 :
+						      AD9516_REG_LVDS_CMOS_DIVIDER_3_0;
 					/* The duty cycle closest to 50% is selected. */
 					reg_value =
 						AD9516_LOW_CYCLES_DIVIDER_1(((divider_1 /
@@ -765,13 +722,9 @@ int64_t ad9516_frequency(struct ad9516_dev *dev,
 					if(ret < 0) {
 						return ret;
 					}
-					if(channel / 6) {
-						reg_address =
-							AD9516_REG_LVDS_CMOS_DIVIDER_4_2;
-					} else {
-						reg_address =
-							AD9516_REG_LVDS_CMOS_DIVIDER_3_2;
-					}
+					reg_address = use_divider4 ?
+						      AD9516_REG_LVDS_CMOS_DIVIDER_4_2 :
+						      AD9516_REG_LVDS_CMOS_DIVIDER_3_2;
 					/* The duty cycle closest to 50% is selected. */
 					reg_value =
 						AD9516_LOW_CYCLES_DIVIDER_2(((divider_2 /
@@ -796,16 +749,6 @@ int64_t ad9516_frequency(struct ad9516_dev *dev,
 
 	return set_freq;
 }
-
-/***************************************************************************//**
- * @brief Sets the phase on the specified channel.
- *
- * @param dev     - The device structure.
- * @param channel - The channel.
- * @param phase   - The desired phase value.
- *
- * @return Returns the phase or negative error code.
-*******************************************************************************/
 int32_t ad9516_phase(struct ad9516_dev *dev, int32_t channel, int32_t phase)
 {
 	uint32_t reg_value = 0;
@@ -813,12 +756,14 @@ int32_t ad9516_phase(struct ad9516_dev *dev, int32_t channel, int32_t phase)
 	int32_t ret = 0;
 
 	if((channel >= 0) && (channel <= 9)) {
-		if((channel >= 0) && (channel <= 3)) {
-			if(channel / 2) {
-				reg_address = AD9516_REG_DIVIDER_1_1;
-			} else {
+		if((channel >= 0) && (channel <= 5)) {
+			int pair = channel / 2;
+			if (pair == 0)
 				reg_address = AD9516_REG_DIVIDER_0_1;
-			}
+			else if (pair == 1)
+				reg_address = AD9516_REG_DIVIDER_1_1;
+			else
+				reg_address = AD9516_REG_DIVIDER_2_1;
 
 			ad9516_read(dev, reg_address, &reg_value);
 			if((int32_t)reg_value < 0) {
@@ -827,11 +772,10 @@ int32_t ad9516_phase(struct ad9516_dev *dev, int32_t channel, int32_t phase)
 			reg_value &= ~AD9516_DIVIDER_PHASE_OFFSET(0xF);
 			reg_value |= AD9516_DIVIDER_PHASE_OFFSET(phase);
 		} else {
-			if(channel / 6) {
-				reg_address = AD9516_REG_LVDS_CMOS_DIVIDER_4_1;
-			} else {
-				reg_address = AD9516_REG_LVDS_CMOS_DIVIDER_3_1;
-			}
+			int use_divider4 = (channel >= 8);
+			reg_address = use_divider4 ?
+				      AD9516_REG_LVDS_CMOS_DIVIDER_4_1 :
+				      AD9516_REG_LVDS_CMOS_DIVIDER_3_1;
 			reg_value = AD9516_PHASE_OFFSET_DIVIDER_2(((phase / 2) +
 					(phase % 2))) |
 				    AD9516_PHASE_OFFSET_DIVIDER_1(phase / 2);
@@ -845,15 +789,7 @@ int32_t ad9516_phase(struct ad9516_dev *dev, int32_t channel, int32_t phase)
 	return phase;
 }
 
-/***************************************************************************//**
- * @brief Sets the power mode of the specified channel.
- *
- * @param dev     - The device structure.
- * @param channel - The channel.
- * @param mode    - Power mode.
- *
- * @return Returns the mode or negative error code.
-*******************************************************************************/
+
 int32_t ad9516_power_mode(struct ad9516_dev *dev, int32_t channel, int32_t mode)
 {
 	struct ad9516_lvpecl_channel_spec *lvpecl_channel;
@@ -941,5 +877,3 @@ int32_t ad9516_power_mode(struct ad9516_dev *dev, int32_t channel, int32_t mode)
 		}
 	}
 }
-
-

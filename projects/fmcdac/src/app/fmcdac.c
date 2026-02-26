@@ -2964,31 +2964,31 @@ static int fmcdac_setup(struct fmcdac_dev *dev,
 
 #ifdef JESD_FSM_ON
 	dev->ad9144_device->link_config.is_transmit = true;
-	dev->ad9144_device->link_config.link_id = fmcdac_init.jtx_link_rx.link_id;
+	dev->ad9144_device->link_config.link_id = fmcdac_init.jrx_link_tx.link_id;
 	dev->ad9144_device->link_config.bank_id = 0;
-	dev->ad9144_device->link_config.device_id = fmcdac_init.jtx_link_rx.device_id;
+	dev->ad9144_device->link_config.device_id = fmcdac_init.jrx_link_tx.device_id;
 	dev->ad9144_device->link_config.octets_per_frame =
-		fmcdac_init.jtx_link_rx.octets_per_frame;
+		fmcdac_init.jrx_link_tx.octets_per_frame;
 	dev->ad9144_device->link_config.frames_per_multiframe =
-		fmcdac_init.jtx_link_rx.frames_per_multiframe;
+		fmcdac_init.jrx_link_tx.frames_per_multiframe;
 	dev->ad9144_device->link_config.samples_per_conv_frame =
-		fmcdac_init.jtx_link_rx.samples_per_converter_per_frame;
+		fmcdac_init.jrx_link_tx.samples_per_converter_per_frame;
 	dev->ad9144_device->link_config.high_density =
-		fmcdac_init.jtx_link_rx.high_density;
+		fmcdac_init.jrx_link_tx.high_density;
 	dev->ad9144_device->link_config.scrambling =
-		fmcdac_init.jtx_link_rx.scrambling;
+		fmcdac_init.jrx_link_tx.scrambling;
 	dev->ad9144_device->link_config.converter_resolution =
-		fmcdac_init.jtx_link_rx.converter_resolution;
+		fmcdac_init.jrx_link_tx.converter_resolution;
 	dev->ad9144_device->link_config.num_converters =
-		fmcdac_init.jtx_link_rx.converters_per_device;
+		fmcdac_init.jrx_link_tx.converters_per_device;
 	dev->ad9144_device->link_config.bits_per_sample =
-		fmcdac_init.jtx_link_rx.bits_per_sample;
+		fmcdac_init.jrx_link_tx.bits_per_sample;
 	dev->ad9144_device->link_config.ctrl_bits_per_sample =
-		fmcdac_init.jtx_link_rx.control_bits_per_sample;
+		fmcdac_init.jrx_link_tx.control_bits_per_sample;
 	dev->ad9144_device->link_config.num_lanes =
-		fmcdac_init.jtx_link_rx.lanes_per_device;
-	dev->ad9144_device->link_config.subclass = fmcdac_init.jtx_link_rx.subclass;
-	dev->ad9144_device->link_config.jesd_version = fmcdac_init.jtx_link_rx.version;
+		fmcdac_init.jrx_link_tx.lanes_per_device;
+	dev->ad9144_device->link_config.subclass = fmcdac_init.jrx_link_tx.subclass;
+	dev->ad9144_device->link_config.jesd_version = fmcdac_init.jrx_link_tx.version;
 
 	dev->ad9144_device->link_config.sysref.capture_falling_edge = 0;
 	dev->ad9144_device->link_config.sysref.mode = JESD204_SYSREF_ONESHOT;

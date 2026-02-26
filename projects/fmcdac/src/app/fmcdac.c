@@ -623,13 +623,35 @@ static int fmcdac_ad9516_program_outputs(struct fmcdac_dev *dev,
 		fpga_ref_khz = dac_ref_khz;
 
 	/*
-	 * SYSREF frequency = fDAC / (K * S)
-	 * For Mode 4: K=32, S=1  =>  983040 / 32 = 30720 kHz (30.72 MHz)
-	 * Use actual DAC sample rate as fDAC source.
+	 * ===== SYSREF Policy (A-02) =====
+	 *
+	 * Frequency: fSYSREF = fDAC / (K × S)  [JESD204B §5.3.3.5]
+	 *   Mode 4: K=32, S=1 → 983040/32 = 30720 kHz = 30.72 MHz
+	 *
+	 * Edge: Two-phase sequencing (required for correct LMFC alignment):
+	 *   1. AD9144 init sets RISING edge (SYSREF_ACTRL0 = 0x04).
+	 *      The AD9144 aligns its LMFC to rising SYSREF during link-up.
+	 *   2. After link reaches DATA state, fmcdac_sysref_tune() switches
+	 *      the AD9144 to FALLING edge and W1C-clears the FPGA SYSREF
+	 *      status. This edge transition produces correct phase alignment
+	 *      between AD9144 and FPGA TX LMFC counters.
+	 *   WARNING: Starting with falling edge from init bricks alignment
+	 *   permanently — the tune cannot recover. Do not change the driver
+	 *   default without re-validating on hardware.
+	 *
+	 * Mode: Continuous SYSREF (REG_SYNC_CTRL = 0xC1, SYSREF-armed).
+	 *   The AD9144 re-aligns its LMFC on every SYSREF pulse.
+	 *   One-shot mode is not used.
 	 */
 	{
 		uint32_t K = dev_init->ad9144_jesd_param.frames_per_multiframe;
-		uint32_t S = 1; /* samples_per_converter_per_frame for Mode 4 */
+		/* S from AD9144 mode table: modes {0,2,3,4,6,7,9,10}→S=1; {1,5}→S=2 */
+		uint32_t S;
+		uint8_t mode = dev_init->ad9144_param.jesd204_mode;
+		if (mode == 1 || mode == 5)
+			S = 2;
+		else
+			S = 1;
 		uint32_t fdac_khz;
 
 		if (dev_init->ad9144_param.pll_enable &&

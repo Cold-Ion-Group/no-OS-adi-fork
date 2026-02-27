@@ -67,8 +67,7 @@ enum fmcdac_clock_mode {
 };
 
 static enum fmcdac_clock_mode g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
-static uint8_t g_pll_lock_only;
-static uint8_t g_clock_only_debug;
+
 static void fmcdac_flush_input(void);
 
 #ifdef JESD_FSM_ON
@@ -619,8 +618,7 @@ static int fmcdac_ad9516_program_outputs(struct fmcdac_dev *dev,
 		return -1;
 	}
 
-	if (g_pll_lock_only)
-		fpga_ref_khz = dac_ref_khz;
+
 
 	/*
 	 * ===== SYSREF Policy (A-02) =====
@@ -907,8 +905,6 @@ static void fmcdac_ad9516_dump_regs(struct ad9516_dev *dev)
 static void fmcdac_apply_clock_mode(struct ad9144_init_param *p_ad9144_param,
 				    struct ad9516_platform_data *p_ad9516_param)
 {
-	if (g_pll_lock_only)
-		return;
 
 	if (g_clk_mode == FMCDAC_CLK_EXTERNAL) {
 		p_ad9144_param->pll_enable = 0;
@@ -982,89 +978,6 @@ static void fmcdac_delay_seconds(uint32_t seconds, uint32_t heartbeat_s)
 	}
 }
 
-static int fmcdac_ad9516_clock_only(struct fmcdac_dev *dev)
-{
-	uint32_t val = 0;
-	int ret;
-
-	xil_printf("[DEBUG] AD9516 clock-only distribution mode\n\r");
-
-	/* Force PLL off (asynchronous power-down). */
-	ret = ad9516_read(dev->ad9516_dev, AD9516_REG_PFD_CHARGE_PUMP, &val);
-	if (ret < 0)
-		return ret;
-	val &= ~AD9516_PLL_POWER_DOWN(0x3);
-	val |= AD9516_PLL_POWER_DOWN(0x3);
-	ret = ad9516_write(dev->ad9516_dev, AD9516_REG_PFD_CHARGE_PUMP, val);
-	if (ret < 0)
-		return ret;
-
-	/* Select external clock path and bypass VCO divider. */
-	ret = ad9516_read(dev->ad9516_dev, AD9516_REG_INPUT_CLKS, &val);
-	if (ret < 0)
-		return ret;
-	val &= ~(AD9516_POWER_DOWN_CLK_INPUT_SECTION |
-		 AD9516_POWER_DOWN_VCO_CLK_INTERFACE |
-		 AD9516_POWER_DOWN_VCO_CLK |
-		 AD9516_SEL_VCO_CLK);
-	val |= AD9516_BYPASS_VCO_DIVIDER;
-	ret = ad9516_write(dev->ad9516_dev, AD9516_REG_INPUT_CLKS, val);
-	if (ret < 0)
-		return ret;
-
-	/* Keep distribution reference powered up. */
-	ret = ad9516_read(dev->ad9516_dev, AD9516_REG_POWER_DOWN_SYNC, &val);
-	if (ret < 0)
-		return ret;
-	val &= ~(AD9516_POWER_DOWN_DIST_REF | AD9516_POWER_DOWN_SYNC);
-	ret = ad9516_write(dev->ad9516_dev, AD9516_REG_POWER_DOWN_SYNC, val);
-	if (ret < 0)
-		return ret;
-
-	/* Ensure OUT1 is enabled (LVPECL). */
-	ret = ad9516_read(dev->ad9516_dev, AD9516_REG_LVPECL_OUT1, &val);
-	if (ret < 0)
-		return ret;
-	val &= ~AD9516_OUT_LVPECL_POWER_DOWN(0x3);
-	ret = ad9516_write(dev->ad9516_dev, AD9516_REG_LVPECL_OUT1, val);
-	if (ret < 0)
-		return ret;
-
-	/* Bypass divider for OUT0/OUT1 pair. */
-	ret = ad9516_read(dev->ad9516_dev, AD9516_REG_DIVIDER_0_1, &val);
-	if (ret < 0)
-		return ret;
-	val |= AD9516_DIVIDER_BYPASS;
-	ret = ad9516_write(dev->ad9516_dev, AD9516_REG_DIVIDER_0_1, val);
-	if (ret < 0)
-		return ret;
-
-	/* Apply update-all so buffered registers take effect. */
-	ret = ad9516_write(dev->ad9516_dev, AD9516_REG_UPDATE_ALL_REGS,
-			   AD9516_UPDATE_ALL_REGS);
-	if (ret < 0)
-		return ret;
-
-	/* Readbacks for verification. */
-	ad9516_read(dev->ad9516_dev, AD9516_REG_PFD_CHARGE_PUMP, &val);
-	xil_printf("[AD9516][DBG] PFD_CP (0x0010)=0x%02lX\n\r", (unsigned long)val);
-	ad9516_read(dev->ad9516_dev, AD9516_REG_INPUT_CLKS, &val);
-	xil_printf("[AD9516][DBG] INPUT_CLKS (0x01E1)=0x%02lX\n\r", (unsigned long)val);
-	ad9516_read(dev->ad9516_dev, AD9516_REG_POWER_DOWN_SYNC, &val);
-	xil_printf("[AD9516][DBG] PWR_DN_SYNC (0x0230)=0x%02lX\n\r", (unsigned long)val);
-	ad9516_read(dev->ad9516_dev, AD9516_REG_LVPECL_OUT1, &val);
-	xil_printf("[AD9516][DBG] OUT1 (0x00F1)=0x%02lX\n\r", (unsigned long)val);
-	ad9516_read(dev->ad9516_dev, AD9516_REG_DIVIDER_0_0, &val);
-	xil_printf("[AD9516][DBG] DIV0_0 (0x0190)=0x%02lX\n\r", (unsigned long)val);
-	ad9516_read(dev->ad9516_dev, AD9516_REG_DIVIDER_0_1, &val);
-	xil_printf("[AD9516][DBG] DIV0_1 (0x0191)=0x%02lX\n\r", (unsigned long)val);
-	ad9516_read(dev->ad9516_dev, AD9516_REG_DIVIDER_0_2, &val);
-	xil_printf("[AD9516][DBG] DIV0_2 (0x0192)=0x%02lX\n\r", (unsigned long)val);
-	ad9516_read(dev->ad9516_dev, AD9516_REG_UPDATE_ALL_REGS, &val);
-	xil_printf("[AD9516][DBG] UPDATE (0x0232)=0x%02lX\n\r", (unsigned long)val);
-
-	return 0;
-}
 
 static void fmcdac_flush_input(void)
 {
@@ -1076,70 +989,6 @@ static void fmcdac_flush_input(void)
 	} while (c != '\n' && c != '\r');
 }
 
-static void fmcdac_ad9516_signature_toggle(struct fmcdac_dev *dev)
-{
-	uint32_t val = 0;
-	uint32_t div01_base = 0;
-	uint32_t div0_0 = 0;
-	uint32_t toggle_count = 0;
-	int ret;
-	uint8_t toggle = 0;
-
-	ret = ad9516_read(dev->ad9516_dev, AD9516_REG_DIVIDER_0_1, &div01_base);
-	if (ret < 0) {
-		xil_printf("[AD9516][DBG] DIV0_1 initial read failed: %d\n\r", ret);
-		div01_base = 0;
-	}
-	div01_base &= ~AD9516_DIVIDER_BYPASS;
-	div0_0 = AD9516_DIVIDER_LOW_CYCLES(0) | AD9516_DIVIDER_HIGH_CYCLES(0);
-
-	xil_printf("[DEBUG] AD9516 signature toggle: OUT1 BYPASS <-> /2 every 30s\n\r");
-	while (1) {
-		if (toggle) {
-			/* Bypass divider => input clock on OUT1. */
-			val = div01_base | AD9516_DIVIDER_BYPASS;
-			ret = ad9516_write(dev->ad9516_dev, AD9516_REG_DIVIDER_0_1, val);
-			if (ret < 0) {
-				xil_printf("[AD9516][DBG] DIV0_1 write failed: %d\n\r", ret);
-				fmcdac_delay_seconds(1, 0);
-				continue;
-			}
-			toggle_count++;
-			xil_printf("[AD9516][DBG] Toggle %lu: OUT1 BYPASS (DIV0_1=0x%02lX)\n\r",
-				   (unsigned long)toggle_count,
-				   (unsigned long)val);
-		} else {
-			/* Divide-by-2: clear bypass and set divider to 2. */
-			val = div01_base & ~AD9516_DIVIDER_BYPASS;
-			ret = ad9516_write(dev->ad9516_dev, AD9516_REG_DIVIDER_0_1, val);
-			if (ret < 0) {
-				xil_printf("[AD9516][DBG] DIV0_1 write failed: %d\n\r", ret);
-				fmcdac_delay_seconds(1, 0);
-				continue;
-			}
-			ret = ad9516_write(dev->ad9516_dev, AD9516_REG_DIVIDER_0_0, div0_0);
-			if (ret < 0) {
-				xil_printf("[AD9516][DBG] DIV0_0 write failed: %d\n\r", ret);
-				fmcdac_delay_seconds(1, 0);
-				continue;
-			}
-			toggle_count++;
-			xil_printf("[AD9516][DBG] Toggle %lu: OUT1 /2 (DIV0_1=0x%02lX)\n\r",
-				   (unsigned long)toggle_count,
-				   (unsigned long)val);
-		}
-
-		ret = ad9516_update(dev->ad9516_dev);
-		if (ret < 0) {
-			xil_printf("[AD9516][DBG] UPDATE failed: %d\n\r", ret);
-		} else {
-			xil_printf("[AD9516][DBG] Update applied; waiting 30s for next toggle\n\r");
-		}
-
-		toggle = !toggle;
-		fmcdac_delay_seconds(30, 5);
-	}
-}
 
 static void fmcdac_ad9144_jesd_sanity(struct ad9144_dev *dev,
 				      const struct ad9144_init_param *init_param)
@@ -2465,13 +2314,10 @@ int fmcdac_reconfig(struct ad9144_init_param *p_ad9144_param,
 	printf ("\t1 - Clock distributor (external CLK input, use DAC PLL)\n");
 	printf ("\t2 - Synthesizer (AD9516 PLL/VCO)\n");
 	printf ("\t3 - External clock (bypass DAC PLL)\n");
-	printf ("\t7 - Clock-only debug (AD9516 distribution only)\n");
 	printf ("choose an option [default 1]:\n");
 
 	clk_mode = getc(stdin);
 	fmcdac_flush_input();
-	g_pll_lock_only = 0;
-	g_clock_only_debug = 0;
 
 	switch (clk_mode) {
 	case '2':
@@ -2484,12 +2330,6 @@ int fmcdac_reconfig(struct ad9144_init_param *p_ad9144_param,
 		p_ad9516_param->vco_clk_sel = 0;
 		p_ad9516_param->power_down_vco_clk = 0;
 		break;
-	case '7':
-		g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
-		g_clock_only_debug = 1;
-		p_ad9516_param->vco_clk_sel = 0;
-		p_ad9516_param->power_down_vco_clk = 0;
-		break;
 	default:
 		g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
 		p_ad9516_param->vco_clk_sel = 0;
@@ -2497,18 +2337,11 @@ int fmcdac_reconfig(struct ad9144_init_param *p_ad9144_param,
 		break;
 	}
 
-	if (g_clock_only_debug) {
-		xil_printf("[DEBUG] Clock-only mode selected; skipping sampling rate selection.\n\r");
-		return 0;
-	}
-
 	printf ("Available sampling rates:\n");
 	printf ("\t1 - DAC 983 MSPS (PLL on)\n");
-	printf ("\t2 - DAC 983 MSPS (PLL on)\n");
 	printf ("\t3 - DAC  500 MSPS\n");
 	printf ("\t4 - DAC  600 MSPS\n");
 	printf ("\t5 - DAC 2000 MSPS (2x interpolation)\n");
-	printf ("\t6 - DAC PLL lock-only test (49.152 MHz ref, skip XCVR/JESD)\n");
 	printf ("choose an option [default 1]:\n");
 
 	mode = getc(stdin);
@@ -2586,38 +2419,7 @@ int fmcdac_reconfig(struct ad9144_init_param *p_ad9144_param,
 
 #endif
 		break;
-	case '2':
-		printf ("2 - DAC 983 MSPS (PLL)\n");
 
-		p_ad9144_param->interpolation = 1;
-		p_ad9144_param->pll_enable = 1;
-		if (g_clk_mode == FMCDAC_CLK_DISTRIBUTE)
-			p_ad9144_param->pll_ref_frequency_khz = 122880;
-		else
-			p_ad9144_param->pll_ref_frequency_khz = 122880;
-		p_ad9144_param->pll_dac_frequency_khz = 983040;
-		p_ad9144_param->lane_rate_kbps = 9830400;
-		ad9144_xcvr_param->lane_rate_khz = 9830400;
-		ad9144_xcvr_param->ref_rate_khz = 122880;
-
-		break;
-	case '6':
-		printf ("6 - DAC PLL lock-only test (122.88 MHz ref)\n");
-
-		g_pll_lock_only = 1;
-		g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
-		p_ad9516_param->vco_clk_sel = 0;
-		p_ad9516_param->power_down_vco_clk = 0;
-		p_ad9516_param->ext_clk_freq = 122880000;
-		p_ad9144_param->interpolation = 1;
-		p_ad9144_param->pll_enable = 1;
-		p_ad9144_param->pll_ref_frequency_khz = 122880;
-		p_ad9144_param->pll_dac_frequency_khz = 983040;
-		p_ad9144_param->lane_rate_kbps = 9830400;
-		ad9144_xcvr_param->lane_rate_khz = 9830400;
-		ad9144_xcvr_param->ref_rate_khz = 122880;
-
-		break;
 	default:
 		printf ("1 - DAC 983 MSPS (PLL)\n");
 		p_ad9144_param->interpolation = 1;
@@ -2761,15 +2563,7 @@ static int fmcdac_setup(struct fmcdac_dev *dev,
 	} else {
 		xil_printf("[SETUP] AD9516 already initialized; skipping re-init\n\r");
 	}
-	if (g_clock_only_debug) {
-		status = fmcdac_ad9516_clock_only(dev);
-		if (status != 0) {
-			xil_printf("[ERROR] AD9516 clock-only setup failed: %d\n\r", status);
-			return status;
-		}
-		xil_printf("[DEBUG] Clock-only mode active; skipping downstream init.\n\r");
-		return 0;
-	}
+
 	status = fmcdac_ad9516_program_outputs(dev, dev_init);
 	if (status != 0) {
 		xil_printf("[ERROR] AD9516 output programming failed: %d\n\r", status);
@@ -2777,36 +2571,7 @@ static int fmcdac_setup(struct fmcdac_dev *dev,
 	}
 	xil_printf("[SETUP] AD9516 configured successfully\n\r");
 
-	if (g_pll_lock_only) {
-		uint8_t clkcfg = 0;
-		uint8_t pllstat = 0;
-		uint8_t cal_valid;
-		uint8_t lock;
-		uint8_t lock_alt;
-		uint8_t over_lo;
-		uint8_t over_hi;
 
-		xil_printf("[TEST] PLL lock-only mode: skipping XCVR/JESD link bring-up\n\r");
-		status = ad9144_setup_legacy(&dev->ad9144_device, &dev_init->ad9144_param);
-		if (dev->ad9144_device) {
-			fmcdac_ad9144_jesd_sanity(dev->ad9144_device, &dev_init->ad9144_param);
-			ad9144_spi_read(dev->ad9144_device, REG_CLKCFG0, &clkcfg);
-			ad9144_spi_read(dev->ad9144_device, REG_DACPLLSTATUS, &pllstat);
-			cal_valid = !!(pllstat & 0x20);
-			lock = !!(pllstat & 0x02);
-			lock_alt = !!(pllstat & 0x10);
-			over_lo = !!(pllstat & 0x40);
-			over_hi = !!(pllstat & 0x80);
-			xil_printf("[AD9144] CLKCFG0 (0x080)=0x%02X\n\r", clkcfg);
-			xil_printf("[AD9144] DACPLLSTATUS (0x084)=0x%02X (cal_valid=%u lock=%u lock_alt=%u over_lo=%u over_hi=%u)\n\r",
-				   pllstat, cal_valid, lock, lock_alt, over_lo, over_hi);
-			if (cal_valid && (lock || lock_alt))
-				status = 0;
-			else
-				status = -1;
-		}
-		return status;
-	}
 
 	// Recommended DAC JESD204 link startup sequence
 	//   1. FPGA JESD204 Link Layer
@@ -3108,8 +2873,8 @@ static void print_boot_banner(void)
 	case FMCDAC_CLK_EXTERNAL:   clk_src = "external bypass";   break;
 	default:                    clk_src = "unknown";            break;
 	}
-	xil_printf("[BANNER] Clock: %s  out_clk_sel=OUTCLK_PMA  PLL=%s\n\r",
-		   clk_src, g_pll_lock_only ? "lock-test" : "on");
+	xil_printf("[BANNER] Clock: %s  out_clk_sel=OUTCLK_PMA  PLL=on\n\r",
+		   clk_src);
 
 	/* Lane crossbar and polarity */
 	xil_printf("[BANNER] Lanes: mux={4,5,6,7,0,1,2,3}"
@@ -3143,16 +2908,7 @@ int main(void)
 	}
 
 	xil_printf("\n\r[MAIN] Setup completed successfully!\n\r");
-	if (g_clock_only_debug)
-		fmcdac_ad9516_signature_toggle(&fmcdac);
-	if (g_pll_lock_only) {
-		xil_printf("[MAIN] PLL lock-only mode complete; skipping tests.\n\r");
-		if (fmcdac.ad9144_device)
-			ad9144_remove(fmcdac.ad9144_device);
-		if (fmcdac.ad9516_dev)
-			ad9516_remove(fmcdac.ad9516_dev);
-		return 0;
-	}
+
 
 #ifdef JESD_FSM_ON
 	pr_info("Using JESD FSM.\n");

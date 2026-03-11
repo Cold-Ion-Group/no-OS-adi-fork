@@ -87,6 +87,15 @@
 #define AXI_DAC_DDS_INCR(x)				(((x) & 0xFFFF) << 0)
 #define AXI_DAC_TO_DDS_INCR(x)			(((x) >> 0) & 0xFFFF)
 
+/* Extension registers for DDS_PHASE_DW > 16 (up_dac_channel.v waddr 0xb/0xc).
+ * Layout: [31:16] = INIT_EXT[15:0], [15:0] = INCR_EXT[15:0].
+ * Full DDS word = {EXT[15:0], BASE[15:0]} when DDS_PHASE_DW == 32. */
+#define AXI_DAC_REG_DDS_INIT_INCR_EXT(x) (0x42C + ((x) >> 1) * 0x40 + ((x) & 1) * 0x4)
+
+/* DDS_PHASE_DW is encoded as (DDS_PHASE_DW - 16) in bits [21:16] of the
+ * tone-0 scale register.  Add 16 to recover the actual width. */
+#define AXI_DAC_TO_DDS_PHASE_DW_RAW(x)	(((x) >> 16) & 0x3F)
+
 #define DAC_REG_DATA_PATTERN(c)			(0x0410 + (c) * 0x40)
 
 #define AXI_DAC_REG_DATA_SELECT(c)		(0x0418 + (c) * 0x40)
@@ -406,11 +415,34 @@ int32_t axi_dac_dds_set_frequency(struct axi_dac *dac,
 	uint32_t reg;
 
 	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
-	axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
-	val64 = (uint64_t) freq_hz * 0xFFFFULL;
-	val64 = val64 / dac->clock_hz;
-	reg = (reg & ~AXI_DAC_DDS_INCR(~0)) | AXI_DAC_DDS_INCR(val64) | 1;
-	axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), reg);
+
+	if (dac->dds_phase_dw > 16) {
+		/* 32-bit FTW: ftw = freq_hz * 2^phase_dw / clock_hz */
+		uint32_t ftw32;
+		val64 = (uint64_t)freq_hz * 0xFFFFFFFFULL;
+		val64 = val64 / dac->clock_hz;
+		ftw32 = (uint32_t)val64;
+
+		/* Write extension FIRST — CDC is triggered by base write */
+		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR_EXT(chan), &reg);
+		reg = (reg & 0xFFFF0000U) | ((ftw32 >> 16) & 0xFFFF);
+		axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR_EXT(chan), reg);
+
+		/* Base register last — triggers CDC transfer */
+		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
+		reg = (reg & ~AXI_DAC_DDS_INCR(~0)) |
+		      AXI_DAC_DDS_INCR(ftw32 & 0xFFFF) | 1;
+		axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), reg);
+	} else {
+		/* Legacy 16-bit path */
+		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
+		val64 = (uint64_t)freq_hz * 0xFFFFULL;
+		val64 = val64 / dac->clock_hz;
+		reg = (reg & ~AXI_DAC_DDS_INCR(~0)) |
+		      AXI_DAC_DDS_INCR(val64) | 1;
+		axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), reg);
+	}
+
 	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
 
 	return 0;
@@ -430,12 +462,27 @@ int32_t axi_dac_dds_get_frequency(struct axi_dac *dac,
 	uint64_t val64;
 
 	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
-	axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
+
+	if (dac->dds_phase_dw > 16) {
+		uint32_t reg_ext;
+		uint32_t ftw32;
+
+		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
+		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR_EXT(chan), &reg_ext);
+
+		ftw32 = ((reg_ext & 0xFFFF) << 16) | (reg & 0xFFFF);
+		val64 = (uint64_t)ftw32 * dac->clock_hz;
+		no_os_do_div(&val64, 0xFFFFFFFFULL);
+		*freq = (uint32_t)val64;
+	} else {
+		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
+		reg = (reg & AXI_DAC_DDS_INCR(~0));
+		val64 = (uint64_t)reg * dac->clock_hz;
+		no_os_do_div(&val64, 0xFFFF);
+		*freq = val64;
+	}
+
 	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
-	reg = (reg & AXI_DAC_DDS_INCR(~0));
-	val64 = (uint64_t) reg * dac->clock_hz;
-	no_os_do_div(&val64, 0xFFFF);
-	*freq = val64;
 
 	return 0;
 }
@@ -455,11 +502,33 @@ int32_t axi_dac_dds_set_phase(struct axi_dac *dac,
 	uint32_t reg;
 
 	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
-	axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
-	val64 = (uint64_t) phase * 0x10000ULL + (360000 / 2);
-	val64 = val64 / 360000;
-	reg = (reg & ~AXI_DAC_DDS_INIT(~0)) | AXI_DAC_DDS_INIT(val64);
-	axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), reg);
+
+	if (dac->dds_phase_dw > 16) {
+		/* 32-bit phase offset: pow = phase * 2^32 / 360000 */
+		uint32_t pow32;
+		val64 = (uint64_t)phase * 0x100000000ULL + (360000 / 2);
+		val64 = val64 / 360000;
+		pow32 = (uint32_t)val64;
+
+		/* Write extension FIRST — CDC is triggered by base write */
+		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR_EXT(chan), &reg);
+		reg = (reg & 0x0000FFFFU) | (((pow32 >> 16) & 0xFFFF) << 16);
+		axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR_EXT(chan), reg);
+
+		/* Base register last — triggers CDC transfer */
+		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
+		reg = (reg & ~AXI_DAC_DDS_INIT(~0)) |
+		      AXI_DAC_DDS_INIT(pow32 & 0xFFFF);
+		axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), reg);
+	} else {
+		/* Legacy 16-bit path */
+		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
+		val64 = (uint64_t)phase * 0x10000ULL + (360000 / 2);
+		val64 = val64 / 360000;
+		reg = (reg & ~AXI_DAC_DDS_INIT(~0)) | AXI_DAC_DDS_INIT(val64);
+		axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), reg);
+	}
+
 	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
 
 	return 0;
@@ -480,13 +549,29 @@ int32_t axi_dac_dds_get_phase(struct axi_dac *dac,
 	uint32_t reg;
 
 	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
-	axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
+
+	if (dac->dds_phase_dw > 16) {
+		uint32_t reg_ext;
+		uint32_t pow32;
+
+		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
+		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR_EXT(chan), &reg_ext);
+
+		pow32 = ((reg_ext >> 16) & 0xFFFF) << 16 |
+		        AXI_DAC_TO_DDS_INIT(reg);
+		val64 = (uint64_t)pow32 * 360000ULL + (0x100000000ULL / 2);
+		no_os_do_div(&val64, 0x100000000ULL);
+		*phase = (uint32_t)val64;
+	} else {
+		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
+		reg = (reg & AXI_DAC_DDS_INIT(~0));
+		reg = AXI_DAC_TO_DDS_INIT(reg);
+		val64 = reg * 360000ULL + (0x10000 / 2);
+		no_os_do_div(&val64, 0x10000);
+		*phase = val64;
+	}
+
 	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
-	reg = (reg & AXI_DAC_DDS_INIT(~0));
-	reg = AXI_DAC_TO_DDS_INIT(reg);
-	val64 = reg * 360000ULL + (0x10000 / 2);
-	no_os_do_div(&val64, 0x10000);
-	*phase = val64;
 
 	return 0;
 }
@@ -895,6 +980,7 @@ int32_t axi_dac_init_begin(struct axi_dac **dac_core,
 	dac->name = init->name;
 	dac->base = init->base;
 	dac->num_channels = init->num_channels;
+	dac->dds_phase_dw = init->dds_phase_dw;
 	dac->channels = init->channels;
 
 	*dac_core = dac;
@@ -924,8 +1010,20 @@ int32_t axi_dac_init_finish(struct axi_dac *dac)
 	dac->clock_hz = freq * ratio;
 	dac->clock_hz = (dac->clock_hz * 390625) >> 8;
 
-	printf("%s: Successfully initialized (%"PRIu64" Hz)\n",
-	       dac->name, dac->clock_hz);
+	/* Auto-detect DDS phase width from IP if not set by init params.
+	 * The HDL encodes (DDS_PHASE_DW - 16) in bits [21:16] of the
+	 * tone-0 scale register (REG_CHAN_CNTRL_1, offset 0x400).
+	 * Add 16 to recover the actual phase accumulator width. */
+	if (dac->dds_phase_dw == 0) {
+		uint32_t scale_reg;
+		uint32_t raw_dw;
+		axi_dac_read(dac, AXI_DAC_REG_DDS_SCALE(0), &scale_reg);
+		raw_dw = AXI_DAC_TO_DDS_PHASE_DW_RAW(scale_reg);
+		dac->dds_phase_dw = (uint8_t)(raw_dw + 16);
+	}
+
+	printf("%s: Successfully initialized (%"PRIu64" Hz, DDS_PHASE_DW=%u)\n",
+	       dac->name, dac->clock_hz, dac->dds_phase_dw);
 
 	return 0;
 }

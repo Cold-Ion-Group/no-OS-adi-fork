@@ -60,6 +60,8 @@ struct axi_dac {
 	uint8_t	num_channels;
 	/** AXI DAC Clock */
 	uint64_t clock_hz;
+	/** DDS phase accumulator width (auto-detected from IP if 0) */
+	uint8_t dds_phase_dw;
 	/** DAC channels manual configuration */
 	struct axi_dac_channel *channels;
 };
@@ -71,6 +73,8 @@ struct axi_dac_init {
 	uint32_t base;
 	/** Number of channels */
 	uint8_t	num_channels;
+	/** DDS phase accumulator width (0 = auto-detect from IP register) */
+	uint8_t dds_phase_dw;
 	/** DAC channels manual configuration */
 	struct axi_dac_channel *channels;
 };

@@ -1696,7 +1696,8 @@ static int force_dds_tone(struct fmcdac_dev *dev)
 	}
 
 	/* 5) Read back AXI DDS registers at correct addresses */
-	dbg_printf("[DDS-DIAG] AXI DAC register dump:\n\r");
+	dbg_printf("[DDS-DIAG] AXI DAC register dump (DDS_PHASE_DW=%u):\n\r",
+		   dev->ad9144_core->dds_phase_dw);
 	for (ch = 0; ch < dev->ad9144_core->num_channels && ch < 4; ch++) {
 		uint32_t tone = ch * 2;
 		/* AXI_DAC_REG_DDS_SCALE(tone) = 0x400 + (tone>>1)*0x40 + (tone&1)*0x8 */
@@ -1710,17 +1711,34 @@ static int force_dds_tone(struct fmcdac_dev *dev)
 		uint32_t incr_val  = Xil_In32(dev->ad9144_core->base + incr_addr);
 		uint32_t sel_val   = Xil_In32(dev->ad9144_core->base + sel_addr);
 
-		uint16_t ftw = incr_val & 0xFFFF;
-		uint16_t init = (incr_val >> 16) & 0xFFFF;
 		uint16_t sc  = scale_val & 0xFFFF;
 
-		dbg_printf("[DDS-DIAG] ch%lu: SCALE[0x%03lX]=0x%08lX (sc=0x%04X) "
-			   "INCR[0x%03lX]=0x%08lX (ftw=0x%04X init=0x%04X) "
-			   "SEL[0x%03lX]=0x%08lX\n\r",
-			   (unsigned long)ch,
-			   (unsigned long)scale_addr, (unsigned long)scale_val, sc,
-			   (unsigned long)incr_addr, (unsigned long)incr_val, ftw, init,
-			   (unsigned long)sel_addr, (unsigned long)sel_val);
+		if (dev->ad9144_core->dds_phase_dw > 16) {
+			/* Extension register: 0x42C + (tone>>1)*0x40 + (tone&1)*0x4 */
+			uint32_t ext_addr = 0x42C + (tone >> 1) * 0x40 + (tone & 1) * 0x4;
+			uint32_t ext_val  = Xil_In32(dev->ad9144_core->base + ext_addr);
+
+			uint32_t ftw32  = ((ext_val & 0xFFFF) << 16) | (incr_val & 0xFFFF);
+			uint32_t init32 = ((ext_val >> 16) & 0xFFFF) << 16 |
+					  ((incr_val >> 16) & 0xFFFF);
+
+			dbg_printf("[DDS-DIAG] ch%lu: sc=0x%04X ftw32=0x%08lX init32=0x%08lX "
+				   "sel=0x%lX\n\r",
+				   (unsigned long)ch, sc,
+				   (unsigned long)ftw32, (unsigned long)init32,
+				   (unsigned long)sel_val);
+		} else {
+			uint16_t ftw = incr_val & 0xFFFF;
+			uint16_t init = (incr_val >> 16) & 0xFFFF;
+
+			dbg_printf("[DDS-DIAG] ch%lu: SCALE[0x%03lX]=0x%08lX (sc=0x%04X) "
+				   "INCR[0x%03lX]=0x%08lX (ftw=0x%04X init=0x%04X) "
+				   "SEL[0x%03lX]=0x%08lX\n\r",
+				   (unsigned long)ch,
+				   (unsigned long)scale_addr, (unsigned long)scale_val, sc,
+				   (unsigned long)incr_addr, (unsigned long)incr_val, ftw, init,
+				   (unsigned long)sel_addr, (unsigned long)sel_val);
+		}
 	}
 
 	/* 6) AD9144 output status */
@@ -1768,11 +1786,20 @@ static int force_dds_tone(struct fmcdac_dev *dev)
 			}
 
 			/* Read back FTW for logging */
-			uint32_t incr_val = Xil_In32(dev->ad9144_core->base + 0x404);
-			uint16_t ftw = incr_val & 0xFFFF;
-
-			xil_printf("[SWEEP] %3lu MHz  (ftw=0x%04X)\n\r",
-				   (unsigned long)f_mhz, ftw);
+			if (dev->ad9144_core->dds_phase_dw > 16) {
+				uint32_t incr_val = Xil_In32(dev->ad9144_core->base + 0x404);
+				uint32_t ext_val  = Xil_In32(dev->ad9144_core->base + 0x42C);
+				uint32_t ftw32 = ((ext_val & 0xFFFF) << 16) |
+						 (incr_val & 0xFFFF);
+				xil_printf("[SWEEP] %3lu MHz  (ftw32=0x%08lX)\n\r",
+					   (unsigned long)f_mhz,
+					   (unsigned long)ftw32);
+			} else {
+				uint32_t incr_val = Xil_In32(dev->ad9144_core->base + 0x404);
+				uint16_t ftw = incr_val & 0xFFFF;
+				xil_printf("[SWEEP] %3lu MHz  (ftw=0x%04X)\n\r",
+					   (unsigned long)f_mhz, ftw);
+			}
 
 			no_os_mdelay(SWEEP_HOLD_MS);
 		}

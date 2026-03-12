@@ -45,8 +45,24 @@
 #include <stdint.h>
 
 /******************************************************************************/
+/********************** Macros and Constants Definitions **********************/
+/******************************************************************************/
+/** Maximum DDS tones: up to 4 channels × 2 tones each */
+#define AXI_DAC_MAX_TONES	8
+
+/******************************************************************************/
 /*************************** Types Declarations *******************************/
 /******************************************************************************/
+/**
+ * @struct axi_dac_dds_shadow
+ * @brief Cached copy of per-tone DDS registers (eliminates read-modify-write).
+ */
+struct axi_dac_dds_shadow {
+	uint32_t init_incr;     /**< Base INIT_INCR register value */
+	uint32_t init_incr_ext; /**< Extension INIT_INCR register value (DDS_PHASE_DW>16) */
+	uint32_t scale;         /**< DDS_SCALE register value */
+};
+
 /**
  * @struct axi_dac
  * @brief AXI DAC Device Descriptor.
@@ -62,6 +78,10 @@ struct axi_dac {
 	uint64_t clock_hz;
 	/** DDS phase accumulator width (auto-detected from IP if 0) */
 	uint8_t dds_phase_dw;
+	/** Batch mode: 1 = SYNC held, setters skip per-call SYNC pulse */
+	uint8_t sync_held;
+	/** Shadow copy of DDS registers — eliminates read-modify-write */
+	struct axi_dac_dds_shadow dds_shadow[AXI_DAC_MAX_TONES];
 	/** DAC channels manual configuration */
 	struct axi_dac_channel *channels;
 };
@@ -137,6 +157,10 @@ int32_t axi_dac_dds_set_phase(struct axi_dac *dac,
 /** AXI DAC Get DDS Phase */
 int32_t axi_dac_dds_get_phase(struct axi_dac *dac,
 			      uint32_t chan, uint32_t *phase);
+/** Hold SYNC — defer all DDS updates until commit */
+void axi_dac_dds_sync_hold(struct axi_dac *dac);
+/** Commit SYNC — apply all deferred DDS updates atomically */
+void axi_dac_dds_sync_commit(struct axi_dac *dac);
 /** AXI DAC Set DDS Scale */
 int32_t axi_dac_dds_set_scale(struct axi_dac *dac,
 			      uint32_t chan,

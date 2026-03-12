@@ -396,7 +396,8 @@ int32_t axi_dac_set_datasel(struct axi_dac *dac,
 	else
 		axi_dac_write(dac, AXI_DAC_REG_CHAN_CNTRL_7(chan), sel);
 
-	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
+	if (!dac->sync_held)
+		axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
 
 	return 0;
 }
@@ -413,37 +414,38 @@ int32_t axi_dac_dds_set_frequency(struct axi_dac *dac,
 {
 	uint64_t val64;
 	uint32_t reg;
+	struct axi_dac_dds_shadow *sh = &dac->dds_shadow[chan];
 
-	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
+	if (!dac->sync_held)
+		axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
 
 	if (dac->dds_phase_dw > 16) {
-		/* 32-bit FTW: ftw = freq_hz * 2^phase_dw / clock_hz */
 		uint32_t ftw32;
 		val64 = (uint64_t)freq_hz * 0xFFFFFFFFULL;
 		val64 = val64 / dac->clock_hz;
 		ftw32 = (uint32_t)val64;
 
-		/* Write extension FIRST — CDC is triggered by base write */
-		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR_EXT(chan), &reg);
-		reg = (reg & 0xFFFF0000U) | ((ftw32 >> 16) & 0xFFFF);
+		/* Extension first (CDC triggered by base write) */
+		reg = (sh->init_incr_ext & 0xFFFF0000U) | ((ftw32 >> 16) & 0xFFFF);
+		sh->init_incr_ext = reg;
 		axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR_EXT(chan), reg);
 
-		/* Base register last — triggers CDC transfer */
-		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
-		reg = (reg & ~AXI_DAC_DDS_INCR(~0)) |
+		/* Base register last */
+		reg = (sh->init_incr & ~AXI_DAC_DDS_INCR(~0)) |
 		      AXI_DAC_DDS_INCR(ftw32 & 0xFFFF) | 1;
+		sh->init_incr = reg;
 		axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), reg);
 	} else {
-		/* Legacy 16-bit path */
-		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
 		val64 = (uint64_t)freq_hz * 0xFFFFULL;
 		val64 = val64 / dac->clock_hz;
-		reg = (reg & ~AXI_DAC_DDS_INCR(~0)) |
+		reg = (sh->init_incr & ~AXI_DAC_DDS_INCR(~0)) |
 		      AXI_DAC_DDS_INCR(val64) | 1;
+		sh->init_incr = reg;
 		axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), reg);
 	}
 
-	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
+	if (!dac->sync_held)
+		axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
 
 	return 0;
 }
@@ -458,31 +460,23 @@ int32_t axi_dac_dds_set_frequency(struct axi_dac *dac,
 int32_t axi_dac_dds_get_frequency(struct axi_dac *dac,
 				  uint32_t chan, uint32_t *freq)
 {
-	uint32_t reg;
+	const struct axi_dac_dds_shadow *sh = &dac->dds_shadow[chan];
 	uint64_t val64;
 
-	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
-
 	if (dac->dds_phase_dw > 16) {
-		uint32_t reg_ext;
 		uint32_t ftw32;
 
-		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
-		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR_EXT(chan), &reg_ext);
-
-		ftw32 = ((reg_ext & 0xFFFF) << 16) | (reg & 0xFFFF);
+		ftw32 = ((sh->init_incr_ext & 0xFFFF) << 16) |
+			(sh->init_incr & 0xFFFF);
 		val64 = (uint64_t)ftw32 * dac->clock_hz;
 		no_os_do_div(&val64, 0xFFFFFFFFULL);
 		*freq = (uint32_t)val64;
 	} else {
-		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
-		reg = (reg & AXI_DAC_DDS_INCR(~0));
+		uint32_t reg = (sh->init_incr & AXI_DAC_DDS_INCR(~0));
 		val64 = (uint64_t)reg * dac->clock_hz;
 		no_os_do_div(&val64, 0xFFFF);
 		*freq = val64;
 	}
-
-	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
 
 	return 0;
 }
@@ -500,36 +494,39 @@ int32_t axi_dac_dds_set_phase(struct axi_dac *dac,
 {
 	uint64_t val64;
 	uint32_t reg;
+	struct axi_dac_dds_shadow *sh = &dac->dds_shadow[chan];
 
-	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
+	if (!dac->sync_held)
+		axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
 
 	if (dac->dds_phase_dw > 16) {
-		/* 32-bit phase offset: pow = phase * 2^32 / 360000 */
 		uint32_t pow32;
 		val64 = (uint64_t)phase * 0x100000000ULL + (360000 / 2);
 		val64 = val64 / 360000;
 		pow32 = (uint32_t)val64;
 
-		/* Write extension FIRST — CDC is triggered by base write */
-		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR_EXT(chan), &reg);
-		reg = (reg & 0x0000FFFFU) | (((pow32 >> 16) & 0xFFFF) << 16);
+		/* Extension first (CDC triggered by base write) */
+		reg = (sh->init_incr_ext & 0x0000FFFFU) |
+		      (((pow32 >> 16) & 0xFFFF) << 16);
+		sh->init_incr_ext = reg;
 		axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR_EXT(chan), reg);
 
-		/* Base register last — triggers CDC transfer */
-		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
-		reg = (reg & ~AXI_DAC_DDS_INIT(~0)) |
+		/* Base register last */
+		reg = (sh->init_incr & ~AXI_DAC_DDS_INIT(~0)) |
 		      AXI_DAC_DDS_INIT(pow32 & 0xFFFF);
+		sh->init_incr = reg;
 		axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), reg);
 	} else {
-		/* Legacy 16-bit path */
-		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
 		val64 = (uint64_t)phase * 0x10000ULL + (360000 / 2);
 		val64 = val64 / 360000;
-		reg = (reg & ~AXI_DAC_DDS_INIT(~0)) | AXI_DAC_DDS_INIT(val64);
+		reg = (sh->init_incr & ~AXI_DAC_DDS_INIT(~0)) |
+		      AXI_DAC_DDS_INIT(val64);
+		sh->init_incr = reg;
 		axi_dac_write(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), reg);
 	}
 
-	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
+	if (!dac->sync_held)
+		axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
 
 	return 0;
 }
@@ -545,33 +542,24 @@ int32_t axi_dac_dds_set_phase(struct axi_dac *dac,
 int32_t axi_dac_dds_get_phase(struct axi_dac *dac,
 			      uint32_t chan, uint32_t *phase)
 {
+	const struct axi_dac_dds_shadow *sh = &dac->dds_shadow[chan];
 	uint64_t val64;
-	uint32_t reg;
-
-	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
 
 	if (dac->dds_phase_dw > 16) {
-		uint32_t reg_ext;
 		uint32_t pow32;
 
-		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
-		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR_EXT(chan), &reg_ext);
-
-		pow32 = ((reg_ext >> 16) & 0xFFFF) << 16 |
-		        AXI_DAC_TO_DDS_INIT(reg);
+		pow32 = ((sh->init_incr_ext >> 16) & 0xFFFF) << 16 |
+		        AXI_DAC_TO_DDS_INIT(sh->init_incr);
 		val64 = (uint64_t)pow32 * 360000ULL + (0x100000000ULL / 2);
 		no_os_do_div(&val64, 0x100000000ULL);
 		*phase = (uint32_t)val64;
 	} else {
-		axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(chan), &reg);
-		reg = (reg & AXI_DAC_DDS_INIT(~0));
+		uint32_t reg = (sh->init_incr & AXI_DAC_DDS_INIT(~0));
 		reg = AXI_DAC_TO_DDS_INIT(reg);
 		val64 = reg * 360000ULL + (0x10000 / 2);
 		no_os_do_div(&val64, 0x10000);
 		*phase = val64;
 	}
-
-	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
 
 	return 0;
 }
@@ -599,12 +587,42 @@ int32_t axi_dac_dds_set_scale(struct axi_dac *dac,
 	if (scale_micro_units < 0)
 		scale_reg = scale_reg | 0x8000;
 
-	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
+	if (!dac->sync_held)
+		axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
+
+	dac->dds_shadow[chan].scale = AXI_DAC_DDS_SCALE(scale_reg);
 	axi_dac_write(dac, AXI_DAC_REG_DDS_SCALE(chan),
 		      AXI_DAC_DDS_SCALE(scale_reg));
-	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
+
+	if (!dac->sync_held)
+		axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
 
 	return 0;
+}
+
+/**
+ * @brief Hold SYNC — begin a batch of DDS updates.
+ *
+ * While held, set_frequency / set_phase / set_scale / set_datasel
+ * write registers but do NOT pulse SYNC. All updates take effect
+ * atomically when axi_dac_dds_sync_commit() is called.
+ *
+ * @param dac - The device structure.
+ */
+void axi_dac_dds_sync_hold(struct axi_dac *dac)
+{
+	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
+	dac->sync_held = 1;
+}
+
+/**
+ * @brief Commit SYNC — apply all deferred DDS updates atomically.
+ * @param dac - The device structure.
+ */
+void axi_dac_dds_sync_commit(struct axi_dac *dac)
+{
+	dac->sync_held = 0;
+	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
 }
 
 /**
@@ -622,11 +640,7 @@ int32_t axi_dac_dds_get_scale(struct axi_dac *dac,
 	int32_t sign;
 	uint32_t scale_reg;
 
-	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, 0);
-	axi_dac_read(dac, AXI_DAC_REG_DDS_SCALE(chan),
-		     &scale_reg);
-	axi_dac_write(dac, AXI_DAC_REG_SYNC_CONTROL, AXI_DAC_SYNC);
-	scale_reg = AXI_DAC_TO_DDS_SCALE(scale_reg);
+	scale_reg = AXI_DAC_TO_DDS_SCALE(dac->dds_shadow[chan].scale);
 	sign = (scale_reg & 0x8000) ? -1 : 1;
 	scale_reg &= ~0x8000;
 	scale_reg = ((uint64_t)scale_reg * 1000000) / 0x4000;
@@ -1024,6 +1038,26 @@ int32_t axi_dac_init_finish(struct axi_dac *dac)
 
 	printf("%s: Successfully initialized (%"PRIu64" Hz, DDS_PHASE_DW=%u)\n",
 	       dac->name, dac->clock_hz, dac->dds_phase_dw);
+
+	/* Populate DDS shadow registers from hardware (one-time read).
+	 * This ensures the shadow is consistent before any setter runs. */
+	{
+		uint32_t num_tones = dac->num_channels * 2;
+		uint32_t t;
+		if (num_tones > AXI_DAC_MAX_TONES)
+			num_tones = AXI_DAC_MAX_TONES;
+		for (t = 0; t < num_tones; t++) {
+			axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR(t),
+				     &dac->dds_shadow[t].init_incr);
+			axi_dac_read(dac, AXI_DAC_REG_DDS_SCALE(t),
+				     &dac->dds_shadow[t].scale);
+			if (dac->dds_phase_dw > 16)
+				axi_dac_read(dac, AXI_DAC_REG_DDS_INIT_INCR_EXT(t),
+					     &dac->dds_shadow[t].init_incr_ext);
+			else
+				dac->dds_shadow[t].init_incr_ext = 0;
+		}
+	}
 
 	return 0;
 }

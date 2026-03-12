@@ -1663,7 +1663,8 @@ static int force_dds_tone(struct fmcdac_dev *dev)
 #undef DAC_CTRL_MASK
 	}
 
-	/* 4) Program DDS using direct API (bypass axi_dac_data_setup) */
+	/* 4) Program DDS using direct API — batched SYNC for atomic update */
+	axi_dac_dds_sync_hold(dev->ad9144_core);
 	for (ch = 0; ch < dev->ad9144_core->num_channels; ch++) {
 		/* Each converter channel has 2 DDS tones: (ch*2+0) and (ch*2+1) */
 		uint32_t tone0 = ch * 2 + 0;
@@ -1694,6 +1695,7 @@ static int force_dds_tone(struct fmcdac_dev *dev)
 		xil_printf("[DDS] ch%lu datasel=DDS ret=%ld\n\r",
 			   (unsigned long)ch, (long)ret);
 	}
+	axi_dac_dds_sync_commit(dev->ad9144_core);
 
 	/* 5) Read back AXI DDS registers at correct addresses */
 	dbg_printf("[DDS-DIAG] AXI DAC register dump (DDS_PHASE_DW=%u):\n\r",
@@ -1779,11 +1781,13 @@ static int force_dds_tone(struct fmcdac_dev *dev)
 		for (uint32_t f_mhz = start_mhz; f_mhz <= stop_mhz; f_mhz += step_mhz) {
 			uint32_t f_hz = f_mhz * 1000000U;
 
-			/* Update frequency on both channels, tone0 only */
+			/* Update frequency on both channels, tone0 only — batched */
+			axi_dac_dds_sync_hold(dev->ad9144_core);
 			for (ch = 0; ch < dev->ad9144_core->num_channels; ch++) {
 				uint32_t tone0 = ch * 2;
 				axi_dac_dds_set_frequency(dev->ad9144_core, tone0, f_hz);
 			}
+			axi_dac_dds_sync_commit(dev->ad9144_core);
 
 			/* Read back FTW for logging */
 			if (dev->ad9144_core->dds_phase_dw > 16) {
@@ -1939,13 +1943,15 @@ static int fmcdac_test(struct fmcdac_dev *dev,
 	dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_DDS;
 	xil_printf("[STPL-ZERO] Using DDS mode with scale=0 for guaranteed zeros\n\r");
 	
-	/* Enable channels and set DDS source */
+	/* Enable channels and set DDS source — batched for single SYNC */
+	axi_dac_dds_sync_hold(dev->ad9144_core);
 	axi_dac_set_datasel(dev->ad9144_core, -1, AXI_DAC_DATA_SEL_DDS);
 	/* Set DDS scales to 0 for all tones - this outputs hard zeros */
 	axi_dac_dds_set_scale(dev->ad9144_core, 0, 0);  /* ch0 tone0 scale = 0 */
 	axi_dac_dds_set_scale(dev->ad9144_core, 1, 0);  /* ch0 tone1 scale = 0 */
 	axi_dac_dds_set_scale(dev->ad9144_core, 2, 0);  /* ch1 tone0 scale = 0 */
 	axi_dac_dds_set_scale(dev->ad9144_core, 3, 0);  /* ch1 tone1 scale = 0 */
+	axi_dac_dds_sync_commit(dev->ad9144_core);
 	
 	no_os_mdelay(50); /* Allow register update to propagate */
 	
@@ -2189,8 +2195,8 @@ skip_stpl_zero:
 #endif /* SKIP_STPL_TESTS */
 
 	// PN7 data path test
-	dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_PN23;
-	dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_PN23;
+	dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_PN7;
+	dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_PN7;
 	axi_dac_data_setup(dev->ad9144_core);
 	/* Poll for FPGA DATA + AD9144 CGS+Frame */
 	for (poll_i = 0; poll_i < 80; poll_i++) {
@@ -2213,8 +2219,8 @@ skip_stpl_zero:
 	}
 
 	// PN15 data path test
-	dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_PN31;
-	dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_PN31;
+	dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_PN15;
+	dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_PN15;
 	axi_dac_data_setup(dev->ad9144_core);
 	/* Poll for FPGA DATA + AD9144 CGS+Frame */
 	for (poll_i = 0; poll_i < 80; poll_i++) {

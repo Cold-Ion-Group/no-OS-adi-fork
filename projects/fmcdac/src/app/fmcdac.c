@@ -70,6 +70,22 @@ static enum fmcdac_clock_mode g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
 
 static void fmcdac_flush_input(void);
 
+#ifndef FMCDAC_DEFAULT_RATE_OPTION
+#define FMCDAC_DEFAULT_RATE_OPTION 1
+#endif
+
+#if (FMCDAC_DEFAULT_RATE_OPTION != 1) && (FMCDAC_DEFAULT_RATE_OPTION != 2)
+#error "FMCDAC_DEFAULT_RATE_OPTION must be 1 (2x interpolation) or 2 (1x, no interpolation)"
+#endif
+
+#if FMCDAC_DEFAULT_RATE_OPTION == 1
+#define FMCDAC_DEFAULT_RATE_OPTION_CHAR '1'
+#define FMCDAC_DEFAULT_RATE_TEXT "option 1 (DAC 1966 MSPS, 2x interpolation)"
+#else
+#define FMCDAC_DEFAULT_RATE_OPTION_CHAR '2'
+#define FMCDAC_DEFAULT_RATE_TEXT "option 2 (DAC 983 MSPS, 1x, no interpolation)"
+#endif
+
 #ifdef JESD_FSM_ON
 struct link_init_param {
 	uint32_t	link_id;
@@ -131,6 +147,8 @@ static void fmcdac_sysref_verify(struct fmcdac_dev *dev);
 static int fmcdac_sysref_tune(struct fmcdac_dev *dev);
 static void fmcdac_latency_readback(struct fmcdac_dev *dev);
 static void fmcdac_phy_prbs_test(struct fmcdac_dev *dev);
+static int fmcdac_nco_discriminator_test(struct fmcdac_dev *dev);
+static int fmcdac_dds_band_diagnostic_test(struct fmcdac_dev *dev);
 static void fmcdac_flush_input(void);
 
 static int fmcdac_gpio_init(struct fmcdac_dev *dev)
@@ -659,10 +677,25 @@ static int fmcdac_ad9516_program_outputs(struct fmcdac_dev *dev,
 			fdac_khz = dac_ref_khz;
 
 		if (K == 0) K = 32; /* safety fallback */
-		sysref_khz = fdac_khz / (K * S);
-		xil_printf("[AD9516] SYSREF: fDAC=%lu kHz  K=%lu  S=%lu  =>  sysref=%lu kHz\n\r",
+
+		/*
+		 * SYSREF = fDAC / (K × S × interpolation)
+		 *
+		 * The JESD LMFC is based on the link data rate, not the DAC
+		 * output rate.  With Nx interpolation the link rate is
+		 * fDAC/N, so divide by the interpolation factor to keep
+		 * SYSREF aligned to the actual LMFC period.
+		 *
+		 *   interp=1, 983 MSPS:  983040/(32×1×1) = 30720 kHz  ✓
+		 *   interp=2, 1966 MSPS: 1966080/(32×1×2) = 30720 kHz ✓
+		 */
+		uint32_t interp = dev_init->ad9144_param.interpolation;
+		if (interp == 0) interp = 1;
+		sysref_khz = fdac_khz / (K * S * interp);
+		xil_printf("[AD9516] SYSREF: fDAC=%lu kHz  K=%lu  S=%lu  interp=%lu  =>  sysref=%lu kHz\n\r",
 			   (unsigned long)fdac_khz, (unsigned long)K,
-			   (unsigned long)S, (unsigned long)sysref_khz);
+			   (unsigned long)S, (unsigned long)interp,
+			   (unsigned long)sysref_khz);
 	}
 
 	if (dev->ad9516_dev->ad9516_st.pdata->ref_sel_pin_en)
@@ -1088,27 +1121,34 @@ static int fmcdac_soak(struct fmcdac_dev *dev,
 		}
 		total_polls++;
 
-		/* Periodic PRBS check */
+		/* Periodic PRBS check — skip when interpolation active */
 		if (elapsed_s >= next_prbs_s) {
-			dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_PN7;
-			dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_PN7;
-			axi_dac_data_setup(dev->ad9144_core);
-			no_os_mdelay(200);
+			if (dev_init->ad9144_param.interpolation > 1) {
+				/* PRBS checker is incompatible with interpolation;
+				 * REG_INTERP_MODE must NOT be changed mid-link
+				 * (causes PLL/JESD rate mismatch, link drop).
+				 * Link polling above is the sole soak health metric. */
+			} else {
+				dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_PN7;
+				dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_PN7;
+				axi_dac_data_setup(dev->ad9144_core);
+				no_os_mdelay(200);
 
-			dev_init->ad9144_param.prbs_type = AD9144_PRBS7;
-			status = ad9144_datapath_prbs_test(dev->ad9144_device,
-							    &dev_init->ad9144_param);
-			if (status < 0) {
-				prbs_fails++;
-				xil_printf("[SOAK] PRBS-FAIL at t=%lu s (fail #%lu)\n\r",
-					   (unsigned long)elapsed_s,
-					   (unsigned long)prbs_fails);
+				dev_init->ad9144_param.prbs_type = AD9144_PRBS7;
+				status = ad9144_datapath_prbs_test(dev->ad9144_device,
+								    &dev_init->ad9144_param);
+				if (status < 0) {
+					prbs_fails++;
+					xil_printf("[SOAK] PRBS-FAIL at t=%lu s (fail #%lu)\n\r",
+						   (unsigned long)elapsed_s,
+						   (unsigned long)prbs_fails);
+				}
+
+				/* Restore DDS output */
+				dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_DDS;
+				dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_DDS;
+				axi_dac_data_setup(dev->ad9144_core);
 			}
-
-			/* Restore DDS output */
-			dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_DDS;
-			dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_DDS;
-			axi_dac_data_setup(dev->ad9144_core);
 
 			next_prbs_s = elapsed_s + SOAK_PRBS_INTERVAL_S;
 		}
@@ -1597,6 +1637,273 @@ static int wait_link_stable(struct fmcdac_dev *dev, uint32_t consec_need, uint32
 #define dbg_printf(...) do {} while(0)
 #endif
 
+static int fmcdac_prepare_dds_output(struct fmcdac_dev *dev, const char *tag)
+{
+	uint32_t tri;
+	uint32_t dat;
+
+	if (!dev || !dev->ad9144_core || !dev->ad9144_device)
+		return -1;
+
+	if (wait_link_stable(dev, 20, 1000) != 0) {
+		xil_printf("[%s] Link not stable in DATA, abort.\n\r", tag);
+		return -1;
+	}
+
+	xil_printf("[%s] AXI DAC core: clock_hz=%lu Hz, num_channels=%u\n\r",
+		   tag,
+		   (unsigned long)dev->ad9144_core->clock_hz,
+		   dev->ad9144_core->num_channels);
+
+	ad9144_spi_write(dev->ad9144_device, REG_DACGAIN0_0, 0xFF);
+	ad9144_spi_write(dev->ad9144_device, REG_DACGAIN0_1, 0x01);
+	ad9144_spi_write(dev->ad9144_device, REG_DACGAIN1_0, 0xFF);
+	ad9144_spi_write(dev->ad9144_device, REG_DACGAIN1_1, 0x01);
+	xil_printf("[%s] IOUTFS set: DAC0/DAC1 gain = 0x01FF\n\r", tag);
+
+#define AXI_GPIO_BASE  0x40000000U
+#define DAC_CTRL_MASK  ((1U << 22) | (1U << 21))
+	tri = Xil_In32(AXI_GPIO_BASE + 0x4);
+	dat = Xil_In32(AXI_GPIO_BASE + 0x0);
+	xil_printf("[%s] GPIO before: TRI=0x%08lX DATA=0x%08lX\n\r",
+		   tag, (unsigned long)tri, (unsigned long)dat);
+	Xil_Out32(AXI_GPIO_BASE + 0x4, tri & ~DAC_CTRL_MASK);
+	Xil_Out32(AXI_GPIO_BASE + 0x0, dat | DAC_CTRL_MASK);
+	no_os_mdelay(10);
+	tri = Xil_In32(AXI_GPIO_BASE + 0x4);
+	dat = Xil_In32(AXI_GPIO_BASE + 0x0);
+	xil_printf("[%s] GPIO after:  TRI=0x%08lX DATA=0x%08lX (dac_ctrl=%lu)\n\r",
+		   tag, (unsigned long)tri, (unsigned long)dat,
+		   (unsigned long)((dat >> 21) & 0x3));
+#undef AXI_GPIO_BASE
+#undef DAC_CTRL_MASK
+
+	return 0;
+}
+
+static int fmcdac_program_dds_pair(struct fmcdac_dev *dev, uint32_t freq_hz,
+				       int32_t scale_u,
+				       uint32_t phase0_mdeg,
+				       uint32_t phase1_mdeg,
+				       const char *tag)
+{
+	int32_t ret = 0;
+	uint32_t ch;
+
+	if (!dev || !dev->ad9144_core)
+		return -1;
+
+	axi_dac_dds_sync_hold(dev->ad9144_core);
+	for (ch = 0; ch < dev->ad9144_core->num_channels && ch < 2; ch++) {
+		uint32_t tone0 = ch * 2;
+		uint32_t tone1 = tone0 + 1;
+		uint32_t phase = (ch == 0) ? phase0_mdeg : phase1_mdeg;
+		int32_t tmp;
+
+		tmp = axi_dac_dds_set_frequency(dev->ad9144_core, tone0, freq_hz);
+		if (tmp < 0)
+			ret = tmp;
+		tmp = axi_dac_dds_set_frequency(dev->ad9144_core, tone1, 0);
+		if (tmp < 0)
+			ret = tmp;
+
+		tmp = axi_dac_dds_set_scale(dev->ad9144_core, tone0, scale_u);
+		if (tmp < 0)
+			ret = tmp;
+		tmp = axi_dac_dds_set_scale(dev->ad9144_core, tone1, 0);
+		if (tmp < 0)
+			ret = tmp;
+
+		tmp = axi_dac_dds_set_phase(dev->ad9144_core, tone0, phase);
+		if (tmp < 0)
+			ret = tmp;
+		tmp = axi_dac_dds_set_phase(dev->ad9144_core, tone1, 0);
+		if (tmp < 0)
+			ret = tmp;
+
+		tmp = axi_dac_set_datasel(dev->ad9144_core, ch, AXI_DAC_DATA_SEL_DDS);
+		if (tmp < 0)
+			ret = tmp;
+
+		xil_printf("[%s] ch%lu tone%lu: freq=%lu Hz scale=%ld phase=%lu mddeg datasel=DDS\n\r",
+			   tag,
+			   (unsigned long)ch,
+			   (unsigned long)tone0,
+			   (unsigned long)freq_hz,
+			   (long)scale_u,
+			   (unsigned long)phase);
+	}
+	axi_dac_dds_sync_commit(dev->ad9144_core);
+
+	return ret;
+}
+
+static void fmcdac_nco_readback(struct fmcdac_dev *dev, const char *tag)
+{
+	uint8_t datapath_ctrl = 0;
+	uint8_t interp_mode = 0;
+	uint8_t ftw[6] = {0};
+	uint8_t phase_lsb = 0;
+	uint8_t phase_msb = 0;
+	uint8_t i;
+
+	ad9144_spi_read(dev->ad9144_device, REG_DATAPATH_CTRL, &datapath_ctrl);
+	ad9144_spi_read(dev->ad9144_device, REG_INTERP_MODE, &interp_mode);
+	ad9144_spi_read(dev->ad9144_device, REG_NCO_PHASE_OFFSET0, &phase_lsb);
+	ad9144_spi_read(dev->ad9144_device, REG_NCO_PHASE_OFFSET1, &phase_msb);
+	for (i = 0; i < 6; i++)
+		ad9144_spi_read(dev->ad9144_device, REG_FTW0 + i, &ftw[i]);
+
+	xil_printf("[%s] DATAPATH_CTRL=0x%02X INTERP=0x%02X NCO_PHASE=0x%02X%02X FTW=0x%02X%02X%02X%02X%02X%02X\n\r",
+		   tag,
+		   datapath_ctrl,
+		   interp_mode,
+		   phase_msb,
+		   phase_lsb,
+		   ftw[5], ftw[4], ftw[3], ftw[2], ftw[1], ftw[0]);
+}
+
+static void fmcdac_wait_for_enter(const char *tag, const char *message)
+{
+	xil_printf("[%s] %s Press ENTER to continue...\n\r", tag, message);
+	fmcdac_flush_input();
+}
+
+static int fmcdac_nco_discriminator_test(struct fmcdac_dev *dev)
+{
+	static const char *tag = "NCO-TEST";
+	const uint32_t baseband_freq_hz = 10000000U;
+	const int32_t scale_u = 999000;
+	const uint32_t q_phase_mdeg = 90000U;
+	const int32_t carrier_khz = 300000;
+	int ret;
+
+	ret = fmcdac_prepare_dds_output(dev, tag);
+	if (ret != 0)
+		return ret;
+
+	ret = fmcdac_program_dds_pair(dev, baseband_freq_hz, scale_u,
+					 0, q_phase_mdeg, tag);
+	if (ret != 0) {
+		xil_printf("[%s] DDS programming failed: %ld\n\r",
+			   tag, (long)ret);
+		return ret;
+	}
+
+	ret = ad9144_set_nco(dev->ad9144_device, 0, 0);
+	if (ret != 0) {
+		xil_printf("[%s] Failed to disable NCO: %ld\n\r",
+			   tag, (long)ret);
+		return ret;
+	}
+
+	xil_printf("[%s] Step 1/3: baseband only. Expect ~10 MHz on DAC0 and DAC1.\n\r",
+		   tag);
+	xil_printf("[%s] DDS setup uses a complex tone: DAC0=0 deg, DAC1=+90 deg.\n\r",
+		   tag);
+	fmcdac_nco_readback(dev, tag);
+	fmcdac_wait_for_enter(tag, "Observe the 10 MHz baseband tone.");
+
+	ret = ad9144_set_nco(dev->ad9144_device, carrier_khz, 0);
+	if (ret != 0) {
+		xil_printf("[%s] Failed to apply +300 MHz NCO: %ld\n\r",
+			   tag, (long)ret);
+		return ret;
+	}
+	xil_printf("[%s] Step 2/3: applied +300 MHz NCO carrier.\n\r", tag);
+	xil_printf("[%s] Expect one shifted tone around 290 MHz or 310 MHz.\n\r",
+		   tag);
+	fmcdac_nco_readback(dev, tag);
+	fmcdac_wait_for_enter(tag, "Observe the first shifted tone.");
+
+	ret = ad9144_set_nco(dev->ad9144_device, -carrier_khz, 0);
+	if (ret != 0) {
+		xil_printf("[%s] Failed to apply -300 MHz NCO: %ld\n\r",
+			   tag, (long)ret);
+		return ret;
+	}
+	xil_printf("[%s] Step 3/3: applied -300 MHz NCO carrier.\n\r", tag);
+	xil_printf("[%s] Expect the tone to swap to the opposite sideband (~310 MHz or ~290 MHz).\n\r",
+		   tag);
+	fmcdac_nco_readback(dev, tag);
+	fmcdac_wait_for_enter(tag, "Observe the second shifted tone.");
+
+	ret = ad9144_set_nco(dev->ad9144_device, 0, 0);
+	if (ret != 0) {
+		xil_printf("[%s] Failed to disable NCO at end of test: %ld\n\r",
+			   tag, (long)ret);
+		return ret;
+	}
+
+	xil_printf("[%s] NCO disabled. Returning control to the DDS sweep.\n\r",
+		   tag);
+
+	return 0;
+}
+
+static int fmcdac_dds_band_diagnostic_test(struct fmcdac_dev *dev)
+{
+	static const char *tag = "DDS-BAND";
+	static const uint32_t freqs_mhz[] = {
+		10U, 100U, 200U,
+		230U, 240U, 250U, 260U, 270U, 280U, 290U, 300U, 310U, 320U, 330U
+	};
+	const int32_t scale_u = 999000;
+	uint8_t interp_mode = 0;
+	uint32_t i;
+	int ret;
+
+	ret = fmcdac_prepare_dds_output(dev, tag);
+	if (ret != 0)
+		return ret;
+
+	ret = ad9144_set_nco(dev->ad9144_device, 0, 0);
+	if (ret != 0) {
+		xil_printf("[%s] Failed to disable NCO before DDS-band test: %ld\n\r",
+			   tag, (long)ret);
+		return ret;
+	}
+
+	ad9144_spi_read(dev->ad9144_device, REG_INTERP_MODE, &interp_mode);
+	xil_printf("[%s] Focused DDS sweep diagnostic with NCO disabled.\n\r",
+		   tag);
+	xil_printf("[%s] Interpolation mode=0x%02X. Capturing 10/100/200 MHz references plus 230-330 MHz in 10 MHz steps.\n\r",
+		   tag, interp_mode);
+
+	for (i = 0; i < NO_OS_ARRAY_SIZE(freqs_mhz); i++) {
+		uint32_t freq_mhz = freqs_mhz[i];
+		uint32_t freq_hz = freq_mhz * 1000000U;
+
+		ret = fmcdac_program_dds_pair(dev, freq_hz, scale_u, 0, 0, tag);
+		if (ret != 0) {
+			xil_printf("[%s] DDS programming failed at %lu MHz: %ld\n\r",
+				   tag, (unsigned long)freq_mhz, (long)ret);
+			return ret;
+		}
+
+		xil_printf("[%s] Step %lu/%lu: %lu MHz DDS tone.\n\r",
+			   tag,
+			   (unsigned long)(i + 1),
+			   (unsigned long)NO_OS_ARRAY_SIZE(freqs_mhz),
+			   (unsigned long)freq_mhz);
+
+		if (freq_mhz < 230U) {
+			xil_printf("[%s] Reference checkpoint before the observed droop band.\n\r",
+				   tag);
+		} else {
+			xil_printf("[%s] Problem-band checkpoint near the observed 260-290 MHz amplitude loss.\n\r",
+				   tag);
+		}
+
+		fmcdac_wait_for_enter(tag, "Observe the DDS tone.");
+	}
+
+	xil_printf("[%s] Completed focused DDS band diagnostic. Returning to normal DDS sweep.\n\r",
+		   tag);
+
+	return 0;
+}
+
 /**
  * @brief Force a known-good DDS tone for scope/spectrum analyzer validation.
  * @param dev - The device structure.
@@ -1607,61 +1914,11 @@ static int force_dds_tone(struct fmcdac_dev *dev)
 	int32_t ret;
 	uint32_t ch;
 	const uint32_t freq_hz = 10000000U;   /* 10 MHz */
-	const int32_t scale_u  = 800000;      /* 0.8 FS (micro-units) */
+	const int32_t scale_u  = 999000;      /* ~1.0 FS (micro-units), max headroom for sweep */
 
-	/* 1) Require link stability first (DATA for N polls) */
-	uint32_t stable = 0;
-	for (uint32_t i = 0; i < 100; i++) {
-		uint32_t st = Xil_In32(TX_JESD_BASEADDR + 0x280);
-		if ((st & 0x3) == 3) { /* DATA state */
-			stable++;
-			if (stable >= 20)
-				break;
-		} else {
-			stable = 0;
-		}
-		no_os_mdelay(10);
-	}
-	if (stable < 20) {
-		xil_printf("[DDS] Link not stable in DATA, abort tone set.\n\r");
-		return -1;
-	}
-
-	/* 2) Show AXI DAC core state before programming */
-	xil_printf("[DDS] AXI DAC core: clock_hz=%lu Hz, num_channels=%u\n\r",
-		   (unsigned long)dev->ad9144_core->clock_hz,
-		   dev->ad9144_core->num_channels);
-
-	/* 3) Set DAC full-scale output current FIRST */
-	ad9144_spi_write(dev->ad9144_device, REG_DACGAIN0_0, 0xFF);
-	ad9144_spi_write(dev->ad9144_device, REG_DACGAIN0_1, 0x01);
-	ad9144_spi_write(dev->ad9144_device, REG_DACGAIN1_0, 0xFF);
-	ad9144_spi_write(dev->ad9144_device, REG_DACGAIN1_1, 0x01);
-	xil_printf("[DDS] IOUTFS set: DAC0/DAC1 gain = 0x01FF\n\r");
-
-	/* 3b) Enable DAC analog outputs via dac_ctrl GPIO.
-	 * dac_ctrl[1:0] mapped to gpio_o[22:21] in system_top.v.
-	 * AXI GPIO base = 0x40000000, ch1 DATA=+0x0, TRI=+0x4. */
-	{
-#define AXI_GPIO_BASE  0x40000000U
-#define DAC_CTRL_MASK  ((1U << 22) | (1U << 21))  /* bits 22:21 */
-		uint32_t tri = Xil_In32(AXI_GPIO_BASE + 0x4);
-		uint32_t dat = Xil_In32(AXI_GPIO_BASE + 0x0);
-		xil_printf("[DDS] GPIO before: TRI=0x%08lX DATA=0x%08lX\n\r",
-			   (unsigned long)tri, (unsigned long)dat);
-		/* Make bits 21-22 outputs (clear tri-state) */
-		Xil_Out32(AXI_GPIO_BASE + 0x4, tri & ~DAC_CTRL_MASK);
-		/* Drive both dac_ctrl bits high */
-		Xil_Out32(AXI_GPIO_BASE + 0x0, dat | DAC_CTRL_MASK);
-		no_os_mdelay(10);
-		tri = Xil_In32(AXI_GPIO_BASE + 0x4);
-		dat = Xil_In32(AXI_GPIO_BASE + 0x0);
-		xil_printf("[DDS] GPIO after:  TRI=0x%08lX DATA=0x%08lX (dac_ctrl=%lu)\n\r",
-			   (unsigned long)tri, (unsigned long)dat,
-			   (unsigned long)((dat >> 21) & 0x3));
-#undef AXI_GPIO_BASE
-#undef DAC_CTRL_MASK
-	}
+	ret = fmcdac_prepare_dds_output(dev, "DDS");
+	if (ret != 0)
+		return ret;
 
 	/* 4) Program DDS using direct API — batched SYNC for atomic update */
 	axi_dac_dds_sync_hold(dev->ad9144_core);
@@ -1765,19 +2022,32 @@ static int force_dds_tone(struct fmcdac_dev *dev)
 	xil_printf("[DDS] Setup complete. Starting frequency sweep...\n\r");
 
 	/* 5) Frequency sweep: 10 MHz → 490 MHz in 10 MHz steps
+	 * Sweep covers the full FPGA DDS Nyquist band (491.52 MHz).
+	 * With 2x interpolation (default), image suppression is excellent
+	 * across the entire band.  The interpolation filter passband is
+	 * flat to ~393 MHz with 1-3 dB rolloff towards 491 MHz.
+	 *
 	 * NOTE: no_os_mdelay is mis-calibrated on MicroBlaze.
 	 * Adjust SWEEP_HOLD_MS until each step takes ~3 real seconds.
 	 * If steps take ~30s with value 3000, try 300. */
 #define SWEEP_HOLD_MS  50   /* Tune this: target ~3 real seconds per step */
 	{
 		const uint32_t start_mhz = 10;
-		const uint32_t stop_mhz  = 200;   /* practical BW limit of FMC analog output */
-		const uint32_t step_mhz  = 5;
+		const uint32_t stop_mhz  = 490;   /* FPGA DDS Nyquist ≈ 491.52 MHz */
+		const uint32_t step_mhz  = 10;
 
 		xil_printf("[SWEEP] %lu steps, SWEEP_HOLD_MS=%lu (tune if timing is off)\n\r",
 			   (unsigned long)((stop_mhz - start_mhz) / step_mhz + 1),
 			   (unsigned long)SWEEP_HOLD_MS);
 
+		{
+			uint8_t interp_rb = 0;
+			ad9144_spi_read(dev->ad9144_device, REG_INTERP_MODE, &interp_rb);
+			xil_printf("[SWEEP] AD9144 interpolation mode (0x112) = 0x%02X\n\r", interp_rb);
+			if (interp_rb != 0x00)
+				xil_printf("[SWEEP] NOTE: 2x interpolation active. Expect ~3 dB rolloff "
+					   "above 390 MHz, ~6+ dB above 450 MHz (half-band filter).\n\r");
+		}
 		for (uint32_t f_mhz = start_mhz; f_mhz <= stop_mhz; f_mhz += step_mhz) {
 			uint32_t f_hz = f_mhz * 1000000U;
 
@@ -2194,52 +2464,70 @@ skip_stpl_zero:
 	xil_printf("\n\r[STPL] Skipped - see stpl_analysis.md. PRBS tests confirm link works.\n\r");
 #endif /* SKIP_STPL_TESTS */
 
-	// PN7 data path test
-	dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_PN7;
-	dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_PN7;
-	axi_dac_data_setup(dev->ad9144_core);
-	/* Poll for FPGA DATA + AD9144 CGS+Frame */
-	for (poll_i = 0; poll_i < 80; poll_i++) {
-		fpga_link_state = Xil_In32(TX_JESD_BASEADDR + 0x280);
-		ad9144_spi_read(dev->ad9144_device, REG_CODEGRPSYNCFLG, &cgs_now);
-		ad9144_spi_read(dev->ad9144_device, REG_FRAMESYNCFLG, &frame_now);
-		if (((fpga_link_state & 0x3) == 3) &&
-		    (cgs_now == 0x0F) && (frame_now == 0x0F)) break;
-		no_os_mdelay(50);
-	}
-	no_os_mdelay(100);
-	xil_printf("[TEST] PN7 link: CGS=0x%02X Frame=0x%02X poll=%d\n\r", cgs_now, frame_now, poll_i);
-	dev_init->ad9144_param.prbs_type = AD9144_PRBS7;
-	status = ad9144_datapath_prbs_test(dev->ad9144_device, &dev_init->ad9144_param);
-	if (status < 0) {
-		xil_printf("[TEST] PRBS7 test FAILED\n\r");
-		test_errors++;
+	/*
+	 * PRBS datapath test: The AD9144 PRBS checker (REG_PRBS, 0x14B) sits
+	 * after the JESD deframer but before the interpolation filter. With 2x
+	 * interpolation the PLL runs at 1966 MHz; bypassing the interpolator
+	 * mid-link (REG_INTERP_MODE = 0x00) causes a rate mismatch — the DAC
+	 * core expects 1966 MSPS input but the JESD link only delivers 983 MSPS.
+	 * This breaks frame sync and the link does not recover.
+	 *
+	 * When interpolation > 1x we therefore SKIP the PRBS tests entirely.
+	 * The STPL zero + pattern tests above already validate the complete
+	 * FPGA -> SerDes -> JESD deframer -> XBAR -> per-sample data path.
+	 */
+	if (dev_init->ad9144_param.interpolation > 1) {
+		xil_printf("[TEST] PRBS7/15 SKIPPED — interpolation=%dx active, "
+			   "checker incompatible (STPL validates datapath)\n\r",
+			   dev_init->ad9144_param.interpolation);
 	} else {
-		xil_printf("[TEST] PRBS7 test PASSED\n\r");
-	}
+		// PN7 data path test
+		dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_PN7;
+		dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_PN7;
+		axi_dac_data_setup(dev->ad9144_core);
+		/* Poll for FPGA DATA + AD9144 CGS+Frame */
+		for (poll_i = 0; poll_i < 80; poll_i++) {
+			fpga_link_state = Xil_In32(TX_JESD_BASEADDR + 0x280);
+			ad9144_spi_read(dev->ad9144_device, REG_CODEGRPSYNCFLG, &cgs_now);
+			ad9144_spi_read(dev->ad9144_device, REG_FRAMESYNCFLG, &frame_now);
+			if (((fpga_link_state & 0x3) == 3) &&
+			    (cgs_now == 0x0F) && (frame_now == 0x0F)) break;
+			no_os_mdelay(50);
+		}
+		no_os_mdelay(100);
+		xil_printf("[TEST] PN7 link: CGS=0x%02X Frame=0x%02X poll=%d\n\r", cgs_now, frame_now, poll_i);
+		dev_init->ad9144_param.prbs_type = AD9144_PRBS7;
+		status = ad9144_datapath_prbs_test(dev->ad9144_device, &dev_init->ad9144_param);
+		if (status < 0) {
+			xil_printf("[TEST] PRBS7 test FAILED\n\r");
+			test_errors++;
+		} else {
+			xil_printf("[TEST] PRBS7 test PASSED\n\r");
+		}
 
-	// PN15 data path test
-	dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_PN15;
-	dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_PN15;
-	axi_dac_data_setup(dev->ad9144_core);
-	/* Poll for FPGA DATA + AD9144 CGS+Frame */
-	for (poll_i = 0; poll_i < 80; poll_i++) {
-		fpga_link_state = Xil_In32(TX_JESD_BASEADDR + 0x280);
-		ad9144_spi_read(dev->ad9144_device, REG_CODEGRPSYNCFLG, &cgs_now);
-		ad9144_spi_read(dev->ad9144_device, REG_FRAMESYNCFLG, &frame_now);
-		if (((fpga_link_state & 0x3) == 3) &&
-		    (cgs_now == 0x0F) && (frame_now == 0x0F)) break;
-		no_os_mdelay(50);
-	}
-	no_os_mdelay(100);
-	xil_printf("[TEST] PN15 link: CGS=0x%02X Frame=0x%02X poll=%d\n\r", cgs_now, frame_now, poll_i);
-	dev_init->ad9144_param.prbs_type = AD9144_PRBS15;
-	status = ad9144_datapath_prbs_test(dev->ad9144_device, &dev_init->ad9144_param);
-	if (status < 0) {
-		xil_printf("[TEST] PRBS15 test FAILED\n\r");
-		test_errors++;
-	} else {
-		xil_printf("[TEST] PRBS15 test PASSED\n\r");
+		// PN15 data path test
+		dev->ad9144_channels[0].sel = AXI_DAC_DATA_SEL_PN15;
+		dev->ad9144_channels[1].sel = AXI_DAC_DATA_SEL_PN15;
+		axi_dac_data_setup(dev->ad9144_core);
+		/* Poll for FPGA DATA + AD9144 CGS+Frame */
+		for (poll_i = 0; poll_i < 80; poll_i++) {
+			fpga_link_state = Xil_In32(TX_JESD_BASEADDR + 0x280);
+			ad9144_spi_read(dev->ad9144_device, REG_CODEGRPSYNCFLG, &cgs_now);
+			ad9144_spi_read(dev->ad9144_device, REG_FRAMESYNCFLG, &frame_now);
+			if (((fpga_link_state & 0x3) == 3) &&
+			    (cgs_now == 0x0F) && (frame_now == 0x0F)) break;
+			no_os_mdelay(50);
+		}
+		no_os_mdelay(100);
+		xil_printf("[TEST] PN15 link: CGS=0x%02X Frame=0x%02X poll=%d\n\r", cgs_now, frame_now, poll_i);
+		dev_init->ad9144_param.prbs_type = AD9144_PRBS15;
+		status = ad9144_datapath_prbs_test(dev->ad9144_device, &dev_init->ad9144_param);
+		if (status < 0) {
+			xil_printf("[TEST] PRBS15 test FAILED\n\r");
+			test_errors++;
+		} else {
+			xil_printf("[TEST] PRBS15 test PASSED\n\r");
+		}
 	}
 
 	/* ===== Subclass 1 Diagnostics (after stable link + datapath PRBS) ===== */
@@ -2247,6 +2535,34 @@ skip_stpl_zero:
 	fmcdac_sysref_verify(dev);
 	fmcdac_latency_readback(dev);
 	fmcdac_phy_prbs_test(dev);
+
+	xil_printf("[NCO-TEST] Run 10 MHz DDS + AD9144 NCO discriminator test? [y/N]: ");
+	{
+		int run_nco = getc(stdin);
+		fmcdac_flush_input();
+		if (run_nco == 'y' || run_nco == 'Y') {
+			status = fmcdac_nco_discriminator_test(dev);
+			if (status != 0)
+				xil_printf("[NCO-TEST] Diagnostic setup failed: %d\n\r",
+					   status);
+		} else {
+			xil_printf("[NCO-TEST] Skipped.\n\r");
+		}
+	}
+
+	xil_printf("[DDS-BAND] Run focused DDS sweep diagnostic around 230-330 MHz? [y/N]: ");
+	{
+		int run_dds_band = getc(stdin);
+		fmcdac_flush_input();
+		if (run_dds_band == 'y' || run_dds_band == 'Y') {
+			status = fmcdac_dds_band_diagnostic_test(dev);
+			if (status != 0)
+				xil_printf("[DDS-BAND] Diagnostic setup failed: %d\n\r",
+					   status);
+		} else {
+			xil_printf("[DDS-BAND] Skipped. Continuing to normal DDS sweep.\n\r");
+		}
+	}
 
 	/* DDS tone test - validates data path for NCO/CORDIC development */
 	force_dds_tone(dev);
@@ -2340,17 +2656,11 @@ int fmcdac_reconfig(struct ad9144_init_param *p_ad9144_param,
 		     struct ad9516_platform_data *p_ad9516_param)
 {
 
-	uint8_t mode = 0;
-	uint8_t clk_mode = 0;
+	uint8_t mode = FMCDAC_DEFAULT_RATE_OPTION_CHAR;
+	uint8_t clk_mode = '1';
 
-	printf ("Clock configurations:\n");
-	printf ("\t1 - Clock distributor (external CLK input, use DAC PLL)\n");
-	printf ("\t2 - Synthesizer (AD9516 PLL/VCO)\n");
-	printf ("\t3 - External clock (bypass DAC PLL)\n");
-	printf ("choose an option [default 1]:\n");
-
-	clk_mode = getc(stdin);
-	fmcdac_flush_input();
+	xil_printf("[AUTO] Clock configuration fixed to option 1 (Clock distributor)\n\r");
+	xil_printf("[AUTO] Sampling rate fixed to " FMCDAC_DEFAULT_RATE_TEXT "\n\r");
 
 	switch (clk_mode) {
 	case '2':
@@ -2370,36 +2680,49 @@ int fmcdac_reconfig(struct ad9144_init_param *p_ad9144_param,
 		break;
 	}
 
-	printf ("Available sampling rates:\n");
-	printf ("\t1 - DAC 983 MSPS (PLL on)\n");
-	printf ("\t3 - DAC  500 MSPS\n");
-	printf ("\t4 - DAC  600 MSPS\n");
-	printf ("\t5 - DAC 2000 MSPS (2x interpolation)\n");
-	printf ("choose an option [default 1]:\n");
-
-	mode = getc(stdin);
-	fmcdac_flush_input();
-
 	switch (mode) {
 	case '5':
-		xil_printf("5 - DAC 2000 MSPS (2x interpolation)\n");
-		/* REF clock = 100 MHz */
-		//p_ad9516_param->channels[DAC_DEVICE_CLK].channel_divider = 10;
-		p_ad9144_param->pll_ref_frequency_khz = 100000;
-
-		/* DAC at 2 GHz using the internal PLL and 2 times interpolation */
+		xil_printf("5 - DAC 1966 MSPS (2x interpolation)\n");
+		/*
+		 * 2x interpolation: AD9144 internal DAC clock = 1966.08 MHz,
+		 * but the JESD link data rate stays at 983.04 MSPS (same as
+		 * mode 4).  The FPGA side is completely unchanged — same lane
+		 * rate, same REFCLK, same QPLL0 config, no HDL changes.
+		 *
+		 * AD9144 PLL: 122.88 MHz × 16 = 1966.08 MHz
+		 *   (lo_div_mode=1, ref_div_mode=1, bcount=16 — integer, locks)
+		 *   VCO = 1966.08 × 4 = 7864.32 MHz (in 6.0–12.4 GHz range)
+		 *
+		 * Nyquist = 1966.08 / 2 = 983.04 MHz → 500 MHz is well covered.
+		 *
+		 * FPGA DDS Nyquist remains 491.52 MHz (input rate = 983 MSPS).
+		 * For tones above 491 MHz, use the AD9144 internal NCO
+		 * (fcenter_shift) which runs at the full 1966 MSPS DAC rate.
+		 */
 		p_ad9144_param->interpolation = 2;
 		p_ad9144_param->pll_enable = 1;
-		p_ad9144_param->pll_dac_frequency_khz = 2000000;
-		p_ad9144_param->lane_rate_kbps = 10000000;
-		ad9144_xcvr_param->lane_rate_khz = 10000000;
+		p_ad9144_param->pll_ref_frequency_khz = 122880;  /* same 122.88 MHz ref */
+		p_ad9144_param->pll_dac_frequency_khz = 1966080; /* 122.88 × 16 */
+		p_ad9144_param->lane_rate_kbps = 9830400;         /* unchanged */
+		ad9144_xcvr_param->lane_rate_khz = 9830400;       /* unchanged */
 #ifndef ALTERA_PLATFORM
-		ad9144_xcvr_param->ref_rate_khz = 500000;
+		ad9144_xcvr_param->ref_rate_khz = 122880;         /* unchanged */
 #else
-		ad9144_xcvr_param->parent_rate_khz = 500000;
+		ad9144_xcvr_param->parent_rate_khz = 122880;
 #endif
-		/* Set SYSCLK_SEL to QPLL */
-		//ad9680_xcvr_param->sys_clk_sel = ADXCVR_SYS_CLK_QPLL0;
+		/* QPLL0 + OUTCLK_PMA stay as mode 4 defaults — no change needed */
+		break;
+	case '2':
+		xil_printf("2 - DAC 983 MSPS (1x, no interpolation)\n");
+		/* Original mode 4 without interpolation — for debugging or
+		 * isolating interpolation filter effects. */
+		p_ad9144_param->interpolation = 1;
+		p_ad9144_param->pll_enable = 1;
+		p_ad9144_param->pll_ref_frequency_khz = 122880;
+		p_ad9144_param->pll_dac_frequency_khz = 983040;
+		p_ad9144_param->lane_rate_kbps = 9830400;
+		ad9144_xcvr_param->lane_rate_khz = 9830400;
+		ad9144_xcvr_param->ref_rate_khz = 122880;
 		break;
 	case '4':
 		printf ("DAC  600 MSPS\n");
@@ -2454,14 +2777,11 @@ int fmcdac_reconfig(struct ad9144_init_param *p_ad9144_param,
 		break;
 
 	default:
-		printf ("1 - DAC 983 MSPS (PLL)\n");
-		p_ad9144_param->interpolation = 1;
+		printf ("1 - DAC 1966 MSPS (2x interpolation, default)\n");
+		p_ad9144_param->interpolation = 2;
 		p_ad9144_param->pll_enable = 1;
-		if (g_clk_mode == FMCDAC_CLK_DISTRIBUTE)
-			p_ad9144_param->pll_ref_frequency_khz = 122880;
-		else
-			p_ad9144_param->pll_ref_frequency_khz = 122880;
-		p_ad9144_param->pll_dac_frequency_khz = 983040;
+		p_ad9144_param->pll_ref_frequency_khz = 122880;
+		p_ad9144_param->pll_dac_frequency_khz = 1966080;
 		p_ad9144_param->lane_rate_kbps = 9830400;
 		ad9144_xcvr_param->lane_rate_khz = 9830400;
 		ad9144_xcvr_param->ref_rate_khz = 122880;
@@ -2554,7 +2874,24 @@ static int fmcdac_setup(struct fmcdac_dev *dev,
 	}
 	xil_printf("[SETUP] JESD initialized successfully\n\r");
 
-	/* Default to PLL-enabled 122.88 MHz -> 983.04 MSPS clock plan */
+	/*
+	 * Default: 2x interpolation, DAC PLL = 1966.08 MHz.
+	 *
+	 * The FPGA DDS and JESD link run at 983.04 MSPS (unchanged from
+	 * the original 1x mode).  The AD9144 2x interpolation filter
+	 * upsamples internally to 1966.08 MSPS, giving:
+	 *   - Better image rejection (images at ±1966 MHz, not ±983 MHz)
+	 *   - ~3 dB SNR improvement in-band
+	 *   - Reduced sinc droop (0.6 dB vs 2.5 dB at 400 MHz)
+	 *   - Relaxed analog anti-alias filter requirements
+	 *
+	 * The FPGA DDS Nyquist remains 491.52 MHz (input rate = 983 MSPS).
+	 * To generate tones above 491 MHz, use AD9144 on-chip NCO or
+	 * switch to JESD Mode 9 (L=8) — see MODE9_HDL_REQUIREMENTS.md.
+	 *
+	 * AD9144 PLL: 122.88 MHz × 16 = 1966.08 MHz
+	 *   VCO = 7864.32 MHz (in valid 6.0–12.4 GHz range)
+	 */
 	dev_init->ad9144_param.lane_rate_kbps = 9830400;
 	dev_init->ad9144_param.spi3wire = 0;  // Use 4-wire SPI (enables SDO for reads)
 #ifdef JESD_FSM_ON
@@ -2562,16 +2899,16 @@ static int fmcdac_setup(struct fmcdac_dev *dev,
 		fmcdac_init.jtx_link_rx.converters_per_device;
 	dev_init->ad9144_param.num_lanes = fmcdac_init.jtx_link_rx.lanes_per_device;
 #endif
-	dev_init->ad9144_param.interpolation = 1;
+	dev_init->ad9144_param.interpolation = 2;
 	dev_init->ad9144_param.fcenter_shift = 0;
 	dev_init->ad9144_param.pll_enable = 1;
 	dev_init->ad9144_param.pll_ref_frequency_khz = 122880;
-	dev_init->ad9144_param.pll_dac_frequency_khz = 983040;
+	dev_init->ad9144_param.pll_dac_frequency_khz = 1966080;
 	dev_init->ad9144_param.jesd204_subclass = 1;
 	dev_init->ad9144_param.jesd204_scrambling = 1;
 	dev_init->ad9144_param.jesd204_mode = 4;
-	/* 122.88 MHz REFCLK from AD9516, AD9144 PLL -> 983.04 MSPS */
-	/* Lane rate that matches 983.04 MSPS with M=2, L=4, F=1 */
+	/* 122.88 MHz REFCLK from AD9516, AD9144 PLL -> 1966.08 MSPS (2x interp) */
+	/* Lane rate matches 983.04 MSPS link rate with M=2, L=4, F=1 */
 	dev_init->ad9144_param.lane_rate_kbps = 9830400;
 
 	/* change the default JESD configurations, if required */

@@ -74,6 +74,8 @@ struct ad9144_jesd204_priv {
 	struct ad9144_dev *dev;
 };
 
+static unsigned int ad9144_get_sample_rate(struct ad9144_dev *dev);
+
 #define AD9144_MOD_TYPE_NONE		(0x0 << 2)
 #define AD9144_MOD_TYPE_FINE		(0x1 << 2)
 #define AD9144_MOD_TYPE_COARSE4		(0x2 << 2)
@@ -484,9 +486,12 @@ int32_t ad9144_set_nco(struct ad9144_dev *dev, int32_t f_carrier_khz,
 		       int16_t phase)
 {
 	uint32_t modulation_type, phase_offset;
+	uint32_t sample_rate_hz;
+	uint32_t carrier_hz;
 	bool sel_sideband = false;
 	uint8_t i, reg;
-	uint64_t ftw;
+	uint64_t ftw, temp;
+	int32_t phase_word;
 	int32_t ret;
 
 	if (phase < -180 || phase >= 180)
@@ -496,19 +501,35 @@ int32_t ad9144_set_nco(struct ad9144_dev *dev, int32_t f_carrier_khz,
 		sel_sideband = true;
 	}
 
-	if ((uint32_t) f_carrier_khz >= dev->sample_rate_khz / 2) {
+	sample_rate_hz = ad9144_get_sample_rate(dev);
+	if (sample_rate_hz == 0)
+		return -1;
+
+	carrier_hz = (uint32_t)f_carrier_khz * 1000U;
+	ftw = 0;
+
+	if (carrier_hz == 0 || carrier_hz >= sample_rate_hz) {
 		/* No modulation */
-		modulation_type = MODULATION_TYPE(0);
-	} else if (dev->sample_rate_khz == (uint32_t) f_carrier_khz * 4) {
-		/* Coarse − f DAC /4 */
-		modulation_type = MODULATION_TYPE(2);
-	} else if (dev->sample_rate_khz == (uint32_t) f_carrier_khz * 8) {
-		/* Coarse − f DAC /8 */
-		modulation_type = MODULATION_TYPE(3);
+		modulation_type = AD9144_MOD_TYPE_NONE;
+	} else if (sample_rate_hz == carrier_hz * 4U) {
+		/* Coarse – f DAC /4 */
+		modulation_type = AD9144_MOD_TYPE_COARSE4;
+	} else if (sample_rate_hz == carrier_hz * 8U) {
+		/* Coarse – f DAC /8 */
+		modulation_type = AD9144_MOD_TYPE_COARSE8;
 	} else {
 		/* NCO Fine Modulation */
-		modulation_type = MODULATION_TYPE(1);
+		modulation_type = AD9144_MOD_TYPE_FINE;
+		temp = no_os_mul_u64_u32_shr(1ULL << 48, carrier_hz, 0);
+		ftw = no_os_div_u64(temp, sample_rate_hz);
 	}
+
+	printf("[AD9144] set_nco carrier=%ld kHz sample_rate=%lu Hz mod=0x%02lX sideband=%u\n",
+	       (long)f_carrier_khz,
+	       (unsigned long)sample_rate_hz,
+	       (unsigned long)modulation_type,
+	       (unsigned int)sel_sideband);
+
 	ret = ad9144_spi_read(dev, REG_DATAPATH_CTRL, &reg);
 	if (ret != 0)
 		return ret;
@@ -522,7 +543,6 @@ int32_t ad9144_set_nco(struct ad9144_dev *dev, int32_t f_carrier_khz,
 	if (ret != 0)
 		return ret;
 
-	ftw = ((1ULL << 48) / dev->sample_rate_khz * f_carrier_khz);
 	for (i = 0; i < 6; i++) {
 		ret = ad9144_spi_write(dev, REG_FTW0 + i,
 				       (ftw >> (8 * i)) & 0xFF);
@@ -530,7 +550,8 @@ int32_t ad9144_set_nco(struct ad9144_dev *dev, int32_t f_carrier_khz,
 			return ret;
 	}
 
-	phase_offset = (phase/180) * (1 << 15);
+	phase_word = ((int32_t)phase * (1 << 15)) / 180;
+	phase_offset = (uint16_t)phase_word;
 	ret = ad9144_spi_write(dev, REG_NCO_PHASE_OFFSET0, phase_offset & 0xFF);
 	if (ret != 0)
 		return ret;
@@ -539,7 +560,7 @@ int32_t ad9144_set_nco(struct ad9144_dev *dev, int32_t f_carrier_khz,
 	if (ret != 0)
 		return ret;
 
-	if (modulation_type  == MODULATION_TYPE(1)) {
+	if (modulation_type == AD9144_MOD_TYPE_FINE) {
 		ret = ad9144_spi_write(dev, REG_NCO_FTW_UPDATE, FTW_UPDATE_REQ);
 		if (ret != 0)
 			return ret;
@@ -552,7 +573,7 @@ static unsigned int ad9144_get_sample_rate(struct ad9144_dev *dev)
 {
 	unsigned int rate;
 
-	if (dev->pll_enable)
+	if (dev->pll_enable && dev->pll_dac_frequency_khz)
 		rate = dev->pll_dac_frequency_khz * 1000;
 	else
 		rate = dev->sample_rate_khz * 1000;
@@ -1085,8 +1106,9 @@ int32_t ad9144_setup_legacy(struct ad9144_dev **device,
 	uint32_t val;
 	int32_t ret;
 	struct ad9144_dev *dev;
+	unsigned char i;
 
-	dev = (struct ad9144_dev *)malloc(sizeof(*dev));
+	dev = (struct ad9144_dev *)calloc(1, sizeof(*dev));
 	if (!dev)
 		return -1;
 
@@ -1113,6 +1135,17 @@ int32_t ad9144_setup_legacy(struct ad9144_dev **device,
 		       scratchpad);
 		return -1;
 	}
+
+	dev->pll_ref_frequency_khz = init_param->pll_ref_frequency_khz;
+	dev->pll_dac_frequency_khz = init_param->pll_dac_frequency_khz;
+	dev->pll_enable = init_param->pll_enable;
+	dev->interpolation = init_param->interpolation;
+	for (i = 0; i < 8; i++) {
+		dev->lane_mux[i] = init_param->lane_mux[i];
+	}
+	dev->fcenter_shift = init_param->fcenter_shift;
+	dev->num_converters = init_param->num_converters;
+	dev->num_lanes = init_param->num_lanes;
 
 	// power-up and dac initialization
 	ad9144_spi_write(dev, REG_PWRCNTRL0, 0x00);	// dacs - power up everything
@@ -1306,7 +1339,7 @@ int32_t ad9144_setup_jesd_fsm(struct ad9144_dev **device,
 	struct ad9144_dev *dev;
 	unsigned char i;
 
-	dev = (struct ad9144_dev *)malloc(sizeof(*dev));
+	dev = (struct ad9144_dev *)calloc(1, sizeof(*dev));
 	if (!dev)
 		return -1;
 

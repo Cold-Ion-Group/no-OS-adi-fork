@@ -1,9 +1,13 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <inttypes.h>
 #include <xil_printf.h>
 #include <xil_cache.h>
+#include <xparameters.h>
 #include <xstatus.h>
 #include <xiic.h>
+#include <xtmrctr.h>
 #include "app_config.h"
 #include "parameters.h"
 #include "axi_adxcvr.h"
@@ -86,6 +90,10 @@ static void fmcdac_flush_input(void);
 #define FMCDAC_DEFAULT_RATE_TEXT "option 2 (DAC 983 MSPS, 1x, no interpolation)"
 #endif
 
+#define FMCDAC_BENCH_TIMER_DEVICE_ID XPAR_TMRCTR_0_DEVICE_ID
+#define FMCDAC_BENCH_TIMER_INDEX 0U
+#define FMCDAC_BENCH_TIMER_FREQ_HZ XPAR_TMRCTR_0_CLOCK_FREQ_HZ
+
 #ifdef JESD_FSM_ON
 struct link_init_param {
 	uint32_t	link_id;
@@ -149,6 +157,15 @@ static void fmcdac_latency_readback(struct fmcdac_dev *dev);
 static void fmcdac_phy_prbs_test(struct fmcdac_dev *dev);
 static int fmcdac_nco_discriminator_test(struct fmcdac_dev *dev);
 static int fmcdac_dds_band_diagnostic_test(struct fmcdac_dev *dev);
+static int fmcdac_sfdr_test(struct fmcdac_dev *dev);
+static int fmcdac_throughput_test(struct fmcdac_dev *dev);
+static void fmcdac_uart_rtt_service(void);
+static int fmcdac_read_line(char *buf, size_t len);
+static int fmcdac_timer_init(void);
+static uint64_t fmcdac_timer_now_cycles(void);
+static uint32_t fmcdac_cycles_to_us(uint64_t cycles);
+static uint32_t fmcdac_cycles_to_ns_per_op(uint64_t cycles, uint32_t ops);
+static uint32_t fmcdac_ops_per_second(uint32_t ops, uint64_t cycles);
 static void fmcdac_flush_input(void);
 
 static int fmcdac_gpio_init(struct fmcdac_dev *dev)
@@ -1020,6 +1037,96 @@ static void fmcdac_flush_input(void)
 		if (c == EOF)
 			break;
 	} while (c != '\n' && c != '\r');
+}
+
+static int fmcdac_read_line(char *buf, size_t len)
+{
+	size_t pos = 0;
+	int c;
+
+	if (!buf || len == 0)
+		return -1;
+
+	while (1) {
+		c = getc(stdin);
+		if (c == EOF)
+			continue;
+		if (c == '\r' || c == '\n') {
+			if (pos == 0)
+				continue;
+			break;
+		}
+		if (pos + 1 < len)
+			buf[pos++] = (char)c;
+	}
+
+	buf[pos] = '\0';
+	return (int)pos;
+}
+
+static uint64_t fmcdac_timer_now_cycles(void)
+{
+	static XTmrCtr timer_instance;
+	static int initialized;
+	uint32_t current;
+
+	if (!initialized) {
+		if (fmcdac_timer_init() != 0)
+			return 0;
+
+		if (XTmrCtr_Initialize(&timer_instance, FMCDAC_BENCH_TIMER_DEVICE_ID) != XST_SUCCESS)
+			return 0;
+
+		XTmrCtr_SetOptions(&timer_instance,
+				   FMCDAC_BENCH_TIMER_INDEX,
+				   XTC_DOWN_COUNT_OPTION | XTC_AUTO_RELOAD_OPTION);
+		XTmrCtr_SetResetValue(&timer_instance,
+				      FMCDAC_BENCH_TIMER_INDEX,
+				      0xFFFFFFFFU);
+		XTmrCtr_Reset(&timer_instance, FMCDAC_BENCH_TIMER_INDEX);
+		XTmrCtr_Start(&timer_instance, FMCDAC_BENCH_TIMER_INDEX);
+		initialized = 1;
+	}
+
+	current = XTmrCtr_GetValue(&timer_instance, FMCDAC_BENCH_TIMER_INDEX);
+
+	return (uint64_t)(0xFFFFFFFFU - current);
+}
+
+static int fmcdac_timer_init(void)
+{
+#ifndef XPAR_TMRCTR_0_DEVICE_ID
+	return -1;
+#else
+	return 0;
+#endif
+}
+
+static uint32_t fmcdac_cycles_to_us(uint64_t cycles)
+{
+	if (FMCDAC_BENCH_TIMER_FREQ_HZ == 0)
+		return 0;
+
+	return (uint32_t)((cycles * 1000000ULL) / FMCDAC_BENCH_TIMER_FREQ_HZ);
+}
+
+static uint32_t fmcdac_cycles_to_ns_per_op(uint64_t cycles, uint32_t ops)
+{
+	uint64_t denom;
+
+	if (FMCDAC_BENCH_TIMER_FREQ_HZ == 0 || ops == 0)
+		return 0;
+
+	denom = (uint64_t)ops * (uint64_t)FMCDAC_BENCH_TIMER_FREQ_HZ;
+	return (uint32_t)((cycles * 1000000000ULL) / denom);
+}
+
+static uint32_t fmcdac_ops_per_second(uint32_t ops, uint64_t cycles)
+{
+	if (cycles == 0)
+		return 0;
+
+	return (uint32_t)(((uint64_t)ops * (uint64_t)FMCDAC_BENCH_TIMER_FREQ_HZ) / cycles);
 }
 
 
@@ -1904,6 +2011,186 @@ static int fmcdac_dds_band_diagnostic_test(struct fmcdac_dev *dev)
 	return 0;
 }
 
+static int fmcdac_sfdr_test(struct fmcdac_dev *dev)
+{
+	static const char *tag = "SFDR-TEST";
+	static const uint32_t freqs_mhz[] = {
+		50U, 100U, 150U, 200U, 250U, 300U, 350U, 400U
+	};
+	const int32_t scale_u = 700000;
+	uint8_t interp_mode = 0;
+	uint32_t i;
+	int ret;
+
+	ret = fmcdac_prepare_dds_output(dev, tag);
+	if (ret != 0)
+		return ret;
+
+	ret = ad9144_set_nco(dev->ad9144_device, 0, 0);
+	if (ret != 0) {
+		xil_printf("[%s] Failed to disable NCO before SFDR test: %ld\n\r",
+			   tag, (long)ret);
+		return ret;
+	}
+
+	ad9144_spi_read(dev->ad9144_device, REG_INTERP_MODE, &interp_mode);
+	xil_printf("[%s] Steady-state SFDR tone set with NCO disabled.\n\r", tag);
+	xil_printf("[%s] Interpolation mode=0x%02X. Holding 50-400 MHz in 50 MHz steps.\n\r",
+		   tag, interp_mode);
+	xil_printf("[%s] DDS scale fixed to %ld micro-units to keep some spur headroom.\n\r",
+		   tag, (long)scale_u);
+
+	for (i = 0; i < NO_OS_ARRAY_SIZE(freqs_mhz); i++) {
+		uint32_t freq_mhz = freqs_mhz[i];
+		uint32_t freq_hz = freq_mhz * 1000000U;
+
+		ret = fmcdac_program_dds_pair(dev, freq_hz, scale_u, 0, 0, tag);
+		if (ret != 0) {
+			xil_printf("[%s] DDS programming failed at %lu MHz: %ld\n\r",
+				   tag, (unsigned long)freq_mhz, (long)ret);
+			return ret;
+		}
+
+		xil_printf("[%s] Step %lu/%lu: %lu MHz DDS tone.\n\r",
+			   tag,
+			   (unsigned long)(i + 1),
+			   (unsigned long)NO_OS_ARRAY_SIZE(freqs_mhz),
+			   (unsigned long)freq_mhz);
+		xil_printf("[%s] Analyzer should capture carrier power and strongest spur for SFDR.\n\r",
+			   tag);
+		fmcdac_wait_for_enter(tag, "Observe the steady-state tone.");
+	}
+
+	xil_printf("[%s] Completed steady-state SFDR tone set.\n\r", tag);
+
+	return 0;
+}
+
+static void fmcdac_print_benchmark_result(const char *tag, const char *name,
+					  uint32_t ops, uint64_t cycles)
+{
+	uint32_t total_us = fmcdac_cycles_to_us(cycles);
+	uint32_t ops_per_sec = fmcdac_ops_per_second(ops, cycles);
+	uint32_t ns_per_op = fmcdac_cycles_to_ns_per_op(cycles, ops);
+
+	xil_printf("[%s] RESULT name=%s ops=%lu total_us=%lu ops_per_sec=%lu ns_per_op=%lu\n\r",
+		   tag,
+		   name,
+		   (unsigned long)ops,
+		   (unsigned long)total_us,
+		   (unsigned long)ops_per_sec,
+		   (unsigned long)ns_per_op);
+}
+
+static int fmcdac_throughput_test(struct fmcdac_dev *dev)
+{
+	static const char *tag = "THROUGHPUT";
+	const uint32_t axi_iterations = 50000U;
+	const uint32_t spi_iterations = 4000U;
+	const uint32_t dds_iterations = 250U;
+	uint32_t axi_addr;
+	uint32_t axi_value;
+	uint8_t scratch_saved = 0;
+	uint32_t i;
+	uint64_t start_cycles;
+	uint64_t end_cycles;
+	int ret;
+
+	ret = fmcdac_prepare_dds_output(dev, tag);
+	if (ret != 0)
+		return ret;
+
+	ret = ad9144_set_nco(dev->ad9144_device, 0, 0);
+	if (ret != 0) {
+		xil_printf("[%s] Failed to disable NCO before throughput test: %ld\n\r",
+			   tag, (long)ret);
+		return ret;
+	}
+
+	ret = fmcdac_program_dds_pair(dev, 10000000U, 999000, 0, 0, tag);
+	if (ret != 0) {
+		xil_printf("[%s] Failed to establish DDS baseline before throughput test: %ld\n\r",
+			   tag, (long)ret);
+		return ret;
+	}
+
+	xil_printf("[%s] Measuring firmware-side software update baselines.\n\r", tag);
+	xil_printf("[%s] AXI timer basis: freq_hz=%lu\n\r",
+		   tag, (unsigned long)FMCDAC_BENCH_TIMER_FREQ_HZ);
+
+	axi_addr = dev->ad9144_core->base + 0x0418;
+	axi_value = Xil_In32(axi_addr);
+	start_cycles = fmcdac_timer_now_cycles();
+	for (i = 0; i < axi_iterations; i++)
+		Xil_Out32(axi_addr, axi_value);
+	end_cycles = fmcdac_timer_now_cycles();
+	fmcdac_print_benchmark_result(tag, "axi_mmio_write",
+				      axi_iterations,
+				      end_cycles - start_cycles);
+
+	ad9144_spi_read(dev->ad9144_device, REG_SPI_SCRATCHPAD, &scratch_saved);
+	start_cycles = fmcdac_timer_now_cycles();
+	for (i = 0; i < spi_iterations; i++)
+		ad9144_spi_write(dev->ad9144_device, REG_SPI_SCRATCHPAD,
+				 (uint8_t)(i & 0xFF));
+	end_cycles = fmcdac_timer_now_cycles();
+	ad9144_spi_write(dev->ad9144_device, REG_SPI_SCRATCHPAD, scratch_saved);
+	fmcdac_print_benchmark_result(tag, "ad9144_spi_write",
+				      spi_iterations,
+				      end_cycles - start_cycles);
+
+	start_cycles = fmcdac_timer_now_cycles();
+	for (i = 0; i < dds_iterations; i++) {
+		uint32_t freq_hz = ((i & 1U) == 0U) ? 10000000U : 11000000U;
+
+		axi_dac_dds_sync_hold(dev->ad9144_core);
+		ret = axi_dac_dds_set_frequency(dev->ad9144_core, 0, freq_hz);
+		if (ret < 0)
+			return ret;
+		ret = axi_dac_dds_set_frequency(dev->ad9144_core, 2, freq_hz);
+		if (ret < 0)
+			return ret;
+		axi_dac_dds_sync_commit(dev->ad9144_core);
+	}
+	end_cycles = fmcdac_timer_now_cycles();
+	fmcdac_print_benchmark_result(tag, "dds_pair_update",
+				      dds_iterations,
+				      end_cycles - start_cycles);
+
+	xil_printf("[%s] Done.\n\r", tag);
+
+	return 0;
+}
+
+static void fmcdac_uart_rtt_service(void)
+{
+	static const char *tag = "UART-RTT";
+	char line[64];
+	uint32_t exchanges = 0;
+
+	xil_printf("[%s] Ready. Send 'PING <token>' and wait for 'PONG <token>'. Send DONE to exit.\n\r",
+		   tag);
+
+	while (exchanges < 64U) {
+		if (fmcdac_read_line(line, sizeof(line)) < 0)
+			break;
+
+		if (strcmp(line, "DONE") == 0)
+			break;
+
+		if (strncmp(line, "PING ", 5) == 0) {
+			xil_printf("[%s] PONG %s\n\r", tag, line + 5);
+			exchanges++;
+			continue;
+		}
+
+		xil_printf("[%s] ERROR unexpected='%s'\n\r", tag, line);
+	}
+
+	xil_printf("[%s] Done. exchanges=%lu\n\r",
+		   tag, (unsigned long)exchanges);
+}
+
 /**
  * @brief Force a known-good DDS tone for scope/spectrum analyzer validation.
  * @param dev - The device structure.
@@ -2562,6 +2849,44 @@ skip_stpl_zero:
 		} else {
 			xil_printf("[DDS-BAND] Skipped. Continuing to normal DDS sweep.\n\r");
 		}
+	}
+
+	xil_printf("[SFDR-TEST] Run steady-state SFDR tone set at 50-400 MHz? [y/N]: ");
+	{
+		int run_sfdr = getc(stdin);
+		fmcdac_flush_input();
+		if (run_sfdr == 'y' || run_sfdr == 'Y') {
+			status = fmcdac_sfdr_test(dev);
+			if (status != 0)
+				xil_printf("[SFDR-TEST] Diagnostic setup failed: %d\n\r",
+					   status);
+		} else {
+			xil_printf("[SFDR-TEST] Skipped.\n\r");
+		}
+	}
+
+	xil_printf("[THROUGHPUT] Run MicroBlaze throughput benchmark? [y/N]: ");
+	{
+		int run_throughput = getc(stdin);
+		fmcdac_flush_input();
+		if (run_throughput == 'y' || run_throughput == 'Y') {
+			status = fmcdac_throughput_test(dev);
+			if (status != 0)
+				xil_printf("[THROUGHPUT] Benchmark failed: %d\n\r",
+					   status);
+		} else {
+			xil_printf("[THROUGHPUT] Skipped.\n\r");
+		}
+	}
+
+	xil_printf("[UART-RTT] Run host UART round-trip benchmark? [y/N]: ");
+	{
+		int run_uart_rtt = getc(stdin);
+		fmcdac_flush_input();
+		if (run_uart_rtt == 'y' || run_uart_rtt == 'Y')
+			fmcdac_uart_rtt_service();
+		else
+			xil_printf("[UART-RTT] Skipped.\n\r");
 	}
 
 	/* DDS tone test - validates data path for NCO/CORDIC development */

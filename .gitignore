@@ -40,3 +40,10 @@ local_variables.mk
 /projects/*/resources/
 /projects/*/_ide/
 /projects/*/*.prj
+
+# FMCDAC automation artifacts
+/projects/fmcdac/capture_runs/
+/projects/fmcdac/__pycache__/
+/projects/fmcdac/*.pyc
+/projects/fmcdac/.Xil.stale.*/
+/projects/fmcdac/build.stale.*/

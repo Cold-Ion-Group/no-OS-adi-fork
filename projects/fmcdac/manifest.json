@@ -1,19 +1,19 @@
 ﻿{
     "project":  "fmcdac_kcu116",
-    "created":  "2026-02-19T21:25:50+08:00",
+    "created":  "2026-04-02T18:23:01+08:00",
     "firmware":  {
                      "repo":  "Cold-Ion-Group/no-OS-adi-fork",
-                     "branch":  "tmp-dump",
-                     "commit":  "26fd0f30b424a700703bff6d85df60fba3f8cfc5",
-                     "describe":  "heads/tmp-dump-0-g26fd0f30b-modified",
+                     "branch":  "dev-Cold-Ion-Group",
+                     "commit":  "e3285de08d7cd62dadf4248aaf9069454429cc8f",
+                     "describe":  "heads/dev-Cold-Ion-Group-0-ge3285de08-modified",
                      "dirty":  true
                  },
     "hdl":  {
                 "file":  "system_top.xsa",
-                "sha256":  "39f6ca62a748b56a2ccda1e7c07b28785b62e447b406c9c1ccb5dd422b39f43a"
+                "sha256":  "3b2089d1e45dac7788185f1e2472cdcdbdd6fd3be8db94e42f005ae96113bdcb"
             },
     "submodules":  {
-                       "libraries/mbedtls":  "f8c01a1a386de1129cf377d4a4d3246da4b0d41f",
+                       "libraries/mbedtls":  "8b8485373fa01289253071b93bfc79b6df592401",
                        "libraries/mqtt/paho.mqtt.embedded-c":  "29ab2aa29c5e47794284376d7f8386cfd54c3eed",
                        "libraries/iio/libtinyiiod":  "440e4252f9e57340eda5d4741299d77093af7a72"
                    },
@@ -21,9 +21,9 @@
                          "jesd_subclass":  1,
                          "jesd_mode":  4,
                          "lane_rate_kbps":  9830400,
-                         "dac_freq_khz":  983040,
+                         "dac_freq_khz":  1966080,
                          "ref_freq_khz":  122880,
-                         "interpolation":  1,
+                         "interpolation":  2,
                          "scrambling":  1,
                          "num_converters":  2,
                          "num_lanes":  4,

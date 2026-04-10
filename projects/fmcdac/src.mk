@@ -3,6 +3,7 @@
 # fmcdac is the main file used to set up the baremetal os libraries. 
 
 SRCS += $(PROJECT)/src/app/fmcdac.c \
+        $(PROJECT)/src/app/awg_sched.c \
         $(DRIVERS)/frequency/ad9516/ad9516.c \
         $(DRIVERS)/si5328/si5328drv.c \
         $(DRIVERS)/axi_core/axi_dac_core/axi_dac_core.c \
@@ -24,6 +25,7 @@ SRCS += $(PLATFORM_DRIVERS)/xilinx_axi_io.c \
         $(PLATFORM_DRIVERS)/xilinx_delay.c
 
 INCS += $(PROJECT)/src/app/app_config.h \
+        $(PROJECT)/src/app/awg_sched.h \
         $(PROJECT)/src/app/parameters.h \
         $(DRIVERS)/axi_core/axi_dac_core/axi_dac_core.h \
         $(DRIVERS)/axi_core/axi_dmac/axi_dmac.h \

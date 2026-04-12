@@ -23,6 +23,7 @@
 #include "axi_dmac.h"
 #include "axi_jesd204_tx.h"
 #include "si5328drv.h"
+#include "awg_sched.h"
 
 /* Stringify NO_OS_VERSION — the Makefile's -D quotes may not survive
  * the Windows shell, so we force stringification here. */
@@ -71,6 +72,28 @@ enum fmcdac_clock_mode {
 };
 
 static enum fmcdac_clock_mode g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
+
+#ifndef FMCDAC_MANUAL_DEBUG_MODE
+#define FMCDAC_MANUAL_DEBUG_MODE 0
+#endif
+
+#ifndef FMCDAC_AWG_SCHED_BASEADDR
+#define FMCDAC_AWG_SCHED_BASEADDR 0U
+#endif
+
+#ifndef FMCDAC_AWG_SCHED_MAX_EVENTS
+#define FMCDAC_AWG_SCHED_MAX_EVENTS 64U
+#endif
+
+#ifndef FMCDAC_AWG_SCHED_TICK_HZ
+#define FMCDAC_AWG_SCHED_TICK_HZ 1000000U
+#endif
+
+#ifndef FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS
+#define FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS 2000U
+#endif
+
+static const int g_fmcdac_manual_debug_mode = (FMCDAC_MANUAL_DEBUG_MODE != 0);
 
 static void fmcdac_flush_input(void);
 
@@ -161,6 +184,7 @@ static int fmcdac_sfdr_test(struct fmcdac_dev *dev);
 static int fmcdac_throughput_test(struct fmcdac_dev *dev);
 static void fmcdac_uart_rtt_service(void);
 static int fmcdac_read_line(char *buf, size_t len);
+static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev);
 static int fmcdac_timer_init(void);
 static uint64_t fmcdac_timer_now_cycles(void);
 static uint32_t fmcdac_cycles_to_us(uint64_t cycles);
@@ -1872,8 +1896,114 @@ static void fmcdac_nco_readback(struct fmcdac_dev *dev, const char *tag)
 
 static void fmcdac_wait_for_enter(const char *tag, const char *message)
 {
+	if (!g_fmcdac_manual_debug_mode) {
+		xil_printf("[%s] Manual wait skipped (FMCDAC_MANUAL_DEBUG_MODE=0): %s\n\r",
+			   tag, message);
+		return;
+	}
+
 	xil_printf("[%s] %s Press ENTER to continue...\n\r", tag, message);
 	fmcdac_flush_input();
+}
+
+static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev)
+{
+	static const char *tag = "SCHED-DET";
+	awg_sched_cfg_t sched_cfg;
+	awg_sched_status_t sched_status;
+	awg_event_v1_t events[4];
+	const uint32_t event_count = NO_OS_ARRAY_SIZE(events);
+	int ret;
+
+	(void)dev;
+
+	if (FMCDAC_AWG_SCHED_BASEADDR == 0U) {
+		xil_printf("[%s] Skipped: FMCDAC_AWG_SCHED_BASEADDR is 0.\n\r", tag);
+		return 0;
+	}
+
+	sched_cfg.base_addr = FMCDAC_AWG_SCHED_BASEADDR;
+	sched_cfg.max_events = FMCDAC_AWG_SCHED_MAX_EVENTS;
+	sched_cfg.tick_hz = FMCDAC_AWG_SCHED_TICK_HZ;
+	sched_cfg.done_timeout_ms = FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS;
+
+	ret = awg_sched_config(&sched_cfg);
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_config() failed: %d\n\r", tag, ret);
+		return ret;
+	}
+
+	memset(events, 0, sizeof(events));
+	events[0].timestamp_ticks = 1000U;
+	events[0].channel = 0U;
+	events[0].flags = 0x0001U;
+	events[0].payload.word0 = 0x00010000U;
+
+	events[1].timestamp_ticks = 2000U;
+	events[1].channel = 0U;
+	events[1].flags = 0x0001U;
+	events[1].payload.word0 = 0x00020000U;
+
+	events[2].timestamp_ticks = 3000U;
+	events[2].channel = 1U;
+	events[2].flags = 0x0001U;
+	events[2].payload.word0 = 0x00030000U;
+
+	events[3].timestamp_ticks = 4000U;
+	events[3].channel = 1U;
+	events[3].flags = 0x0001U;
+	events[3].payload.word0 = 0x00040000U;
+
+	xil_printf("[%s] Built %lu events in-memory.\n\r",
+		   tag, (unsigned long)event_count);
+
+	ret = awg_sched_verify_events(events, event_count);
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_verify_events() failed: %d\n\r", tag, ret);
+		return ret;
+	}
+
+	ret = awg_sched_load_events(events, event_count);
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_load_events() failed: %d\n\r", tag, ret);
+		return ret;
+	}
+
+	ret = awg_sched_arm();
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_arm() failed: %d\n\r", tag, ret);
+		return ret;
+	}
+
+	ret = awg_sched_start();
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_start() failed: %d\n\r", tag, ret);
+		return ret;
+	}
+
+	ret = awg_sched_wait_done(FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS, &sched_status);
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_wait_done() failed: %d\n\r", tag, ret);
+		return ret;
+	}
+
+	ret = awg_sched_get_status(&sched_status);
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_get_status() failed: %d\n\r", tag, ret);
+		return ret;
+	}
+
+	xil_printf("[%s] DONE armed=%u running=%u done=%u error=%u current=%lu loaded=%lu status=0x%08lX\n\r",
+		   tag,
+		   sched_status.armed ? 1U : 0U,
+		   sched_status.running ? 1U : 0U,
+		   sched_status.done ? 1U : 0U,
+		   sched_status.error ? 1U : 0U,
+		   (unsigned long)sched_status.current_event,
+		   (unsigned long)sched_status.loaded_events,
+		   (unsigned long)sched_status.hw_status_word);
+
+	return 0;
 }
 
 static int fmcdac_nco_discriminator_test(struct fmcdac_dev *dev)
@@ -2823,74 +2953,83 @@ skip_stpl_zero:
 	fmcdac_latency_readback(dev);
 	fmcdac_phy_prbs_test(dev);
 
-	xil_printf("[NCO-TEST] Run 10 MHz DDS + AD9144 NCO discriminator test? [y/N]: ");
-	{
-		int run_nco = getc(stdin);
-		fmcdac_flush_input();
-		if (run_nco == 'y' || run_nco == 'Y') {
-			status = fmcdac_nco_discriminator_test(dev);
-			if (status != 0)
-				xil_printf("[NCO-TEST] Diagnostic setup failed: %d\n\r",
-					   status);
-		} else {
-			xil_printf("[NCO-TEST] Skipped.\n\r");
+	if (g_fmcdac_manual_debug_mode) {
+		xil_printf("[MANUAL] FMCDAC_MANUAL_DEBUG_MODE=1; enabling interactive diagnostics.\n\r");
+
+		xil_printf("[NCO-TEST] Run 10 MHz DDS + AD9144 NCO discriminator test? [y/N]: ");
+		{
+			int run_nco = getc(stdin);
+			fmcdac_flush_input();
+			if (run_nco == 'y' || run_nco == 'Y') {
+				status = fmcdac_nco_discriminator_test(dev);
+				if (status != 0)
+					xil_printf("[NCO-TEST] Diagnostic setup failed: %d\n\r",
+						   status);
+			} else {
+				xil_printf("[NCO-TEST] Skipped.\n\r");
+			}
 		}
-	}
 
-	xil_printf("[DDS-BAND] Run focused DDS sweep diagnostic around 230-330 MHz? [y/N]: ");
-	{
-		int run_dds_band = getc(stdin);
-		fmcdac_flush_input();
-		if (run_dds_band == 'y' || run_dds_band == 'Y') {
-			status = fmcdac_dds_band_diagnostic_test(dev);
-			if (status != 0)
-				xil_printf("[DDS-BAND] Diagnostic setup failed: %d\n\r",
-					   status);
-		} else {
-			xil_printf("[DDS-BAND] Skipped. Continuing to normal DDS sweep.\n\r");
+		xil_printf("[DDS-BAND] Run focused DDS sweep diagnostic around 230-330 MHz? [y/N]: ");
+		{
+			int run_dds_band = getc(stdin);
+			fmcdac_flush_input();
+			if (run_dds_band == 'y' || run_dds_band == 'Y') {
+				status = fmcdac_dds_band_diagnostic_test(dev);
+				if (status != 0)
+					xil_printf("[DDS-BAND] Diagnostic setup failed: %d\n\r",
+						   status);
+			} else {
+				xil_printf("[DDS-BAND] Skipped. Continuing to normal DDS sweep.\n\r");
+			}
 		}
-	}
 
-	xil_printf("[SFDR-TEST] Run steady-state SFDR tone set at 50-400 MHz? [y/N]: ");
-	{
-		int run_sfdr = getc(stdin);
-		fmcdac_flush_input();
-		if (run_sfdr == 'y' || run_sfdr == 'Y') {
-			status = fmcdac_sfdr_test(dev);
-			if (status != 0)
-				xil_printf("[SFDR-TEST] Diagnostic setup failed: %d\n\r",
-					   status);
-		} else {
-			xil_printf("[SFDR-TEST] Skipped.\n\r");
+		xil_printf("[SFDR-TEST] Run steady-state SFDR tone set at 50-400 MHz? [y/N]: ");
+		{
+			int run_sfdr = getc(stdin);
+			fmcdac_flush_input();
+			if (run_sfdr == 'y' || run_sfdr == 'Y') {
+				status = fmcdac_sfdr_test(dev);
+				if (status != 0)
+					xil_printf("[SFDR-TEST] Diagnostic setup failed: %d\n\r",
+						   status);
+			} else {
+				xil_printf("[SFDR-TEST] Skipped.\n\r");
+			}
 		}
-	}
 
-	xil_printf("[THROUGHPUT] Run MicroBlaze throughput benchmark? [y/N]: ");
-	{
-		int run_throughput = getc(stdin);
-		fmcdac_flush_input();
-		if (run_throughput == 'y' || run_throughput == 'Y') {
-			status = fmcdac_throughput_test(dev);
-			if (status != 0)
-				xil_printf("[THROUGHPUT] Benchmark failed: %d\n\r",
-					   status);
-		} else {
-			xil_printf("[THROUGHPUT] Skipped.\n\r");
+		xil_printf("[THROUGHPUT] Run MicroBlaze throughput benchmark? [y/N]: ");
+		{
+			int run_throughput = getc(stdin);
+			fmcdac_flush_input();
+			if (run_throughput == 'y' || run_throughput == 'Y') {
+				status = fmcdac_throughput_test(dev);
+				if (status != 0)
+					xil_printf("[THROUGHPUT] Benchmark failed: %d\n\r",
+						   status);
+			} else {
+				xil_printf("[THROUGHPUT] Skipped.\n\r");
+			}
 		}
-	}
 
-	xil_printf("[UART-RTT] Run host UART round-trip benchmark? [y/N]: ");
-	{
-		int run_uart_rtt = getc(stdin);
-		fmcdac_flush_input();
-		if (run_uart_rtt == 'y' || run_uart_rtt == 'Y')
-			fmcdac_uart_rtt_service();
-		else
-			xil_printf("[UART-RTT] Skipped.\n\r");
-	}
+		xil_printf("[UART-RTT] Run host UART round-trip benchmark? [y/N]: ");
+		{
+			int run_uart_rtt = getc(stdin);
+			fmcdac_flush_input();
+			if (run_uart_rtt == 'y' || run_uart_rtt == 'Y')
+				fmcdac_uart_rtt_service();
+			else
+				xil_printf("[UART-RTT] Skipped.\n\r");
+		}
 
-	/* DDS tone test - validates data path for NCO/CORDIC development */
-	force_dds_tone(dev);
+		/* Manual DDS tone test/sweep path */
+		force_dds_tone(dev);
+	} else {
+		xil_printf("[MANUAL] FMCDAC_MANUAL_DEBUG_MODE=0; interactive prompts and manual DDS sweep disabled.\n\r");
+		status = fmcdac_run_scheduler_deterministic_path(dev);
+		if (status != 0)
+			xil_printf("[SCHED-DET] Deterministic scheduler path failed: %d\n\r", status);
+	}
 
 	return test_errors ? -test_errors : 0;
 }

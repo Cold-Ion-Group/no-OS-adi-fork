@@ -7,6 +7,7 @@
 #include "awg_sched.h"
 #include "no_os_axi_io.h"
 #include "no_os_delay.h"
+#include "xil_printf.h"
 
 /* Control/status register map (local to this implementation). */
 #define AWG_SCHED_REG_CTRL            0x0000U
@@ -35,9 +36,91 @@
 
 static struct {
 	bool configured;
+	bool events_validated;
 	awg_sched_cfg_t cfg;
 	uint32_t loaded_events;
 } g_awg_sched;
+
+#define AWG_SCHED_FLAGS_ALLOWED_MASK      0x0001U
+#define AWG_SCHED_CHANNEL_MASK_DEFAULT    0x0001U
+#define AWG_SCHED_TONE_MASK_DEFAULT       0x0003U
+#define AWG_SCHED_FREQ_MASK_DEFAULT       0x0000FFFFU
+#define AWG_SCHED_SCALE_MASK_DEFAULT      0x0000FFFFU
+#define AWG_SCHED_PHASE_MASK_DEFAULT      0x0000FFFFU
+
+static const char *awg_sched_validation_reason(awg_evtval_err_t code)
+{
+	switch (code) {
+	case AWG_EVTVAL_OK:
+		return "ok";
+	case AWG_EVTVAL_ERR_NOT_CONFIGURED:
+		return "scheduler not configured";
+	case AWG_EVTVAL_ERR_NULL_EVENTS:
+		return "events pointer is NULL while count > 0";
+	case AWG_EVTVAL_ERR_TOO_MANY_EVENTS:
+		return "event count exceeds hardware depth";
+	case AWG_EVTVAL_ERR_TS_NOT_MONOTONIC:
+		return "timestamp is not monotonic nondecreasing";
+	case AWG_EVTVAL_ERR_TS_DELTA_TOO_SMALL:
+		return "timestamp delta below Tmin_event";
+	case AWG_EVTVAL_ERR_RESERVED_FLAGS:
+		return "reserved/illegal flags are set";
+	case AWG_EVTVAL_ERR_CHANNEL_WIDTH:
+		return "channel exceeds configured field width";
+	case AWG_EVTVAL_ERR_TONE_WIDTH:
+		return "tone exceeds configured field width";
+	case AWG_EVTVAL_ERR_FREQ_WIDTH:
+		return "frequency exceeds configured field width";
+	case AWG_EVTVAL_ERR_SCALE_WIDTH:
+		return "scale exceeds configured field width";
+	case AWG_EVTVAL_ERR_PHASE_WIDTH:
+		return "phase exceeds configured field width";
+	default:
+		return "unknown validation error";
+	}
+}
+
+static void awg_sched_validation_report_set(awg_sched_validation_report_t *report,
+		awg_evtval_err_t code, uint32_t idx,
+		uint32_t observed, uint32_t expected_min)
+{
+	if (!report)
+		return;
+
+	report->code = code;
+	report->failing_index = idx;
+	report->reason = awg_sched_validation_reason(code);
+	report->observed = observed;
+	report->expected_min = expected_min;
+}
+
+void awg_sched_validation_rules_default(awg_sched_validation_rules_t *rules)
+{
+	if (!rules)
+		return;
+
+	memset(rules, 0, sizeof(*rules));
+	rules->min_delta_ticks = 1U;
+	rules->delta_mode = AWG_SCHED_DELTA_MODE_STRICT;
+	rules->allowed_flags_mask = AWG_SCHED_FLAGS_ALLOWED_MASK;
+	rules->channel_mask = AWG_SCHED_CHANNEL_MASK_DEFAULT;
+	rules->tone_shift = 0U;
+	rules->tone_mask = AWG_SCHED_TONE_MASK_DEFAULT;
+	rules->freq_shift = 16U;
+	rules->freq_mask = AWG_SCHED_FREQ_MASK_DEFAULT;
+	rules->scale_shift = 0U;
+	rules->scale_mask = AWG_SCHED_SCALE_MASK_DEFAULT;
+	rules->phase_shift = 0U;
+	rules->phase_mask = AWG_SCHED_PHASE_MASK_DEFAULT;
+}
+
+static bool awg_sched_check_field_width(uint32_t raw, uint32_t mask, uint8_t shift)
+{
+	if (mask == 0U)
+		return true;
+
+	return ((raw >> shift) & ~mask) == 0U;
+}
 
 static int awg_sched_reg_write(uint32_t offset, uint32_t val)
 {
@@ -70,6 +153,7 @@ int awg_sched_reset(void)
 		return ret;
 
 	g_awg_sched.loaded_events = 0;
+	g_awg_sched.events_validated = false;
 	return awg_sched_reg_write(AWG_SCHED_REG_EVENT_COUNT, 0U);
 }
 
@@ -90,23 +174,151 @@ int awg_sched_config(const awg_sched_cfg_t *cfg)
 
 int awg_sched_verify_events(const awg_event_v1_t *events, uint32_t count)
 {
+	awg_sched_validation_report_t report;
+	int ret;
+
+	ret = awg_sched_validate_events(events, count, NULL, &report);
+	if (ret != 0)
+		return ret;
+
+	g_awg_sched.events_validated = true;
+	return 0;
+}
+
+int awg_sched_validate_events(const awg_event_v1_t *events, uint32_t count,
+			      const awg_sched_validation_rules_t *rules,
+			      awg_sched_validation_report_t *report)
+{
+	awg_sched_validation_rules_t active_rules;
 	uint32_t i;
+	uint32_t max_events;
+	uint32_t observed;
+	uint32_t delta;
+
+	awg_sched_validation_report_set(report, AWG_EVTVAL_OK, 0U, 0U, 0U);
 
 	if (!g_awg_sched.configured)
-		return -ENODEV;
+		goto fail_not_configured;
 
 	if ((count > 0U) && !events)
-		return -EINVAL;
+		goto fail_null_events;
 
-	if (count > g_awg_sched.cfg.max_events)
-		return -E2BIG;
+	awg_sched_validation_rules_default(&active_rules);
+	if (rules)
+		active_rules = *rules;
+
+	max_events = g_awg_sched.cfg.max_events;
+	if (count > max_events)
+		goto fail_too_many_events;
 
 	for (i = 1U; i < count; i++) {
-		if (events[i].timestamp_ticks < events[i - 1U].timestamp_ticks)
-			return -EINVAL;
+		if (events[i].timestamp_ticks < events[i - 1U].timestamp_ticks) {
+			awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_TS_NOT_MONOTONIC,
+							i, events[i].timestamp_ticks,
+							events[i - 1U].timestamp_ticks);
+			goto fail;
+		}
+	}
+
+	for (i = 0U; i < count; i++) {
+		const awg_event_v1_t *event = &events[i];
+
+		if ((event->flags & ~active_rules.allowed_flags_mask) != 0U) {
+			awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_RESERVED_FLAGS,
+							i, event->flags,
+							active_rules.allowed_flags_mask);
+			goto fail;
+		}
+
+		if ((event->channel & ~active_rules.channel_mask) != 0U) {
+			awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_CHANNEL_WIDTH,
+							i, event->channel,
+							active_rules.channel_mask);
+			goto fail;
+		}
+
+		if (!awg_sched_check_field_width(event->payload.word0, active_rules.tone_mask,
+						 active_rules.tone_shift)) {
+			awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_TONE_WIDTH, i,
+							event->payload.word0,
+							active_rules.tone_mask);
+			goto fail;
+		}
+
+		if (!awg_sched_check_field_width(event->payload.word0, active_rules.freq_mask,
+						 active_rules.freq_shift)) {
+			awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_FREQ_WIDTH, i,
+							event->payload.word0,
+							active_rules.freq_mask);
+			goto fail;
+		}
+
+		if (!awg_sched_check_field_width(event->payload.word1, active_rules.scale_mask,
+						 active_rules.scale_shift)) {
+			awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_SCALE_WIDTH, i,
+							event->payload.word1,
+							active_rules.scale_mask);
+			goto fail;
+		}
+
+		if (!awg_sched_check_field_width(event->payload.word2, active_rules.phase_mask,
+						 active_rules.phase_shift)) {
+			awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_PHASE_WIDTH, i,
+							event->payload.word2,
+							active_rules.phase_mask);
+			goto fail;
+		}
+	}
+
+	if (count > 1U) {
+		for (i = 1U; i < count; i++) {
+			delta = events[i].timestamp_ticks - events[i - 1U].timestamp_ticks;
+			if (delta < active_rules.min_delta_ticks) {
+				if ((active_rules.delta_mode ==
+				     AWG_SCHED_DELTA_MODE_ALLOW_ZERO_ON_SAME_CHANNEL) &&
+				    (events[i].channel == events[i - 1U].channel) &&
+				    (delta == 0U))
+					continue;
+
+				awg_sched_validation_report_set(report,
+							AWG_EVTVAL_ERR_TS_DELTA_TOO_SMALL,
+							i, delta, active_rules.min_delta_ticks);
+				goto fail;
+			}
+		}
 	}
 
 	return 0;
+
+fail_not_configured:
+	awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_NOT_CONFIGURED, 0U, 0U, 0U);
+	xil_printf("[AWG-SCHED] validation failed @idx=0 code=%d reason=%s\n\r",
+		   (int)AWG_EVTVAL_ERR_NOT_CONFIGURED,
+		   awg_sched_validation_reason(AWG_EVTVAL_ERR_NOT_CONFIGURED));
+	return -ENODEV;
+fail_null_events:
+	awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_NULL_EVENTS, 0U, 0U, 0U);
+	xil_printf("[AWG-SCHED] validation failed @idx=0 code=%d reason=%s\n\r",
+		   (int)AWG_EVTVAL_ERR_NULL_EVENTS,
+		   awg_sched_validation_reason(AWG_EVTVAL_ERR_NULL_EVENTS));
+	return -EINVAL;
+fail_too_many_events:
+	observed = count;
+	awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_TOO_MANY_EVENTS,
+					0U, observed, max_events);
+	xil_printf("[AWG-SCHED] validation failed @idx=0 code=%d reason=%s observed=%lu max=%lu\n\r",
+		   (int)AWG_EVTVAL_ERR_TOO_MANY_EVENTS,
+		   awg_sched_validation_reason(AWG_EVTVAL_ERR_TOO_MANY_EVENTS),
+		   (unsigned long)observed, (unsigned long)max_events);
+	return -E2BIG;
+fail:
+	if (report) {
+		xil_printf("[AWG-SCHED] validation failed @idx=%lu code=%d reason=%s observed=0x%08lX expected_min=0x%08lX\n\r",
+			   (unsigned long)report->failing_index, (int)report->code,
+			   report->reason, (unsigned long)report->observed,
+			   (unsigned long)report->expected_min);
+	}
+	return -EINVAL;
 }
 
 static int awg_sched_write_event(uint32_t idx, const awg_event_v1_t *event)
@@ -151,23 +363,30 @@ int awg_sched_load_events(const awg_event_v1_t *events, uint32_t count)
 	int ret;
 	uint32_t i;
 
+	g_awg_sched.events_validated = false;
 	ret = awg_sched_verify_events(events, count);
 	if (ret)
 		return ret;
 
 	ret = awg_sched_stop();
-	if (ret)
+	if (ret) {
+		g_awg_sched.events_validated = false;
 		return ret;
+	}
 
 	for (i = 0; i < count; i++) {
 		ret = awg_sched_write_event(i, &events[i]);
-		if (ret)
+		if (ret) {
+			g_awg_sched.events_validated = false;
 			return ret;
+		}
 	}
 
 	ret = awg_sched_reg_write(AWG_SCHED_REG_EVENT_COUNT, count);
-	if (ret)
+	if (ret) {
+		g_awg_sched.events_validated = false;
 		return ret;
+	}
 
 	g_awg_sched.loaded_events = count;
 	return 0;
@@ -179,6 +398,9 @@ int awg_sched_arm(void)
 		return -ENODEV;
 
 	if (!g_awg_sched.loaded_events)
+		return -EINVAL;
+
+	if (!g_awg_sched.events_validated)
 		return -EINVAL;
 
 	return awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_ARM);

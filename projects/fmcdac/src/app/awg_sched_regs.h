@@ -47,7 +47,7 @@
 /**
  * IP_CAPS — capability register (R):
  *   [31:24]  log2 of maximum event depth (1 << field gives depth)
- *   [23:16]  payload width in bits / 8
+ *   [23:16]  payload width in bits
  *   [15:8]   timestamp width in bits
  *   [7:0]    reserved
  */

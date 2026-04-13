@@ -24,8 +24,8 @@ as the HDL localparams.
 | 0x14   | IP_ID           | R      | IP magic word (0x41574753 = `'AWGS'`)      |
 | 0x18   | IP_VERSION      | R      | Major\[31:16\] / Minor\[15:0\]             |
 | 0x1C   | IP_CAPS         | R      | Capability word (see below)                |
-| 0x20   | TIME_LO         | R      | Tick counter \[31:0\] (latched on STATUS read)|
-| 0x24   | TIME_HI         | R      | Tick counter \[63:32\]                     |
+| 0x20   | TIME_LO         | R      | Tick counter \[31:0\] (read after STATUS to get a consistent snapshot) |
+| 0x24   | TIME_HI         | R      | Tick counter \[63:32\] (read after TIME_LO for coherent pair)          |
 | 0x28   | LAST_EXEC_LO    | R      | Last-dispatched event tick \[31:0\]        |
 | 0x2C   | LAST_EXEC_HI    | R      | Last-dispatched event tick \[63:32\]       |
 | 0x30   | COMMIT_COUNT    | R      | Total events dispatched since reset        |

@@ -442,12 +442,13 @@ EXPECT_EQ(stub_config(64), 0);
 memset(&ev, 0, sizeof(ev));
 ev.timestamp_ticks = 1000U;
 ev.flags = 0x0001U;
-/* scale occupies word1[15:0]; bit16 exceeds scale_mask=0xFFFF */
-ev.payload.word1 = 0x00010000U;
+/* scale occupies word1[15:0]; use a narrow mask and exceed it. */
+ev.payload.word1 = 0x00000100U;
 
 awg_sched_validation_rules_default(&rules);
 rules.tone_mask = 0U;
 rules.freq_mask = 0U;
+rules.scale_mask = 0x00FFU;
 
 ret = awg_sched_validate_events(&ev, 1, &rules, &r);
 EXPECT_NE(ret, 0);
@@ -466,17 +467,60 @@ EXPECT_EQ(stub_config(64), 0);
 memset(&ev, 0, sizeof(ev));
 ev.timestamp_ticks = 1000U;
 ev.flags = 0x0001U;
-/* phase occupies word2[15:0]; bit16 exceeds phase_mask=0xFFFF */
-ev.payload.word2 = 0x00010000U;
+/* phase occupies word2[15:0]; use a narrow mask and exceed it. */
+ev.payload.word2 = 0x00000100U;
 
 awg_sched_validation_rules_default(&rules);
 rules.tone_mask  = 0U;
 rules.freq_mask  = 0U;
 rules.scale_mask = 0U;
+rules.phase_mask = 0x00FFU;
 
 ret = awg_sched_validate_events(&ev, 1, &rules, &r);
 EXPECT_NE(ret, 0);
 EXPECT_EQ((int)r.code, (int)AWG_EVTVAL_ERR_PHASE_WIDTH);
+}
+
+static void test_fake_hw_progression(void)
+{
+	awg_event_v1_t ev;
+	awg_sched_status_t st;
+	int ret;
+
+	test_begin("fake-hw arm/run/done progression");
+	EXPECT_EQ(stub_config(64), 0);
+
+	memset(&ev, 0, sizeof(ev));
+	ev.timestamp_ticks = 1000U;
+	ev.flags = 0x0001U;
+	ev.payload.word0 = 0x00010000U;
+
+	ret = awg_sched_load_events(&ev, 1U);
+	EXPECT_EQ(ret, 0);
+
+	ret = awg_sched_arm();
+	EXPECT_EQ(ret, 0);
+	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_CTRL / 4U],
+		  (int)AWG_SCHED_CTRL_ARM);
+
+	/* Simulate hardware acknowledging ARM. */
+	s_stub_regs[AWG_SCHED_REG_STATUS / 4U] = AWG_SCHED_STATUS_ARMED;
+
+	ret = awg_sched_start();
+	EXPECT_EQ(ret, 0);
+	/*
+	 * start() must issue RUN as a separate write after an ARM round-trip
+	 * (not ARM|RUN in one combined write).
+	 */
+	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_CTRL / 4U],
+		  (int)AWG_SCHED_CTRL_RUN);
+
+	/* Simulate completion and verify polled wait path. */
+	s_stub_regs[AWG_SCHED_REG_STATUS / 4U] = AWG_SCHED_STATUS_DONE;
+	ret = awg_sched_wait_done(1U, &st);
+	EXPECT_EQ(ret, 0);
+	EXPECT_EQ((int)st.done, 1);
+	EXPECT_EQ((int)st.error, 0);
 }
 
 /* -----------------------------------------------------------------------
@@ -502,6 +546,7 @@ test_tone_width();
 test_freq_width();
 test_scale_width();
 test_phase_width();
+test_fake_hw_progression();
 
 printf("\n%d passed, %d failed\n", s_pass, s_fail);
 return (s_fail > 0) ? EXIT_FAILURE : EXIT_SUCCESS;

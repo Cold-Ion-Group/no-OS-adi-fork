@@ -109,14 +109,6 @@ rules->phase_shift = 0U;
 rules->phase_mask = AWG_SCHED_PHASE_MASK_DEFAULT;
 }
 
-static bool awg_sched_check_field_width(uint32_t raw, uint32_t mask, uint8_t shift)
-{
-if (mask == 0U)
-return true;
-
-return ((raw >> shift) & ~mask) == 0U;
-}
-
 static int awg_sched_reg_write(uint32_t offset, uint32_t val)
 {
 if (!g_awg_sched.configured)
@@ -365,8 +357,12 @@ goto fail;
 }
 }
 
-for (i = 0U; i < count; i++) {
-const awg_event_v1_t *event = &events[i];
+	for (i = 0U; i < count; i++) {
+		const awg_event_v1_t *event = &events[i];
+		uint32_t tone_val = (event->payload.word0 >> active_rules.tone_shift) & 0xFFFFU;
+		uint32_t freq_val = (event->payload.word0 >> active_rules.freq_shift) & 0xFFFFU;
+		uint32_t scale_val = (event->payload.word1 >> active_rules.scale_shift) & 0xFFFFU;
+		uint32_t phase_val = (event->payload.word2 >> active_rules.phase_shift) & 0xFFFFU;
 
 if ((event->flags & ~active_rules.allowed_flags_mask) != 0U) {
 awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_RESERVED_FLAGS,
@@ -382,37 +378,33 @@ active_rules.channel_mask);
 goto fail;
 }
 
-if (!awg_sched_check_field_width(event->payload.word0, active_rules.tone_mask,
- active_rules.tone_shift)) {
-awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_TONE_WIDTH, i,
-event->payload.word0,
-active_rules.tone_mask);
-goto fail;
-}
+		if ((tone_val & ~active_rules.tone_mask) != 0U) {
+			awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_TONE_WIDTH, i,
+							tone_val,
+							active_rules.tone_mask);
+			goto fail;
+		}
 
-if (!awg_sched_check_field_width(event->payload.word0, active_rules.freq_mask,
- active_rules.freq_shift)) {
-awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_FREQ_WIDTH, i,
-event->payload.word0,
-active_rules.freq_mask);
-goto fail;
-}
+		if ((freq_val & ~active_rules.freq_mask) != 0U) {
+			awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_FREQ_WIDTH, i,
+							freq_val,
+							active_rules.freq_mask);
+			goto fail;
+		}
 
-if (!awg_sched_check_field_width(event->payload.word1, active_rules.scale_mask,
- active_rules.scale_shift)) {
-awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_SCALE_WIDTH, i,
-event->payload.word1,
-active_rules.scale_mask);
-goto fail;
-}
+		if ((scale_val & ~active_rules.scale_mask) != 0U) {
+			awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_SCALE_WIDTH, i,
+							scale_val,
+							active_rules.scale_mask);
+			goto fail;
+		}
 
-if (!awg_sched_check_field_width(event->payload.word2, active_rules.phase_mask,
- active_rules.phase_shift)) {
-awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_PHASE_WIDTH, i,
-event->payload.word2,
-active_rules.phase_mask);
-goto fail;
-}
+		if ((phase_val & ~active_rules.phase_mask) != 0U) {
+			awg_sched_validation_report_set(report, AWG_EVTVAL_ERR_PHASE_WIDTH, i,
+							phase_val,
+							active_rules.phase_mask);
+			goto fail;
+		}
 }
 
 if (count > 1U) {
@@ -594,14 +586,24 @@ return awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_ARM);
 
 int awg_sched_start(void)
 {
-int ret;
+	awg_sched_status_t status;
+	int ret;
 
-ret = awg_sched_arm();
-if (ret)
-return ret;
+	ret = awg_sched_arm();
+	if (ret)
+		return ret;
 
-return awg_sched_reg_write(AWG_SCHED_REG_CTRL,
-   AWG_SCHED_CTRL_ARM | AWG_SCHED_CTRL_RUN);
+	/*
+	 * Do not combine ARM and RUN in the same write: some HDL
+	 * implementations sample both edge requests in one sched_clk cycle and
+	 * can drop RUN while state is still IDLE.  Force a register round-trip
+	 * between requests, then issue RUN as a separate strobe.
+	 */
+	ret = awg_sched_get_status(&status);
+	if (ret)
+		return ret;
+
+	return awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_RUN);
 }
 
 int awg_sched_stop(void)

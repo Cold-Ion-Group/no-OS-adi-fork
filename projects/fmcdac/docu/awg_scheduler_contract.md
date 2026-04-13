@@ -56,6 +56,10 @@ as the HDL localparams.
 > **Note**: CTRL\[0\]=1 was previously mis-documented as soft-reset.  It is
 > `RUN`.  Soft-reset is on bit 3.  Using the wrong bit would fire a
 > `marker_commit` pulse on the scope pin instead of resetting state.
+>
+> Firmware emits ARM and RUN as **two separate AXI writes** (with a status
+> round-trip in between) to avoid a simultaneous-edge race in implementations
+> that sample both request toggles in the same scheduler clock cycle.
 
 ---
 

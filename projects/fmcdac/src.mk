@@ -26,6 +26,7 @@ SRCS += $(PLATFORM_DRIVERS)/xilinx_axi_io.c \
 
 INCS += $(PROJECT)/src/app/app_config.h \
         $(PROJECT)/src/app/awg_sched.h \
+        $(PROJECT)/src/app/awg_sched_regs.h \
         $(PROJECT)/src/app/parameters.h \
         $(DRIVERS)/axi_core/axi_dac_core/axi_dac_core.h \
         $(DRIVERS)/axi_core/axi_dmac/axi_dmac.h \

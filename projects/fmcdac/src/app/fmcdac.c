@@ -1993,15 +1993,20 @@ static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev)
 		return ret;
 	}
 
-	xil_printf("[%s] DONE armed=%u running=%u done=%u error=%u current=%lu loaded=%lu status=0x%08lX\n\r",
+	xil_printf("[%s] DONE armed=%u running=%u done=%u error=%u err_code=0x%02lX "
+		   "current=%lu loaded=%lu commit=%lu status=0x%08lX\n\r",
 		   tag,
 		   sched_status.armed ? 1U : 0U,
 		   sched_status.running ? 1U : 0U,
 		   sched_status.done ? 1U : 0U,
 		   sched_status.error ? 1U : 0U,
+		   (unsigned long)sched_status.err_code,
 		   (unsigned long)sched_status.current_event,
 		   (unsigned long)sched_status.loaded_events,
+		   (unsigned long)sched_status.commit_count,
 		   (unsigned long)sched_status.hw_status_word);
+
+	awg_sched_dump_artifacts(events, event_count, &sched_status);
 
 	return 0;
 }

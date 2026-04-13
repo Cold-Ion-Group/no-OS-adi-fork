@@ -1,27 +1,134 @@
-# AWG Scheduler Event Packing Contract (v1)
+# AWG Scheduler Contract (v2)
 
-This document is the software↔HDL contract for the AWG scheduler event memory/register format used by:
+This document is the software↔HDL contract for the AWG timed-control peripheral
+used by `projects/fmcdac/src/app/awg_sched.{h,c}`.
 
-- `projects/fmcdac/src/app/awg_sched.h`
-- `projects/fmcdac/src/app/awg_sched.c`
+All registers are 32-bit, little-endian at the CPU AXI4-Lite interface.
+All offsets are byte addresses relative to the peripheral base address.
 
-All words are 32-bit and little-endian at the CPU interface.
+The register constants live in `awg_sched_regs.h`.  When a register-generation
+toolflow is adopted that header must be regenerated from the same YAML source
+as the HDL localparams.
 
-## Event layout (6 words per event)
+---
 
-Per event index `i`, software writes `EVENT_ADDR = i`, then the following register words:
+## Register Map
 
-| Sequential word | Register | Bits | Field |
-|---|---|---|---|
-| word0 | `EVENT_TIME` | `[31:0]` | `timestamp_ticks` |
-| word1 | `EVENT_CH_FLAGS` | `[31:16]` | `channel` |
-|  |  | `[15:0]` | `flags` |
-| word2 | `EVENT_PAYLOAD0` | `[31:0]` | `payload.word0` |
-| word3 | `EVENT_PAYLOAD1` | `[31:0]` | `payload.word1` |
-| word4 | `EVENT_PAYLOAD2` | `[31:0]` | `payload.word2` |
-| word5 | `EVENT_PAYLOAD3` | `[31:0]` | `payload.word3` |
+| Offset | Name            | Access | Description                                |
+|--------|-----------------|--------|--------------------------------------------|
+| 0x00   | CTRL            | W      | Control strobe register                    |
+| 0x04   | STATUS          | R      | Status and error-code register             |
+| 0x08   | EVT_COUNT       | RW     | Number of loaded events                    |
+| 0x0C   | CUR_EVT         | R      | Index of currently executing event         |
+| 0x10   | ERR_REG         | R      | Latched hardware error code                |
+| 0x14   | IP_ID           | R      | IP magic word (0x41574753 = `'AWGS'`)      |
+| 0x18   | IP_VERSION      | R      | Major\[31:16\] / Minor\[15:0\]             |
+| 0x1C   | IP_CAPS         | R      | Capability word (see below)                |
+| 0x20   | TIME_LO         | R      | Tick counter \[31:0\] (latched on STATUS read)|
+| 0x24   | TIME_HI         | R      | Tick counter \[63:32\]                     |
+| 0x28   | LAST_EXEC_LO    | R      | Last-dispatched event tick \[31:0\]        |
+| 0x2C   | LAST_EXEC_HI    | R      | Last-dispatched event tick \[63:32\]       |
+| 0x30   | COMMIT_COUNT    | R      | Total events dispatched since reset        |
+| 0x34   | REINIT_COUNT    | R      | Sequence re-start count since reset        |
+| 0x38   | REINIT_REJECT   | R      | Re-init requests rejected (timing)         |
+| 0x3C   | IRQ_STATUS      | R/W1C  | Latched interrupt flags                    |
+| 0x40   | EVT_WADDR       | W      | Event BRAM write address                   |
+| 0x44   | EVT_WDATA0      | W      | Timestamp \[31:0\]                         |
+| 0x48   | EVT_WDATA1      | W      | Timestamp \[63:32\]                        |
+| 0x4C   | EVT_WDATA2      | W      | Channel\[31:16\] \| Flags\[15:0\]          |
+| 0x50   | EVT_WDATA3      | W      | Payload word 0                             |
+| 0x54   | EVT_WDATA4      | W      | Payload word 1                             |
+| 0x58   | EVT_WDATA5      | W      | Payload word 2                             |
+| 0x5C   | EVT_WDATA6      | W      | Payload word 3                             |
+| 0x60   | EVT_WCTRL       | W      | Write 1 to commit event data to BRAM       |
 
-## Payload v1 bit contract
+---
+
+## CTRL Register Bit Fields
+
+| Bit | Name         | Description                                         |
+|-----|--------------|-----------------------------------------------------|
+| 0   | RUN          | Assert to start sequence execution                  |
+| 1   | ARM          | Arm hardware trigger gate                           |
+| 2   | STOP_REQ     | Request graceful stop after current event           |
+| 3   | RESET_SOFT   | Pulse to clear state (does NOT fire commit pulse)   |
+
+> **Note**: CTRL\[0\]=1 was previously mis-documented as soft-reset.  It is
+> `RUN`.  Soft-reset is on bit 3.  Using the wrong bit would fire a
+> `marker_commit` pulse on the scope pin instead of resetting state.
+
+---
+
+## STATUS Register Bit Fields
+
+| Bits  | Name      | Description                                          |
+|-------|-----------|------------------------------------------------------|
+| 0     | armed     | Hardware trigger gate is armed                       |
+| 1     | running   | Sequence is currently executing                      |
+| 2     | done      | Sequence has completed                               |
+| 3     | error     | Hardware error latched; see ERR_REG                  |
+| 15:8  | err_code  | Latched error code (mirrors ERR_REG\[7:0\])          |
+
+---
+
+## IP_CAPS Register
+
+| Bits  | Field          | Description                                     |
+|-------|----------------|-------------------------------------------------|
+| 31:24 | evt_depth_log2 | `1 << field` gives maximum event BRAM depth     |
+| 23:16 | payload_bits   | Payload width in bits                           |
+| 15:8  | ts_bits        | Timestamp width in bits                         |
+| 7:0   | reserved       | Must be zero                                    |
+
+---
+
+## IRQ_STATUS Register Bit Fields
+
+| Bit | Name             | Description               |
+|-----|------------------|---------------------------|
+| 0   | done_irq         | Sequence-done interrupt   |
+| 1   | error_irq        | Error interrupt           |
+| 2   | spacing_viol_irq | Timing-violation interrupt|
+
+---
+
+## Event Format (v1, 256 bits = 32 bytes)
+
+Event struct `awg_event_v1_t`:
+
+| Byte offset | Field            | Type      | Description                  |
+|-------------|------------------|-----------|------------------------------|
+| 0           | timestamp_ticks  | uint64_t  | 64-bit tick timestamp        |
+| 8           | channel          | uint16_t  | Output channel selector      |
+| 10          | flags            | uint16_t  | Event-type flags             |
+| 12          | payload          | 4×uint32  | DDS control words (16 bytes) |
+| 28          | reserved         | uint32_t  | Must be zero                 |
+
+Compile-time ABI guards enforce these offsets and `sizeof(awg_event_v1_t)==32`.
+
+---
+
+## Event Write Sequence
+
+1. Write `EVT_WADDR = <index>`.
+2. Write `EVT_WDATA0..6` (order does not matter before the strobe).
+3. Write `EVT_WCTRL = 1` to commit.
+
+The 7-word mapping is:
+
+| Register  | Content                            |
+|-----------|------------------------------------|
+| EVT_WDATA0 | `timestamp_ticks[31:0]`           |
+| EVT_WDATA1 | `timestamp_ticks[63:32]`          |
+| EVT_WDATA2 | `channel[31:16] \| flags[15:0]`   |
+| EVT_WDATA3 | `payload.word0`                   |
+| EVT_WDATA4 | `payload.word1`                   |
+| EVT_WDATA5 | `payload.word2`                   |
+| EVT_WDATA6 | `payload.word3`                   |
+
+---
+
+## Payload v1 Bit Contract
 
 `payload.word0`:
 - `[15:0]`  `tone`
@@ -29,39 +136,74 @@ Per event index `i`, software writes `EVENT_ADDR = i`, then the following regist
 
 `payload.word1`:
 - `[15:0]`  `scale`
-- `[31:16]` `reserved0` (must be written as 0 unless reused by a newer contract)
+- `[31:16]` `reserved0` (must be zero unless reused by a newer contract)
 
 `payload.word2`:
 - `[15:0]`  `phase`
-- `[31:16]` `reserved1` (must be written as 0 unless reused by a newer contract)
+- `[31:16]` `reserved1` (must be zero unless reused by a newer contract)
 
 `payload.word3`:
 - `[31:0]`  `user_word3` (opaque extension word)
 
-## Compile-time ABI guards in code
+---
 
-The C header enforces the ABI with compile-time checks:
+## IP Identity Handshake
 
-- `_Static_assert(sizeof(awg_payload_v1_t) == 16)`
-- `_Static_assert(sizeof(awg_event_v1_t) == 24)`
-- `offsetof(...)` checks for word and field positions
+`awg_sched_config()` performs an IP identity check before issuing soft-reset:
 
-These checks intentionally fail the build if packing/alignment changes.
+1. Read `IP_ID`; fail with `-ENODEV` if `!= 0x41574753` (`'AWGS'`).
+2. Read `IP_VERSION`; fail with `-ENOTSUP` if major version does not match
+   `AWG_TIMED_CTRL_MAJOR_EXPECTED` (currently `1`).
+3. Read `IP_CAPS`; store `hw_event_depth`, `hw_payload_bits`, `hw_ts_bits`
+   for runtime capability queries.
 
-## Optional load readback verification
+This ensures firmware detects a mismatched or absent bitstream before
+touching any other register.
 
-`awg_sched_verify_events()` supports optional readback verification (enabled by default via
-`AWG_SCHED_ENABLE_LOAD_READBACK_VERIFY` in `awg_sched.c`).
+---
 
-After events are written, software can re-select each `EVENT_ADDR` and read back:
+## tick_hz
 
-- `EVENT_TIME`
-- `EVENT_CH_FLAGS`
-- `EVENT_PAYLOAD0..3`
+`awg_sched_cfg_t.tick_hz` is **informational only**.  The actual tick rate
+is a static HDL build parameter readable via `IP_CAPS`.  It is not written
+to any hardware register.
 
-Any mismatch returns an error early (`-EIO`) and prints a detailed expected-vs-actual line,
-which helps detect:
+---
 
-- software packing mistakes,
-- endianness or field-order mistakes,
-- scheduler BRAM addressing mismatches.
+## Optional Load Readback Verification
+
+Controlled by `AWG_SCHED_ENABLE_LOAD_READBACK_VERIFY` (default: 1).
+
+After writing all events, `awg_sched_load_events()` re-selects each
+`EVT_WADDR` and reads back `EVT_WDATA0..6`, comparing against the
+expected values.  Any mismatch returns `-EIO` and logs a detailed
+expected-vs-actual line to help diagnose packing or addressing bugs.
+
+---
+
+## Artifact Dump
+
+`awg_sched_dump_artifacts(events, count, status)` emits machine-parsable
+lines prefixed `[SCHED-ARTIFACT]` that can be grepped by a host-side parser:
+
+```
+[SCHED-ARTIFACT] config base=0x44AA0000 max_events=64 tick_hz=1000000 timeout_ms=2000
+[SCHED-ARTIFACT] event idx=0 ts=0x00000000_000003E8 ch=0 fl=0x0001 p0=0x00010000 p1=... p2=... p3=...
+[SCHED-ARTIFACT] status armed=1 running=0 done=1 error=0 err_code=0x00 current=4 loaded=4 commit=4 reinit=0 reinit_reject=0 irq=0x00000001
+[SCHED-ARTIFACT] time_now=0x00000000_00001388 last_exec=0x00000000_00000FA0
+```
+
+---
+
+## Host-Side Unit Tests
+
+`projects/fmcdac/tests/` contains a host-buildable test suite covering
+every `AWG_EVTVAL_ERR_*` path.  Build and run with:
+
+```sh
+make -C projects/fmcdac/tests run
+```
+
+The test binary links `awg_sched.c` against stub implementations of
+`no_os_axi_io_*` and `no_os_mdelay`.  IP identity registers are pre-populated
+in the stub register bank so `awg_sched_config()` succeeds without hardware.

@@ -44,12 +44,29 @@ typedef union {
 	};
 } awg_payload_v1_t;
 
-/* Event format version 1. */
+/*
+ * Event format version 1 (32 bytes = 256 bits):
+ *   [63:0]    timestamp_ticks  — 64-bit tick counter matching HDL time_reg
+ *   [79:64]   channel          — output channel selector
+ *   [95:80]   flags            — event-type flags
+ *   [223:96]  payload          — 4 × 32-bit DDS control words
+ *   [255:224] reserved         — must be zero; pads event to 256 bits
+ *
+ * The 7-word write sequence (EVT_WDATA0..6 + EVT_WCTRL) maps as:
+ *   WDATA0  timestamp[31:0]
+ *   WDATA1  timestamp[63:32]
+ *   WDATA2  channel[31:16] | flags[15:0]
+ *   WDATA3  payload.word0
+ *   WDATA4  payload.word1
+ *   WDATA5  payload.word2
+ *   WDATA6  payload.word3
+ */
 typedef struct AWG_SCHED_PACKED {
-	uint32_t timestamp_ticks;
+	uint64_t timestamp_ticks;
 	uint16_t channel;
 	uint16_t flags;
 	awg_payload_v1_t payload;
+	uint32_t reserved;
 } awg_event_v1_t;
 
 _Static_assert(sizeof(awg_payload_v1_t) == 16U, "awg_payload_v1_t size mismatch");
@@ -61,18 +78,30 @@ _Static_assert(offsetof(awg_payload_v1_t, tone) == 0U, "payload.tone offset mism
 _Static_assert(offsetof(awg_payload_v1_t, freq_lsb16) == 2U, "payload.freq_lsb16 offset mismatch");
 _Static_assert(offsetof(awg_payload_v1_t, scale) == 4U, "payload.scale offset mismatch");
 _Static_assert(offsetof(awg_payload_v1_t, phase) == 8U, "payload.phase offset mismatch");
-_Static_assert(sizeof(awg_event_v1_t) == 24U, "awg_event_v1_t size mismatch");
+_Static_assert(sizeof(awg_event_v1_t) == 32U, "awg_event_v1_t size mismatch");
 _Static_assert(offsetof(awg_event_v1_t, timestamp_ticks) == 0U, "event.timestamp offset mismatch");
-_Static_assert(offsetof(awg_event_v1_t, channel) == 4U, "event.channel offset mismatch");
-_Static_assert(offsetof(awg_event_v1_t, flags) == 6U, "event.flags offset mismatch");
-_Static_assert(offsetof(awg_event_v1_t, payload) == 8U, "event.payload offset mismatch");
+_Static_assert(offsetof(awg_event_v1_t, channel) == 8U, "event.channel offset mismatch");
+_Static_assert(offsetof(awg_event_v1_t, flags) == 10U, "event.flags offset mismatch");
+_Static_assert(offsetof(awg_event_v1_t, payload) == 12U, "event.payload offset mismatch");
+_Static_assert(offsetof(awg_event_v1_t, reserved) == 28U, "event.reserved offset mismatch");
 
-/* Static scheduler configuration. */
+/*
+ * Static scheduler configuration.
+ *
+ * tick_hz is informational only — the actual tick rate is a static HDL build
+ * parameter readable at runtime via IP_CAPS.  It is not written to any hardware
+ * register.
+ *
+ * log_fn, if non-NULL, is called instead of xil_printf for all diagnostic
+ * output.  This decouples the subsystem from the Xilinx BSP and makes the
+ * validation layer testable on the host without a hardware dependency.
+ */
 typedef struct {
 	uint32_t base_addr;
 	uint32_t max_events;
 	uint32_t tick_hz;
 	uint32_t done_timeout_ms;
+	void (*log_fn)(const char *fmt, ...);
 } awg_sched_cfg_t;
 
 /* Event validation mode for minimum timestamp delta handling. */
@@ -129,8 +158,15 @@ typedef struct {
 	bool running;
 	bool done;
 	bool error;
+	uint8_t err_code;
 	uint32_t loaded_events;
 	uint32_t current_event;
+	uint64_t time_now;
+	uint64_t last_exec;
+	uint32_t commit_count;
+	uint32_t reinit_count;
+	uint32_t reinit_reject_count;
+	uint32_t irq_status_latched;
 	uint32_t hw_status_word;
 } awg_sched_status_t;
 
@@ -147,6 +183,8 @@ int awg_sched_start(void);
 int awg_sched_stop(void);
 int awg_sched_get_status(awg_sched_status_t *status);
 int awg_sched_wait_done(uint32_t timeout_ms, awg_sched_status_t *final_status);
+void awg_sched_dump_artifacts(const awg_event_v1_t *events, uint32_t count,
+			      const awg_sched_status_t *status);
 
 #ifdef __cplusplus
 }

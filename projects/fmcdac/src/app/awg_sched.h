@@ -3,26 +3,69 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Payload format version 1, packed as four 32-bit words. */
-typedef struct {
-	uint32_t word0;
-	uint32_t word1;
-	uint32_t word2;
-	uint32_t word3;
+/* Compiler-portable packed annotation for scheduler ABI structs. */
+#if defined(__GNUC__) || defined(__clang__)
+#define AWG_SCHED_PACKED __attribute__((__packed__))
+#else
+#define AWG_SCHED_PACKED
+#endif
+
+/*
+ * Payload format version 1 (16 bytes, 4x32b BRAM words):
+ *   word0[15:0]   tone
+ *   word0[31:16]  freq_lsb16
+ *   word1[15:0]   scale
+ *   word1[31:16]  reserved0
+ *   word2[15:0]   phase
+ *   word2[31:16]  reserved1
+ *   word3[31:0]   user_word3
+ */
+typedef union {
+	struct AWG_SCHED_PACKED {
+		uint32_t word0;
+		uint32_t word1;
+		uint32_t word2;
+		uint32_t word3;
+	};
+	struct AWG_SCHED_PACKED {
+		uint16_t tone;
+		uint16_t freq_lsb16;
+		uint16_t scale;
+		uint16_t reserved0;
+		uint16_t phase;
+		uint16_t reserved1;
+		uint32_t user_word3;
+	};
 } awg_payload_v1_t;
 
 /* Event format version 1. */
-typedef struct {
+typedef struct AWG_SCHED_PACKED {
 	uint32_t timestamp_ticks;
 	uint16_t channel;
 	uint16_t flags;
 	awg_payload_v1_t payload;
 } awg_event_v1_t;
+
+_Static_assert(sizeof(awg_payload_v1_t) == 16U, "awg_payload_v1_t size mismatch");
+_Static_assert(offsetof(awg_payload_v1_t, word0) == 0U, "payload.word0 offset mismatch");
+_Static_assert(offsetof(awg_payload_v1_t, word1) == 4U, "payload.word1 offset mismatch");
+_Static_assert(offsetof(awg_payload_v1_t, word2) == 8U, "payload.word2 offset mismatch");
+_Static_assert(offsetof(awg_payload_v1_t, word3) == 12U, "payload.word3 offset mismatch");
+_Static_assert(offsetof(awg_payload_v1_t, tone) == 0U, "payload.tone offset mismatch");
+_Static_assert(offsetof(awg_payload_v1_t, freq_lsb16) == 2U, "payload.freq_lsb16 offset mismatch");
+_Static_assert(offsetof(awg_payload_v1_t, scale) == 4U, "payload.scale offset mismatch");
+_Static_assert(offsetof(awg_payload_v1_t, phase) == 8U, "payload.phase offset mismatch");
+_Static_assert(sizeof(awg_event_v1_t) == 24U, "awg_event_v1_t size mismatch");
+_Static_assert(offsetof(awg_event_v1_t, timestamp_ticks) == 0U, "event.timestamp offset mismatch");
+_Static_assert(offsetof(awg_event_v1_t, channel) == 4U, "event.channel offset mismatch");
+_Static_assert(offsetof(awg_event_v1_t, flags) == 6U, "event.flags offset mismatch");
+_Static_assert(offsetof(awg_event_v1_t, payload) == 8U, "event.payload offset mismatch");
 
 /* Static scheduler configuration. */
 typedef struct {

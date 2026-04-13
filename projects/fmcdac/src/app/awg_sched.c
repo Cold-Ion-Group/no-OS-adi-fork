@@ -47,6 +47,9 @@ static struct {
 #define AWG_SCHED_FREQ_MASK_DEFAULT       0x0000FFFFU
 #define AWG_SCHED_SCALE_MASK_DEFAULT      0x0000FFFFU
 #define AWG_SCHED_PHASE_MASK_DEFAULT      0x0000FFFFU
+#ifndef AWG_SCHED_ENABLE_LOAD_READBACK_VERIFY
+#define AWG_SCHED_ENABLE_LOAD_READBACK_VERIFY 1
+#endif
 
 static const char *awg_sched_validation_reason(awg_evtval_err_t code)
 {
@@ -141,6 +144,81 @@ static int awg_sched_reg_read(uint32_t offset, uint32_t *val)
 	return no_os_axi_io_read(g_awg_sched.cfg.base_addr, offset, val);
 }
 
+static uint32_t awg_sched_pack_ch_flags(const awg_event_v1_t *event)
+{
+	return (((uint32_t)event->channel) << 16) | (uint32_t)event->flags;
+}
+
+static int awg_sched_verify_loaded_events_readback(const awg_event_v1_t *events, uint32_t count)
+{
+	uint32_t i;
+	uint32_t time_rb;
+	uint32_t ch_flags_rb;
+	uint32_t payload0_rb;
+	uint32_t payload1_rb;
+	uint32_t payload2_rb;
+	uint32_t payload3_rb;
+	int ret;
+
+	if (count == 0U)
+		return 0;
+
+	for (i = 0U; i < count; i++) {
+		const awg_event_v1_t *event = &events[i];
+		uint32_t expected_ch_flags = awg_sched_pack_ch_flags(event);
+
+		ret = awg_sched_reg_write(AWG_SCHED_REG_EVENT_ADDR, i);
+		if (ret)
+			return ret;
+
+		ret = awg_sched_reg_read(AWG_SCHED_REG_EVENT_TIME, &time_rb);
+		if (ret)
+			return ret;
+		ret = awg_sched_reg_read(AWG_SCHED_REG_EVENT_CH_FLAGS, &ch_flags_rb);
+		if (ret)
+			return ret;
+		ret = awg_sched_reg_read(AWG_SCHED_REG_EVENT_PAYLOAD0, &payload0_rb);
+		if (ret)
+			return ret;
+		ret = awg_sched_reg_read(AWG_SCHED_REG_EVENT_PAYLOAD1, &payload1_rb);
+		if (ret)
+			return ret;
+		ret = awg_sched_reg_read(AWG_SCHED_REG_EVENT_PAYLOAD2, &payload2_rb);
+		if (ret)
+			return ret;
+		ret = awg_sched_reg_read(AWG_SCHED_REG_EVENT_PAYLOAD3, &payload3_rb);
+		if (ret)
+			return ret;
+
+		if ((time_rb != event->timestamp_ticks) ||
+		    (ch_flags_rb != expected_ch_flags) ||
+		    (payload0_rb != event->payload.word0) ||
+		    (payload1_rb != event->payload.word1) ||
+		    (payload2_rb != event->payload.word2) ||
+		    (payload3_rb != event->payload.word3)) {
+			xil_printf("[AWG-SCHED] readback mismatch idx=%lu "
+				   "exp:{t=0x%08lX cf=0x%08lX p0=0x%08lX p1=0x%08lX p2=0x%08lX p3=0x%08lX} "
+				   "got:{t=0x%08lX cf=0x%08lX p0=0x%08lX p1=0x%08lX p2=0x%08lX p3=0x%08lX}\n\r",
+				   (unsigned long)i,
+				   (unsigned long)event->timestamp_ticks,
+				   (unsigned long)expected_ch_flags,
+				   (unsigned long)event->payload.word0,
+				   (unsigned long)event->payload.word1,
+				   (unsigned long)event->payload.word2,
+				   (unsigned long)event->payload.word3,
+				   (unsigned long)time_rb,
+				   (unsigned long)ch_flags_rb,
+				   (unsigned long)payload0_rb,
+				   (unsigned long)payload1_rb,
+				   (unsigned long)payload2_rb,
+				   (unsigned long)payload3_rb);
+			return -EIO;
+		}
+	}
+
+	return 0;
+}
+
 int awg_sched_reset(void)
 {
 	int ret;
@@ -180,6 +258,14 @@ int awg_sched_verify_events(const awg_event_v1_t *events, uint32_t count)
 	ret = awg_sched_validate_events(events, count, NULL, &report);
 	if (ret != 0)
 		return ret;
+
+#if AWG_SCHED_ENABLE_LOAD_READBACK_VERIFY
+	if (g_awg_sched.loaded_events == count) {
+		ret = awg_sched_verify_loaded_events_readback(events, count);
+		if (ret != 0)
+			return ret;
+	}
+#endif
 
 	g_awg_sched.events_validated = true;
 	return 0;
@@ -324,7 +410,6 @@ fail:
 static int awg_sched_write_event(uint32_t idx, const awg_event_v1_t *event)
 {
 	int ret;
-	uint32_t ch_flags;
 
 	ret = awg_sched_reg_write(AWG_SCHED_REG_EVENT_ADDR, idx);
 	if (ret)
@@ -334,8 +419,7 @@ static int awg_sched_write_event(uint32_t idx, const awg_event_v1_t *event)
 	if (ret)
 		return ret;
 
-	ch_flags = (((uint32_t)event->channel) << 16) | (uint32_t)event->flags;
-	ret = awg_sched_reg_write(AWG_SCHED_REG_EVENT_CH_FLAGS, ch_flags);
+	ret = awg_sched_reg_write(AWG_SCHED_REG_EVENT_CH_FLAGS, awg_sched_pack_ch_flags(event));
 	if (ret)
 		return ret;
 
@@ -389,6 +473,15 @@ int awg_sched_load_events(const awg_event_v1_t *events, uint32_t count)
 	}
 
 	g_awg_sched.loaded_events = count;
+
+#if AWG_SCHED_ENABLE_LOAD_READBACK_VERIFY
+	ret = awg_sched_verify_loaded_events_readback(events, count);
+	if (ret) {
+		g_awg_sched.events_validated = false;
+		return ret;
+	}
+#endif
+
 	return 0;
 }
 

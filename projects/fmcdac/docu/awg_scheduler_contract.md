@@ -32,6 +32,7 @@ as the HDL localparams.
 | 0x34   | REINIT_COUNT    | R      | Sequence re-start count since reset        |
 | 0x38   | REINIT_REJECT   | R      | Re-init requests rejected (timing)         |
 | 0x3C   | IRQ_STATUS      | R/W1C  | Latched interrupt flags                    |
+| 0x74   | IRQ_ENABLE      | RW     | Interrupt enable mask (bit0=done, bit1=error) |
 | 0x40   | EVT_WADDR       | W      | Event BRAM write address                   |
 | 0x44   | EVT_WDATA0      | W      | Timestamp \[31:0\]                         |
 | 0x48   | EVT_WDATA1      | W      | Timestamp \[63:32\]                        |
@@ -41,6 +42,9 @@ as the HDL localparams.
 | 0x58   | EVT_WDATA5      | W      | Payload word 2                             |
 | 0x5C   | EVT_WDATA6      | W      | Payload word 3                             |
 | 0x60   | EVT_WCTRL       | W      | Write 1 to commit event data to BRAM       |
+| 0x78   | TIME_RELOAD_LO  | W      | Epoch reload value low word                |
+| 0x7C   | TIME_RELOAD_HI  | W      | Epoch reload value high word               |
+| 0x80   | TIME_RELOAD_CTRL| W      | Write 1 to reload on next SYSREF           |
 
 ---
 

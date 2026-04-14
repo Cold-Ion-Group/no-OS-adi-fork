@@ -9,7 +9,8 @@ CC      := gcc
 CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic \
            -I../src/app \
            -I. \
-           -DAWG_SCHED_ENABLE_LOAD_READBACK_VERIFY=0
+           -DAWG_SCHED_ENABLE_LOAD_READBACK_VERIFY=0 \
+           -DFMCDAC_AWG_SCHED_USE_IRQ=1
 
 SRC_DIR := ../src/app
 TEST_BIN := awg_sched_validate_test

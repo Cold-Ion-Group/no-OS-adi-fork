@@ -76,6 +76,8 @@
 #define AWG_SCHED_REG_REINIT_COUNT      0x0034U
 /** REINIT_REJECT — count of re-init requests rejected (timing violation) (R) */
 #define AWG_SCHED_REG_REINIT_REJECT     0x0038U
+/** IRQ_ENABLE — interrupt enable mask (RW) */
+#define AWG_SCHED_REG_IRQ_ENABLE        0x0074U
 /**
  * IRQ_STATUS — latched interrupt flags (R/W1C):
  *   [0]  done interrupt
@@ -120,6 +122,13 @@
 #define AWG_SCHED_REG_EVT_WDATA6        0x005CU
 /** EVT_WCTRL — write 1 to commit event data to BRAM (W, self-clearing) */
 #define AWG_SCHED_REG_EVT_WCTRL         0x0060U
+
+/** TIME_RELOAD_LO — next SYSREF epoch reload low word (W) */
+#define AWG_SCHED_REG_TIME_RELOAD_LO    0x0078U
+/** TIME_RELOAD_HI — next SYSREF epoch reload high word (W) */
+#define AWG_SCHED_REG_TIME_RELOAD_HI    0x007CU
+/** TIME_RELOAD_CTRL — write 1 to reload TIME_NOW on next SYSREF (W) */
+#define AWG_SCHED_REG_TIME_RELOAD_CTRL  0x0080U
 
 /* -----------------------------------------------------------------------
  * CTRL register bit fields

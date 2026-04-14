@@ -1942,7 +1942,7 @@ static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev)
 	memset(events, 0, sizeof(events));
 	events[0].timestamp_ticks = 1000U;
 	events[0].channel = 0U;
-	events[0].flags = 0x0001U;
+	events[0].flags = AWG_SCHED_FLAG_PHASE_REINIT;
 	events[0].payload.tone = events[0].channel;
 	events[0].payload.freq_lsb16 = 0x1000U;
 	events[0].payload.scale = 0x7FFFU;
@@ -1950,7 +1950,7 @@ static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev)
 
 	events[1].timestamp_ticks = 2000U;
 	events[1].channel = 0U;
-	events[1].flags = 0x0001U;
+	events[1].flags = AWG_SCHED_FLAG_PHASE_REINIT;
 	events[1].payload.tone = events[1].channel;
 	events[1].payload.freq_lsb16 = 0x2000U;
 	events[1].payload.scale = 0x7FFFU;
@@ -1958,7 +1958,7 @@ static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev)
 
 	events[2].timestamp_ticks = 3000U;
 	events[2].channel = 1U;
-	events[2].flags = 0x0001U;
+	events[2].flags = AWG_SCHED_FLAG_PHASE_REINIT;
 	events[2].payload.tone = events[2].channel;
 	events[2].payload.freq_lsb16 = 0x3000U;
 	events[2].payload.scale = 0x6FFFU;
@@ -1966,7 +1966,7 @@ static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev)
 
 	events[3].timestamp_ticks = 4000U;
 	events[3].channel = 1U;
-	events[3].flags = 0x0001U;
+	events[3].flags = AWG_SCHED_FLAG_PHASE_REINIT;
 	events[3].payload.tone = events[3].channel;
 	events[3].payload.freq_lsb16 = 0x4000U;
 	events[3].payload.scale = 0x6FFFU;

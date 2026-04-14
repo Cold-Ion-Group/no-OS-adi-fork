@@ -85,6 +85,9 @@ _Static_assert(offsetof(awg_event_v1_t, flags) == 10U, "event.flags offset misma
 _Static_assert(offsetof(awg_event_v1_t, payload) == 12U, "event.payload offset mismatch");
 _Static_assert(offsetof(awg_event_v1_t, reserved) == 28U, "event.reserved offset mismatch");
 
+/* Event flag bit definitions. */
+#define AWG_SCHED_FLAG_PHASE_REINIT 0x0001U
+
 /*
  * Static scheduler configuration.
  *

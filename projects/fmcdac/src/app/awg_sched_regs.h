@@ -16,6 +16,7 @@
  *   0x20–0x2C  Time snapshot (read-only)
  *   0x30–0x3C  Counters / IRQ (read-only)
  *   0x40–0x60  Event write window (write-only during load)
+ *   0x64–0x74  IRQ enable + SYSREF epoch reload controls
  */
 
 #ifndef AWG_SCHED_REGS_H
@@ -125,13 +126,15 @@
 #define AWG_SCHED_REG_EVT_WCTRL         0x0060U
 
 /** IRQ_ENABLE — interrupt enable mask (RW) */
-#define AWG_SCHED_REG_IRQ_ENABLE        0x0074U
+#define AWG_SCHED_REG_IRQ_ENABLE        0x0064U
+/** IP_SCRATCH — firmware/software scratch register (RW) */
+#define AWG_SCHED_REG_IP_SCRATCH        0x0068U
 /** TIME_RELOAD_LO — next SYSREF epoch reload low word (W) */
-#define AWG_SCHED_REG_TIME_RELOAD_LO    0x0078U
+#define AWG_SCHED_REG_TIME_RELOAD_LO    0x006CU
 /** TIME_RELOAD_HI — next SYSREF epoch reload high word (W) */
-#define AWG_SCHED_REG_TIME_RELOAD_HI    0x007CU
+#define AWG_SCHED_REG_TIME_RELOAD_HI    0x0070U
 /** TIME_RELOAD_CTRL — write 1 to reload TIME_NOW on next SYSREF (W) */
-#define AWG_SCHED_REG_TIME_RELOAD_CTRL  0x0080U
+#define AWG_SCHED_REG_TIME_RELOAD_CTRL  0x0074U
 
 /* -----------------------------------------------------------------------
  * CTRL register bit fields

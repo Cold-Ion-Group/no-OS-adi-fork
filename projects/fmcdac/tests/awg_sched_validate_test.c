@@ -33,6 +33,7 @@
 #define TEST_EVENT_FLAG AWG_SCHED_FLAG_PHASE_REINIT
 static uint32_t s_stub_regs[STUB_REG_WORDS];
 static int s_irq_wait_simulate_done;
+static int s_epoch_reload_simulate_done;
 
 int no_os_axi_io_write(uint32_t base, uint32_t offset, uint32_t val)
 {
@@ -59,6 +60,11 @@ return -1;
 void no_os_mdelay(uint32_t ms)
 {
 (void)ms;
+
+if (s_epoch_reload_simulate_done) {
+s_stub_regs[AWG_SCHED_REG_TIME_LO / 4U] = 0U;
+s_epoch_reload_simulate_done = 0;
+}
 }
 
 void awg_sched_irq_wait_hook(uint32_t wait_ms_left)
@@ -117,6 +123,7 @@ awg_sched_cfg_t cfg;
 
 memset(s_stub_regs, 0, sizeof(s_stub_regs));
 s_irq_wait_simulate_done = 0;
+s_epoch_reload_simulate_done = 0;
 
 /* IP identity registers (byte offsets / 4 = word index). */
 s_stub_regs[AWG_SCHED_REG_IP_ID      / 4U] = AWG_TIMED_CTRL_IP_ID;
@@ -161,6 +168,17 @@ do { \
 if ((a) == (b)) { \
 printf("  FAIL %s:%d: expected value != %d\n", \
        __FILE__, __LINE__, (int)(b)); \
+s_fail++; \
+} else { \
+s_pass++; \
+} \
+} while (0)
+
+#define EXPECT_TRUE(cond) \
+do { \
+if (!(cond)) { \
+printf("  FAIL %s:%d: expected true: %s\n", \
+       __FILE__, __LINE__, #cond); \
 s_fail++; \
 } else { \
 s_pass++; \
@@ -389,6 +407,49 @@ static void test_reinit_spacing(void)
 	EXPECT_EQ((int)r.code, (int)AWG_EVTVAL_ERR_REINIT_SPACING);
 }
 
+static void test_reinit_spacing_ok(void)
+{
+	awg_sched_validation_report_t r;
+	awg_event_v1_t ev[2];
+	awg_sched_validation_rules_t rules;
+	int ret;
+
+	test_begin("AWG_EVTVAL_REINIT_SPACING: pass case");
+	EXPECT_EQ(stub_config(64), 0);
+	memset(ev, 0, sizeof(ev));
+	ev[0].timestamp_ticks = 1000U;
+	ev[0].channel = 0U;
+	ev[0].flags = TEST_EVENT_FLAG;
+	ev[1].timestamp_ticks = 1016U;
+	ev[1].channel = 0U;
+	ev[1].flags = TEST_EVENT_FLAG;
+
+	awg_sched_validation_rules_default(&rules);
+	rules.min_reinit_delta_ticks = 8U;
+
+	ret = awg_sched_validate_events(ev, 2, &rules, &r);
+	EXPECT_EQ(ret, 0);
+	EXPECT_EQ((int)r.code, (int)AWG_EVTVAL_OK);
+}
+
+static void test_set_epoch(void)
+{
+	int ret;
+
+	test_begin("set_epoch writes reload registers");
+	EXPECT_EQ(stub_config(64), 0);
+
+	s_stub_regs[AWG_SCHED_REG_TIME_LO / 4U] = 100U;
+	s_epoch_reload_simulate_done = 1;
+
+	ret = awg_sched_set_epoch();
+	EXPECT_EQ(ret, 0);
+	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_TIME_RELOAD_LO / 4U], 0);
+	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_TIME_RELOAD_HI / 4U], 0);
+	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_TIME_RELOAD_CTRL / 4U], 1);
+	EXPECT_TRUE(strstr(s_log_buf, "[SCHED-ARTIFACT] set_epoch") != NULL);
+}
+
 static void test_reserved_flags(void)
 {
 awg_sched_validation_report_t r;
@@ -615,12 +676,14 @@ test_ts_not_monotonic();
 test_ts_delta_too_small();
 test_delta_allow_zero_same_channel();
 test_reinit_spacing();
+test_reinit_spacing_ok();
 test_reserved_flags();
 test_channel_width();
 test_tone_width();
 test_freq_width();
 test_scale_width();
 test_phase_width();
+test_set_epoch();
 test_fake_hw_progression();
 test_irq_wait_done();
 

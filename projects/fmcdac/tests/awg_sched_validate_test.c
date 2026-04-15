@@ -29,7 +29,11 @@
  * --------------------------------------------------------------------- */
 
 #define STUB_REG_WORDS 256U
+#define TEST_IRQ_DONE_AND_ERROR_MASK (AWG_SCHED_IRQ_DONE_BIT | AWG_SCHED_IRQ_ERROR_BIT)
+#define TEST_EVENT_FLAG AWG_SCHED_FLAG_PHASE_REINIT
 static uint32_t s_stub_regs[STUB_REG_WORDS];
+static int s_irq_wait_simulate_done;
+static int s_epoch_reload_simulate_done;
 
 int no_os_axi_io_write(uint32_t base, uint32_t offset, uint32_t val)
 {
@@ -56,6 +60,24 @@ return -1;
 void no_os_mdelay(uint32_t ms)
 {
 (void)ms;
+
+if (s_epoch_reload_simulate_done) {
+s_stub_regs[AWG_SCHED_REG_TIME_LO / 4U] = 0U;
+s_epoch_reload_simulate_done = 0;
+}
+}
+
+void awg_sched_irq_wait_hook(uint32_t wait_ms_left)
+{
+	(void)wait_ms_left;
+
+	if (!s_irq_wait_simulate_done)
+		return;
+
+	s_stub_regs[AWG_SCHED_REG_STATUS / 4U] = AWG_SCHED_STATUS_DONE;
+	s_stub_regs[AWG_SCHED_REG_IRQ_STATUS / 4U] = TEST_IRQ_DONE_AND_ERROR_MASK;
+	awg_sched_irq_signal();
+	s_irq_wait_simulate_done = 0;
 }
 
 /* -----------------------------------------------------------------------
@@ -100,6 +122,8 @@ static int stub_config(uint32_t max_events)
 awg_sched_cfg_t cfg;
 
 memset(s_stub_regs, 0, sizeof(s_stub_regs));
+s_irq_wait_simulate_done = 0;
+s_epoch_reload_simulate_done = 0;
 
 /* IP identity registers (byte offsets / 4 = word index). */
 s_stub_regs[AWG_SCHED_REG_IP_ID      / 4U] = AWG_TIMED_CTRL_IP_ID;
@@ -144,6 +168,17 @@ do { \
 if ((a) == (b)) { \
 printf("  FAIL %s:%d: expected value != %d\n", \
        __FILE__, __LINE__, (int)(b)); \
+s_fail++; \
+} else { \
+s_pass++; \
+} \
+} while (0)
+
+#define EXPECT_TRUE(cond) \
+do { \
+if (!(cond)) { \
+printf("  FAIL %s:%d: expected true: %s\n", \
+       __FILE__, __LINE__, #cond); \
 s_fail++; \
 } else { \
 s_pass++; \
@@ -220,7 +255,7 @@ EXPECT_EQ(stub_config(64), 0);
 memset(&ev, 0, sizeof(ev));
 ev.timestamp_ticks = 1000U;
 ev.channel = 0U;
-ev.flags   = 0x0001U;
+ev.flags = TEST_EVENT_FLAG;
 ret = awg_sched_validate_events(&ev, 1, NULL, &r);
 EXPECT_EQ(ret, 0);
 EXPECT_EQ((int)r.code, (int)AWG_EVTVAL_OK);
@@ -273,11 +308,11 @@ int ret;
 test_begin("AWG_EVTVAL_ERR_TOO_MANY_EVENTS");
 EXPECT_EQ(stub_config(4), 0);
 memset(ev, 0, sizeof(ev));
-ev[0].timestamp_ticks = 100U;  ev[0].flags = 0x0001U;
-ev[1].timestamp_ticks = 200U;  ev[1].flags = 0x0001U;
-ev[2].timestamp_ticks = 300U;  ev[2].flags = 0x0001U;
-ev[3].timestamp_ticks = 400U;  ev[3].flags = 0x0001U;
-ev[4].timestamp_ticks = 500U;  ev[4].flags = 0x0001U;
+ev[0].timestamp_ticks = 100U;  ev[0].flags = TEST_EVENT_FLAG;
+ev[1].timestamp_ticks = 200U;  ev[1].flags = TEST_EVENT_FLAG;
+ev[2].timestamp_ticks = 300U;  ev[2].flags = TEST_EVENT_FLAG;
+ev[3].timestamp_ticks = 400U;  ev[3].flags = TEST_EVENT_FLAG;
+ev[4].timestamp_ticks = 500U;  ev[4].flags = TEST_EVENT_FLAG;
 ret = awg_sched_validate_events(ev, 5, NULL, &r);
 EXPECT_NE(ret, 0);
 EXPECT_EQ((int)r.code, (int)AWG_EVTVAL_ERR_TOO_MANY_EVENTS);
@@ -292,9 +327,9 @@ int ret;
 test_begin("AWG_EVTVAL_ERR_TS_NOT_MONOTONIC");
 EXPECT_EQ(stub_config(64), 0);
 memset(ev, 0, sizeof(ev));
-ev[0].timestamp_ticks = 1000U;  ev[0].flags = 0x0001U;
-ev[1].timestamp_ticks = 2000U;  ev[1].flags = 0x0001U;
-ev[2].timestamp_ticks = 500U;   ev[2].flags = 0x0001U;  /* backward */
+ev[0].timestamp_ticks = 1000U;  ev[0].flags = TEST_EVENT_FLAG;
+ev[1].timestamp_ticks = 2000U;  ev[1].flags = TEST_EVENT_FLAG;
+ev[2].timestamp_ticks = 500U;   ev[2].flags = TEST_EVENT_FLAG;  /* backward */
 ret = awg_sched_validate_events(ev, 3, NULL, &r);
 EXPECT_NE(ret, 0);
 EXPECT_EQ((int)r.code, (int)AWG_EVTVAL_ERR_TS_NOT_MONOTONIC);
@@ -311,12 +346,13 @@ int ret;
 test_begin("AWG_EVTVAL_ERR_TS_DELTA_TOO_SMALL");
 EXPECT_EQ(stub_config(64), 0);
 memset(ev, 0, sizeof(ev));
-ev[0].timestamp_ticks = 1000U;  ev[0].flags = 0x0001U;
-ev[1].timestamp_ticks = 1000U;  ev[1].flags = 0x0001U;  /* delta = 0 */
+ev[0].timestamp_ticks = 1000U;  ev[0].flags = TEST_EVENT_FLAG;
+ev[1].timestamp_ticks = 1000U;  ev[1].flags = TEST_EVENT_FLAG;  /* delta = 0 */
 
 awg_sched_validation_rules_default(&rules);
 rules.min_delta_ticks = 1U;
 rules.delta_mode = AWG_SCHED_DELTA_MODE_STRICT;
+rules.min_reinit_delta_ticks = 0U;
 
 ret = awg_sched_validate_events(ev, 2, &rules, &r);
 EXPECT_NE(ret, 0);
@@ -333,16 +369,85 @@ int ret;
 test_begin("DELTA_MODE_ALLOW_ZERO_ON_SAME_CHANNEL: passes");
 EXPECT_EQ(stub_config(64), 0);
 memset(ev, 0, sizeof(ev));
-ev[0].timestamp_ticks = 1000U;  ev[0].channel = 0U;  ev[0].flags = 0x0001U;
-ev[1].timestamp_ticks = 1000U;  ev[1].channel = 0U;  ev[1].flags = 0x0001U;
+ev[0].timestamp_ticks = 1000U;  ev[0].channel = 0U;  ev[0].flags = TEST_EVENT_FLAG;
+ev[1].timestamp_ticks = 1000U;  ev[1].channel = 0U;  ev[1].flags = TEST_EVENT_FLAG;
 
 awg_sched_validation_rules_default(&rules);
 rules.min_delta_ticks = 1U;
 rules.delta_mode = AWG_SCHED_DELTA_MODE_ALLOW_ZERO_ON_SAME_CHANNEL;
+rules.min_reinit_delta_ticks = 0U;
 
 ret = awg_sched_validate_events(ev, 2, &rules, &r);
 EXPECT_EQ(ret, 0);
 EXPECT_EQ((int)r.code, (int)AWG_EVTVAL_OK);
+}
+
+static void test_reinit_spacing(void)
+{
+	awg_sched_validation_report_t r;
+	awg_event_v1_t ev[2];
+	awg_sched_validation_rules_t rules;
+	int ret;
+
+	test_begin("AWG_EVTVAL_ERR_REINIT_SPACING");
+	EXPECT_EQ(stub_config(64), 0);
+	memset(ev, 0, sizeof(ev));
+	ev[0].timestamp_ticks = 1000U;
+	ev[0].channel = 0U;
+	ev[0].flags = TEST_EVENT_FLAG;
+	ev[1].timestamp_ticks = 1004U;
+	ev[1].channel = 0U;
+	ev[1].flags = TEST_EVENT_FLAG;
+
+	awg_sched_validation_rules_default(&rules);
+	rules.min_reinit_delta_ticks = 8U;
+
+	ret = awg_sched_validate_events(ev, 2, &rules, &r);
+	EXPECT_NE(ret, 0);
+	EXPECT_EQ((int)r.code, (int)AWG_EVTVAL_ERR_REINIT_SPACING);
+}
+
+static void test_reinit_spacing_ok(void)
+{
+	awg_sched_validation_report_t r;
+	awg_event_v1_t ev[2];
+	awg_sched_validation_rules_t rules;
+	int ret;
+
+	test_begin("AWG_EVTVAL_REINIT_SPACING: pass case");
+	EXPECT_EQ(stub_config(64), 0);
+	memset(ev, 0, sizeof(ev));
+	ev[0].timestamp_ticks = 1000U;
+	ev[0].channel = 0U;
+	ev[0].flags = TEST_EVENT_FLAG;
+	ev[1].timestamp_ticks = 1016U;
+	ev[1].channel = 0U;
+	ev[1].flags = TEST_EVENT_FLAG;
+
+	awg_sched_validation_rules_default(&rules);
+	rules.min_reinit_delta_ticks = 8U;
+
+	ret = awg_sched_validate_events(ev, 2, &rules, &r);
+	EXPECT_EQ(ret, 0);
+	EXPECT_EQ((int)r.code, (int)AWG_EVTVAL_OK);
+}
+
+static void test_set_epoch(void)
+{
+	int ret;
+
+	test_begin("set_epoch writes reload registers");
+	EXPECT_EQ(stub_config(64), 0);
+
+	s_stub_regs[AWG_SCHED_REG_TIME_LO / 4U] = 100U;
+	s_epoch_reload_simulate_done = 1;
+
+	ret = awg_sched_set_epoch();
+	EXPECT_EQ(ret, 0);
+	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_TIME_RELOAD_LO / 4U], 0);
+	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_TIME_RELOAD_HI / 4U], 0);
+	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_TIME_RELOAD_CTRL / 4U], 1);
+	EXPECT_TRUE(strstr(s_log_buf, "[SCHED-ARTIFACT] set_epoch") != NULL);
 }
 
 static void test_reserved_flags(void)
@@ -371,7 +476,7 @@ test_begin("AWG_EVTVAL_ERR_CHANNEL_WIDTH");
 EXPECT_EQ(stub_config(64), 0);
 memset(&ev, 0, sizeof(ev));
 ev.timestamp_ticks = 1000U;
-ev.flags    = 0x0001U;
+ev.flags = TEST_EVENT_FLAG;
 ev.channel  = 0x0002U;  /* default channel_mask=0x0001 → bit1 illegal */
 ret = awg_sched_validate_events(&ev, 1, NULL, &r);
 EXPECT_NE(ret, 0);
@@ -389,7 +494,7 @@ test_begin("AWG_EVTVAL_ERR_TONE_WIDTH");
 EXPECT_EQ(stub_config(64), 0);
 memset(&ev, 0, sizeof(ev));
 ev.timestamp_ticks = 1000U;
-ev.flags = 0x0001U;
+ev.flags = TEST_EVENT_FLAG;
 /* tone occupies word0[1:0] (mask=0x3, shift=0); set bit2 */
 ev.payload.word0 = 0x00000004U;
 
@@ -412,7 +517,7 @@ test_begin("AWG_EVTVAL_ERR_FREQ_WIDTH");
 EXPECT_EQ(stub_config(64), 0);
 memset(&ev, 0, sizeof(ev));
 ev.timestamp_ticks = 1000U;
-ev.flags = 0x0001U;
+ev.flags = TEST_EVENT_FLAG;
 /*
  * Use an 8-bit freq_mask so we can actually exceed it.  freq occupies
  * word0[31:16]; with freq_mask=0x00FF, freq_shift=16, a value of 0x0100
@@ -441,7 +546,7 @@ test_begin("AWG_EVTVAL_ERR_SCALE_WIDTH");
 EXPECT_EQ(stub_config(64), 0);
 memset(&ev, 0, sizeof(ev));
 ev.timestamp_ticks = 1000U;
-ev.flags = 0x0001U;
+ev.flags = TEST_EVENT_FLAG;
 /* scale occupies word1[15:0]; use a narrow mask and exceed it. */
 ev.payload.word1 = 0x00000100U;
 
@@ -466,7 +571,7 @@ test_begin("AWG_EVTVAL_ERR_PHASE_WIDTH");
 EXPECT_EQ(stub_config(64), 0);
 memset(&ev, 0, sizeof(ev));
 ev.timestamp_ticks = 1000U;
-ev.flags = 0x0001U;
+ev.flags = TEST_EVENT_FLAG;
 /* phase occupies word2[15:0]; use a narrow mask and exceed it. */
 ev.payload.word2 = 0x00000100U;
 
@@ -492,7 +597,7 @@ static void test_fake_hw_progression(void)
 
 	memset(&ev, 0, sizeof(ev));
 	ev.timestamp_ticks = 1000U;
-	ev.flags = 0x0001U;
+	ev.flags = TEST_EVENT_FLAG;
 	ev.payload.word0 = 0x00010000U;
 
 	ret = awg_sched_load_events(&ev, 1U);
@@ -516,11 +621,41 @@ static void test_fake_hw_progression(void)
 		  (int)AWG_SCHED_CTRL_RUN);
 
 	/* Simulate completion and verify polled wait path. */
-	s_stub_regs[AWG_SCHED_REG_STATUS / 4U] = AWG_SCHED_STATUS_DONE;
+	s_irq_wait_simulate_done = 1;
 	ret = awg_sched_wait_done(1U, &st);
 	EXPECT_EQ(ret, 0);
 	EXPECT_EQ((int)st.done, 1);
 	EXPECT_EQ((int)st.error, 0);
+}
+
+static void test_irq_wait_done(void)
+{
+	awg_event_v1_t ev;
+	awg_sched_status_t st;
+	int ret;
+
+	test_begin("irq wait_done progression");
+	EXPECT_EQ(stub_config(64), 0);
+
+	memset(&ev, 0, sizeof(ev));
+	ev.timestamp_ticks = 1000U;
+	ev.flags = TEST_EVENT_FLAG;
+	ev.payload.word0 = 0x00010000U;
+
+	ret = awg_sched_load_events(&ev, 1U);
+	EXPECT_EQ(ret, 0);
+
+	ret = awg_sched_start();
+	EXPECT_EQ(ret, 0);
+
+	s_irq_wait_simulate_done = 1;
+	ret = awg_sched_wait_done(10U, &st);
+	EXPECT_EQ(ret, 0);
+	EXPECT_EQ((int)st.done, 1);
+	EXPECT_EQ((int)st.error, 0);
+	EXPECT_EQ((int)st.irq_status_latched, (int)TEST_IRQ_DONE_AND_ERROR_MASK);
+	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_IRQ_STATUS / 4U],
+		  (int)TEST_IRQ_DONE_AND_ERROR_MASK);
 }
 
 /* -----------------------------------------------------------------------
@@ -540,13 +675,17 @@ test_too_many();
 test_ts_not_monotonic();
 test_ts_delta_too_small();
 test_delta_allow_zero_same_channel();
+test_reinit_spacing();
+test_reinit_spacing_ok();
 test_reserved_flags();
 test_channel_width();
 test_tone_width();
 test_freq_width();
 test_scale_width();
 test_phase_width();
+test_set_epoch();
 test_fake_hw_progression();
+test_irq_wait_done();
 
 printf("\n%d passed, %d failed\n", s_pass, s_fail);
 return (s_fail > 0) ? EXIT_FAILURE : EXIT_SUCCESS;

@@ -85,6 +85,9 @@ _Static_assert(offsetof(awg_event_v1_t, flags) == 10U, "event.flags offset misma
 _Static_assert(offsetof(awg_event_v1_t, payload) == 12U, "event.payload offset mismatch");
 _Static_assert(offsetof(awg_event_v1_t, reserved) == 28U, "event.reserved offset mismatch");
 
+/* Event flag bit definitions. */
+#define AWG_SCHED_FLAG_PHASE_REINIT 0x0001U
+
 /*
  * Static scheduler configuration.
  *
@@ -123,12 +126,14 @@ typedef enum {
 	AWG_EVTVAL_ERR_TONE_WIDTH,
 	AWG_EVTVAL_ERR_FREQ_WIDTH,
 	AWG_EVTVAL_ERR_SCALE_WIDTH,
-	AWG_EVTVAL_ERR_PHASE_WIDTH
+	AWG_EVTVAL_ERR_PHASE_WIDTH,
+	AWG_EVTVAL_ERR_REINIT_SPACING
 } awg_evtval_err_t;
 
 /* Configurable validation rules. */
 typedef struct {
 	uint32_t min_delta_ticks;
+	uint32_t min_reinit_delta_ticks;
 	awg_sched_delta_mode_t delta_mode;
 	uint16_t allowed_flags_mask;
 	uint16_t channel_mask;
@@ -183,6 +188,8 @@ int awg_sched_start(void);
 int awg_sched_stop(void);
 int awg_sched_get_status(awg_sched_status_t *status);
 int awg_sched_wait_done(uint32_t timeout_ms, awg_sched_status_t *final_status);
+int awg_sched_set_epoch(void);
+void awg_sched_irq_signal(void);
 void awg_sched_dump_artifacts(const awg_event_v1_t *events, uint32_t count,
 			      const awg_sched_status_t *status);
 

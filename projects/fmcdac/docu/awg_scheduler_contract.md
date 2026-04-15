@@ -41,6 +41,11 @@ as the HDL localparams.
 | 0x58   | EVT_WDATA5      | W      | Payload word 2                             |
 | 0x5C   | EVT_WDATA6      | W      | Payload word 3                             |
 | 0x60   | EVT_WCTRL       | W      | Write 1 to commit event data to BRAM       |
+| 0x64   | IRQ_ENABLE      | RW     | Interrupt enable mask (bit0=done, bit1=error) |
+| 0x68   | IP_SCRATCH      | RW     | Scratch register reserved for firmware debug |
+| 0x6C   | TIME_RELOAD_LO  | W      | Epoch reload value low word                |
+| 0x70   | TIME_RELOAD_HI  | W      | Epoch reload value high word               |
+| 0x74   | TIME_RELOAD_CTRL| W      | Write 1 to reload on next SYSREF           |
 
 ---
 
@@ -93,6 +98,11 @@ as the HDL localparams.
 | 0   | done_irq         | Sequence-done interrupt   |
 | 1   | error_irq        | Error interrupt           |
 | 2   | spacing_viol_irq | Timing-violation interrupt|
+
+`awg_sched_wait_done()` supports an IRQ-driven wait path when
+`FMCDAC_AWG_SCHED_USE_IRQ` is enabled. Platform firmware must route the AWG
+interrupt line through the interrupt controller and call `awg_sched_irq_signal()`
+from the ISR callback. If not enabled, firmware uses the polling fallback.
 
 ---
 

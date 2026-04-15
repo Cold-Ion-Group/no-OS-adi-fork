@@ -23,6 +23,7 @@ uint32_t hw_event_depth;
 uint8_t  hw_payload_bits;
 uint8_t  hw_ts_bits;
 } g_awg_sched;
+static volatile uint32_t g_awg_sched_irq_seq;
 
 #define AWG_SCHED_FLAGS_ALLOWED_MASK      0x0001U
 #define AWG_SCHED_CHANNEL_MASK_DEFAULT    0x0001U
@@ -30,6 +31,18 @@ uint8_t  hw_ts_bits;
 #define AWG_SCHED_FREQ_MASK_DEFAULT       0x0000FFFFU
 #define AWG_SCHED_SCALE_MASK_DEFAULT      0x0000FFFFU
 #define AWG_SCHED_PHASE_MASK_DEFAULT      0x0000FFFFU
+#define AWG_SCHED_MIN_REINIT_DELTA_TICKS  8U
+/*
+ * The HDL epoch reload target is zero; allow up to 8 ticks to account for
+ * AXI read latency and scheduler-clock crossing jitter after SYSREF.
+ */
+#define AWG_SCHED_TIME_EPOCH_NEAR_ZERO    8U
+#define AWG_SCHED_IRQ_ARM_MASK            (AWG_SCHED_IRQ_DONE_BIT | AWG_SCHED_IRQ_ERROR_BIT)
+
+__attribute__((weak)) void awg_sched_irq_wait_hook(uint32_t wait_ms_left)
+{
+	(void)wait_ms_left;
+}
 
 /*
  * Emit a diagnostic log line.  Uses the caller-supplied log_fn if configured,
@@ -70,6 +83,8 @@ case AWG_EVTVAL_ERR_SCALE_WIDTH:
 return "scale exceeds configured field width";
 case AWG_EVTVAL_ERR_PHASE_WIDTH:
 return "phase exceeds configured field width";
+case AWG_EVTVAL_ERR_REINIT_SPACING:
+return "reinit event spacing is below minimum threshold";
 default:
 return "unknown validation error";
 }
@@ -96,6 +111,7 @@ return;
 
 memset(rules, 0, sizeof(*rules));
 rules->min_delta_ticks = 1U;
+rules->min_reinit_delta_ticks = AWG_SCHED_MIN_REINIT_DELTA_TICKS;
 rules->delta_mode = AWG_SCHED_DELTA_MODE_STRICT;
 rules->allowed_flags_mask = AWG_SCHED_FLAGS_ALLOWED_MASK;
 rules->channel_mask = AWG_SCHED_CHANNEL_MASK_DEFAULT;
@@ -232,6 +248,7 @@ return ret;
 
 g_awg_sched.loaded_events = 0;
 g_awg_sched.events_validated = false;
+g_awg_sched_irq_seq = 0U;
 return awg_sched_reg_write(AWG_SCHED_REG_EVT_COUNT, 0U);
 }
 
@@ -326,6 +343,8 @@ int awg_sched_validate_events(const awg_event_v1_t *events, uint32_t count,
       awg_sched_validation_report_t *report)
 {
 awg_sched_validation_rules_t active_rules;
+uint64_t last_reinit_ts = 0U;
+bool has_last_reinit = false;
 uint32_t i;
 uint32_t max_events;
 uint32_t observed;
@@ -404,6 +423,32 @@ goto fail;
 							phase_val,
 							active_rules.phase_mask);
 			goto fail;
+		}
+
+		if ((event->flags & AWG_SCHED_FLAG_PHASE_REINIT) != 0U) {
+			if (has_last_reinit) {
+				if (event->timestamp_ticks < last_reinit_ts) {
+					awg_sched_validation_report_set(report,
+									AWG_EVTVAL_ERR_REINIT_SPACING,
+									i,
+									0U,
+									active_rules.min_reinit_delta_ticks);
+					goto fail;
+				}
+
+				delta = event->timestamp_ticks - last_reinit_ts;
+				if (delta < (uint64_t)active_rules.min_reinit_delta_ticks) {
+					awg_sched_validation_report_set(report,
+									AWG_EVTVAL_ERR_REINIT_SPACING,
+									i,
+									(uint32_t)delta,
+									active_rules.min_reinit_delta_ticks);
+					goto fail;
+				}
+			}
+
+			last_reinit_ts = event->timestamp_ticks;
+			has_last_reinit = true;
 		}
 }
 
@@ -572,6 +617,8 @@ return 0;
 
 int awg_sched_arm(void)
 {
+int ret;
+
 if (!g_awg_sched.configured)
 return -ENODEV;
 
@@ -580,6 +627,10 @@ return -EINVAL;
 
 if (!g_awg_sched.events_validated)
 return -EINVAL;
+
+ret = awg_sched_reg_write(AWG_SCHED_REG_IRQ_ENABLE, AWG_SCHED_IRQ_ARM_MASK);
+if (ret)
+return ret;
 
 return awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_ARM);
 }
@@ -699,6 +750,10 @@ int awg_sched_wait_done(uint32_t timeout_ms, awg_sched_status_t *final_status)
 {
 awg_sched_status_t status;
 uint32_t wait_ms;
+#ifdef FMCDAC_AWG_SCHED_USE_IRQ
+uint32_t irq_status;
+uint32_t last_irq_seq;
+#endif
 int ret;
 
 if (!g_awg_sched.configured)
@@ -708,23 +763,96 @@ wait_ms = timeout_ms;
 if (wait_ms == 0U)
 wait_ms = g_awg_sched.cfg.done_timeout_ms;
 
+#ifdef FMCDAC_AWG_SCHED_USE_IRQ
+last_irq_seq = g_awg_sched_irq_seq;
+#endif
+
 while (true) {
+#ifdef FMCDAC_AWG_SCHED_USE_IRQ
+while (g_awg_sched_irq_seq == last_irq_seq) {
+if (wait_ms == 0U)
+return -ETIMEDOUT;
+
+awg_sched_irq_wait_hook(wait_ms);
+no_os_mdelay(1U);
+wait_ms--;
+}
+last_irq_seq = g_awg_sched_irq_seq;
+#endif
+
 ret = awg_sched_get_status(&status);
 if (ret)
 return ret;
 
 if (status.done || status.error) {
+#ifdef FMCDAC_AWG_SCHED_USE_IRQ
+ret = awg_sched_reg_read(AWG_SCHED_REG_IRQ_STATUS, &irq_status);
+if (ret)
+return ret;
+status.irq_status_latched = irq_status;
+ret = awg_sched_reg_write(AWG_SCHED_REG_IRQ_STATUS, irq_status);
+if (ret)
+return ret;
+#endif
+
 if (final_status)
 *final_status = status;
 return status.error ? -EIO : 0;
 }
 
+#ifndef FMCDAC_AWG_SCHED_USE_IRQ
 if (wait_ms == 0U)
 return -ETIMEDOUT;
 
 no_os_mdelay(1U);
 wait_ms--;
+#endif
 }
+}
+
+int awg_sched_set_epoch(void)
+{
+	uint32_t time_now_lo;
+	uint32_t wait_ms;
+	int ret;
+
+	if (!g_awg_sched.configured)
+		return -ENODEV;
+
+	ret = awg_sched_reg_write(AWG_SCHED_REG_TIME_RELOAD_LO, 0U);
+	if (ret)
+		return ret;
+
+	ret = awg_sched_reg_write(AWG_SCHED_REG_TIME_RELOAD_HI, 0U);
+	if (ret)
+		return ret;
+
+	ret = awg_sched_reg_write(AWG_SCHED_REG_TIME_RELOAD_CTRL, 1U);
+	if (ret)
+		return ret;
+
+	wait_ms = g_awg_sched.cfg.done_timeout_ms;
+	while (wait_ms > 0U) {
+		ret = awg_sched_reg_read(AWG_SCHED_REG_TIME_LO, &time_now_lo);
+		if (ret)
+			return ret;
+
+		if (time_now_lo <= AWG_SCHED_TIME_EPOCH_NEAR_ZERO) {
+			AWG_LOG("[SCHED-ARTIFACT] set_epoch time_now=0x%08lX\n\r",
+				(unsigned long)time_now_lo);
+			return 0;
+		}
+
+		no_os_mdelay(1U);
+		wait_ms--;
+	}
+
+	return -ETIMEDOUT;
+}
+
+void awg_sched_irq_signal(void)
+{
+	g_awg_sched_irq_seq++;
 }
 
 void awg_sched_dump_artifacts(const awg_event_v1_t *events, uint32_t count,

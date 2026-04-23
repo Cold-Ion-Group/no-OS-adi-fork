@@ -7,8 +7,10 @@ The current primary workflow is DDS-focused:
 
 1. `DDS-BAND` carrier-level benchmarking
 2. `SFDR-TEST` steady-state spur benchmarking
-3. `THROUGHPUT` firmware update-rate baselines
-4. `UART-RTT` host latency baselines
+3. optional close-in carrier traces during selected `SFDR-TEST` tones
+4. `DYNAMIC-SFDR` retune-burst benchmarking
+5. `THROUGHPUT` firmware update-rate baselines
+6. `UART-RTT` host latency baselines
 
 `NCO-TEST` still exists in the firmware, but it is now optional and skipped by
 default.
@@ -24,9 +26,12 @@ Primary steps:
    - `230-330 MHz` in `10 MHz` steps
 2. `SFDR-TEST`
    - `50-400 MHz` in `50 MHz` steps
-3. `THROUGHPUT`
+3. `DYNAMIC-SFDR`
+   - `100 MHz <-> 400 MHz`, `1 ms` dwell burst
+   - `100 MHz <-> 400 MHz`, `10 ms` dwell burst
+4. `THROUGHPUT`
    - firmware-side software update baseline
-4. `UART-RTT`
+5. `UART-RTT`
    - host-side ping/pong latency baseline
 
 Optional step:
@@ -59,6 +64,68 @@ This is required because:
 1. simple marker-window searches on the FSH8 could reacquire the carrier as the
    spur
 2. full `TRAC:DATA? TRACE1` wideband readback was timing out on this setup
+
+### Phase-noise scout traces
+
+During selected SFDR tones, the script can also capture narrow raw traces
+centered on the carrier:
+
+1. enable one or more `--phase-noise-span-hz` values
+2. optionally pick the SFDR carrier(s) with `--phase-noise-carrier-mhz`
+3. optionally override analyzer RBW/VBW/sweep settings for those traces only
+
+This is intended for close-in carrier-skirt capture near `~400 MHz` using the
+existing paused firmware flow. It is useful for the next bench campaign, but it
+is not an acceptance-grade phase-noise claim by itself.
+
+Current caution:
+
+1. the raw-trace method depends on trace-export SCPI
+2. on the current FSH8 `V1.58` firmware, compatibility probing showed the
+   trace-export path is not usable:
+   - `FORM*` commands are rejected
+   - memory-trace commands are rejected
+   - `TRAC:DATA? TRACE1` and `TRAC? TRACE1` still fail after the setup is
+     reduced to `V1.58`-compatible commands
+3. `run_nco_scope_test.py` now fails fast for trace-based requests on this
+   legacy firmware instead of waiting for analyzer timeouts
+
+### Marker-only phase-noise offset sweep
+
+The script can also run a marker-only close-in sideband survey that avoids raw
+trace export entirely:
+
+1. enable one or more `--phase-noise-offset-hz` values
+2. optionally pick the SFDR carrier(s) with `--phase-noise-carrier-mhz`
+3. optionally override the narrow sideband span with `--phase-noise-window-hz`
+4. the host measures left and right sideband levels at each offset
+5. it reports the averaged sideband level in `dBc` and `dBc/Hz`
+
+This is the preferred current-bench method when the trace-export path is not
+usable.
+
+### Dynamic retune bursts
+
+The script can also drive a live retune burst and measure during the burst:
+
+1. the firmware toggles between `100 MHz` and `400 MHz` for a fixed-duration run
+2. the host measures intended-tone windows near both endpoints
+3. the host also searches outside guarded windows for the strongest unintended
+   spur
+
+This is the current bench-accessible path for dynamic SFDR / settling work.
+
+Current caution:
+
+1. if `--dynamic-intended-margin-hz` is too narrow, endpoint-adjacent transient
+   energy can be classified as the strongest unintended spur
+2. the earlier `2 MHz` guard showed that behavior in repeated
+   `100 MHz <-> 400 MHz` runs
+3. widening only the intended windows is not enough; the unintended spur search
+   must exclude the same full intended margin
+4. the host now does that correctly
+5. use `--dynamic-intended-margin-hz 10000000` for the current confirmation
+   rerun if you need a cleaner settling interpretation
 
 ## Build/Run Behavior
 
@@ -112,6 +179,23 @@ python .\run_nco_scope_test.py `
   --resume-at-nco
 ```
 
+Dynamic retune burst run:
+
+```powershell
+python .\run_nco_scope_test.py `
+  --serial-port COM4 `
+  --visa-resource "TCPIP::192.168.100.142::INSTR" `
+  --visa-backend "@py" `
+  --skip-dds-band-test `
+  --skip-sfdr-test `
+  --skip-throughput-test `
+  --skip-uart-rtt `
+  --dynamic-trace-mode maxhold `
+  --dynamic-sweep-count 1 `
+  --dynamic-intended-margin-hz 10000000 `
+  --output-dir .\capture_runs\dynamic_sfdr_run
+```
+
 ## Useful Options
 
 General analyzer setup:
@@ -152,6 +236,48 @@ Optional raw narrow-span traces for DDS-band/NCO:
 --capture-trace
 ```
 
+Current FSH8 `V1.58` bench status: this option is intentionally blocked by the
+host preflight because the analyzer rejects the trace-export path.
+
+Optional close-in carrier traces during SFDR:
+
+```powershell
+--phase-noise-span-hz <span_hz>
+--phase-noise-carrier-mhz 400
+--phase-noise-rbw-hz <rbw_hz>
+--phase-noise-vbw-hz <vbw_hz>
+--phase-noise-sweep-count <count>
+```
+
+Current FSH8 `V1.58` bench status: `--phase-noise-span-hz` is intentionally
+blocked by the host preflight. Use the marker-only offset sweep below until the
+trace-export path is fixed.
+
+Marker-only phase-noise offset sweep during SFDR:
+
+```powershell
+--phase-noise-offset-hz 1000
+--phase-noise-offset-hz 10000
+--phase-noise-offset-hz 100000
+--phase-noise-carrier-mhz 400
+--phase-noise-window-hz 100000
+--phase-noise-rbw-hz 1000
+--phase-noise-vbw-hz 1000
+--phase-noise-sweep-count 10
+```
+
+Optional dynamic retune burst tuning:
+
+```powershell
+--dynamic-rbw-hz <rbw_hz>
+--dynamic-vbw-hz <vbw_hz>
+--dynamic-sweep-count <count>
+--dynamic-trace-mode maxhold
+--dynamic-detector positive
+--dynamic-intended-margin-hz 2000000
+--skip-dynamic-sfdr-test
+```
+
 ## Outputs
 
 If `--output-dir` is not supplied, artifacts are written to:
@@ -167,9 +293,12 @@ Typical outputs:
 3. `dds_band_plot.csv`
 4. `dds_band_plot.svg`
 5. `sfdr_results.csv`
-6. `throughput.json`
-7. `uart_rtt.json`
-8. per-step CSV/JSON files
+6. `phase_noise_results.csv` when close-in traces are requested
+7. `phase_noise_offset_results.csv` when marker-only offset sweeps are requested
+8. `dynamic_sfdr_results.csv` when retune bursts are requested
+9. `throughput.json`
+10. `uart_rtt.json`
+11. per-step CSV/JSON files
 
 For SFDR steps, the per-step CSV contains the carrier, left-spur, right-spur,
 and worst-spur marker summary.
@@ -180,5 +309,17 @@ and worst-spur marker summary.
 2. Use direct coax and `50 ohm` input.
 3. Start with the conservative analyzer settings listed above.
 4. Keep attenuation and reference level documented for each run.
+
+## TODOs
+
+1. Get the exact R&S-supported trace-export path for FSH8 firmware `V1.58`, or
+   upgrade the analyzer firmware to a version that supports the documented
+   `TRACe<n>[:DATA]?` flow.
+2. After firmware or syntax changes, rerun `fsh_trace_probe.py` before enabling
+   trace capture in the main benchmark flow.
+3. If live trace export remains unavailable, evaluate instrument-side
+   `MMEM:DATA?` file export as the next fallback.
+4. Keep marker-only `--phase-noise-offset-hz` as the current working close-in
+   method until a dense trace path is proven.
 5. Treat `summary.json` and `sfdr_results.csv` as the primary outputs for
    comparing runs.

@@ -18,13 +18,16 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
+import re
+import struct
 import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from dds_band_plot import load_dds_band_series, write_dds_band_csv, write_dds_band_svg
 
@@ -49,6 +52,8 @@ DDS_BAND_START_PROMPT = "[DDS-BAND] Run focused DDS sweep diagnostic around 230-
 DDS_BAND_DONE_MARKER = "[DDS-BAND] Completed focused DDS band diagnostic. Returning to normal DDS sweep."
 SFDR_START_PROMPT = "[SFDR-TEST] Run steady-state SFDR tone set at 50-400 MHz? [y/N]:"
 SFDR_DONE_MARKER = "[SFDR-TEST] Completed steady-state SFDR tone set."
+DYNAMIC_SFDR_START_PROMPT = "[DYNAMIC-SFDR] Run dynamic retune settling test? [y/N]:"
+DYNAMIC_SFDR_DONE_MARKER = "[DYNAMIC-SFDR] Completed dynamic retune settling test."
 THROUGHPUT_START_PROMPT = "[THROUGHPUT] Run MicroBlaze throughput benchmark? [y/N]:"
 THROUGHPUT_DONE_MARKER = "[THROUGHPUT] Done."
 UART_RTT_START_PROMPT = "[UART-RTT] Run host UART round-trip benchmark? [y/N]:"
@@ -72,6 +77,7 @@ DEFAULT_NCO_SEARCH_MARGIN_HZ = 5_000_000.0
 DEFAULT_SFDR_GUARD_HZ = 2_000_000.0
 DEFAULT_SFDR_MIN_SEARCH_HZ = 5_000_000.0
 DEFAULT_SFDR_MAX_SEARCH_HZ = 1_000_000_000.0
+DEFAULT_DYNAMIC_INTENDED_MARGIN_HZ = 2_000_000.0
 
 
 @dataclass(frozen=True)
@@ -122,6 +128,93 @@ class SfdrSettings:
     carrier_guard_hz: float
 
 
+@dataclass(frozen=True)
+class PhaseNoiseRequest:
+    carrier_hz: float
+    span_hz: float
+    step_spec: StepSpec
+
+
+@dataclass(frozen=True)
+class PhaseNoiseOffsetRequest:
+    carrier_hz: float
+    offset_hz: float
+    sideband_window_hz: float
+    step_spec: StepSpec
+
+
+@dataclass(frozen=True)
+class DynamicRetuneSpec:
+    index: int
+    name: str
+    marker: str
+    done_marker: str
+    description: str
+    intended_freq_hz: List[float]
+    dwell_ms: int
+    transitions: int
+    intended_margin_hz: float
+
+
+@dataclass
+class WindowPeak:
+    label: str
+    search_left_hz: float
+    search_right_hz: float
+    power_dbm: Optional[float]
+    freq_hz: Optional[float]
+
+
+@dataclass
+class DynamicRetuneMetrics:
+    dwell_ms: int
+    transitions: int
+    active_duration_ms: int
+    search_left_hz: float
+    search_right_hz: float
+    carrier_guard_hz: float
+    intended_margin_hz: float
+    rbw_hz: float
+    vbw_hz: float
+    sweep_count: int
+    trace_mode: str
+    detector: str
+    reference_level_dbm: float
+    display_range_db: float
+    attenuation_auto: bool
+    preamp_on: bool
+    impedance_ohms: int
+    intended_peaks: List[WindowPeak]
+    unintended_peaks: List[WindowPeak]
+    reference_power_dbm: Optional[float]
+    reference_freq_hz: Optional[float]
+    spur_power_dbm: Optional[float]
+    spur_freq_hz: Optional[float]
+    dynamic_spur_margin_db: Optional[float]
+
+
+@dataclass
+class PhaseNoiseOffsetMetrics:
+    carrier_power_dbm: float
+    carrier_freq_hz: float
+    offset_hz: float
+    sideband_window_hz: float
+    rbw_hz: float
+    vbw_hz: float
+    sweep_count: int
+    trace_mode: str
+    detector: str
+    reference_level_dbm: float
+    display_range_db: float
+    attenuation_auto: bool
+    preamp_on: bool
+    impedance_ohms: int
+    sidebands: List[WindowPeak]
+    avg_sideband_power_dbm: Optional[float]
+    avg_sideband_dbc: Optional[float]
+    avg_sideband_dbc_per_hz: Optional[float]
+
+
 @dataclass
 class SpectrumMetrics:
     trace_points: int
@@ -157,6 +250,8 @@ class SpectrumMetrics:
     reference_step_name: Optional[str] = None
     reference_power_dbm: Optional[float] = None
     power_delta_db: Optional[float] = None
+    trace_capture_degraded: bool = False
+    trace_capture_error: Optional[str] = None
 
 
 @dataclass
@@ -168,7 +263,7 @@ class StepCaptureSummary:
     description: str
     expected_freq_hz: List[float]
     csv_path: str
-    metrics: SpectrumMetrics
+    metrics: Any
 
 
 NCO_STEP_SPECS = [
@@ -230,6 +325,31 @@ SFDR_STEP_SPECS = [
     StepSpec("sfdr", 6, "sfdr_300mhz", "[SFDR-TEST] Step 6/8: 300 MHz DDS tone.", "Steady-state SFDR carrier at 300 MHz", [300_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
     StepSpec("sfdr", 7, "sfdr_350mhz", "[SFDR-TEST] Step 7/8: 350 MHz DDS tone.", "Steady-state SFDR carrier at 350 MHz", [350_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
     StepSpec("sfdr", 8, "sfdr_400mhz", "[SFDR-TEST] Step 8/8: 400 MHz DDS tone.", "Steady-state SFDR carrier at 400 MHz", [400_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
+]
+
+DYNAMIC_RETUNE_STEP_SPECS = [
+    DynamicRetuneSpec(
+        index=1,
+        name="dynamic_toggle_100_400_1ms",
+        marker="[DYNAMIC-SFDR] Step 1/2: toggle_100_to_400_1ms.",
+        done_marker="[DYNAMIC-SFDR] Completed burst 1/2.",
+        description="Rapid DDS retune burst toggling 100 MHz <-> 400 MHz with 1 ms dwell",
+        intended_freq_hz=[100_000_000.0, 400_000_000.0],
+        dwell_ms=1,
+        transitions=12_000,
+        intended_margin_hz=DEFAULT_DYNAMIC_INTENDED_MARGIN_HZ,
+    ),
+    DynamicRetuneSpec(
+        index=2,
+        name="dynamic_toggle_100_400_10ms",
+        marker="[DYNAMIC-SFDR] Step 2/2: toggle_100_to_400_10ms.",
+        done_marker="[DYNAMIC-SFDR] Completed burst 2/2.",
+        description="Rapid DDS retune burst toggling 100 MHz <-> 400 MHz with 10 ms dwell",
+        intended_freq_hz=[100_000_000.0, 400_000_000.0],
+        dwell_ms=10,
+        transitions=1_200,
+        intended_margin_hz=DEFAULT_DYNAMIC_INTENDED_MARGIN_HZ,
+    ),
 ]
 
 
@@ -393,6 +513,29 @@ class RohdeSchwarzFSH:
         self.inst.write("*CLS")
         self.idn = self.inst.query("*IDN?").strip()
         self.last_io = "*IDN?"
+        self.firmware_major = self._parse_firmware_major(self.idn)
+
+    @staticmethod
+    def _parse_firmware_major(idn: str) -> Optional[int]:
+        match = re.search(r",V(\d+)(?:\.\d+)?$", idn.strip(), re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    @property
+    def legacy_firmware(self) -> bool:
+        return self.firmware_major is not None and self.firmware_major < 2
+
+    def trace_capture_unsupported_message(self) -> str:
+        return (
+            f"Analyzer {self.idn} uses legacy firmware that rejects the trace-export "
+            "SCPI required for span-based trace capture on this bench. "
+            "Use --phase-noise-offset-hz for marker-only sideband measurements, "
+            "leave --capture-trace disabled, or upgrade the analyzer firmware."
+        )
 
     def _wrap_io_error(self, exc: Exception) -> RuntimeError:
         return RuntimeError(f"Analyzer SCPI failed at '{self.last_io}': {exc}")
@@ -428,6 +571,25 @@ class RohdeSchwarzFSH:
         except Exception as exc:
             raise self._wrap_io_error(exc) from exc
 
+    def _query_text(self, command: str) -> str:
+        self.last_io = command
+        try:
+            return self.inst.query(command).strip()
+        except Exception as exc:
+            raise self._wrap_io_error(exc) from exc
+
+    def query_system_errors(self) -> List[str]:
+        errors: List[str] = []
+        for command in ("SYST:ERR:ALL?", "SYST:ERR?"):
+            try:
+                response = self._query_text(command)
+            except Exception as exc:
+                errors.append(f"{command} failed: {exc}")
+                continue
+            if response:
+                errors.append(f"{command} -> {response}")
+        return errors
+
     def _query_ascii_float_list(self, command: str) -> List[float]:
         self.last_io = command
         try:
@@ -438,17 +600,189 @@ class RohdeSchwarzFSH:
             return []
         return [float(item) for item in raw.split(",") if item.strip()]
 
+    def _query_binary_float_list(self, command: str) -> List[float]:
+        self.last_io = command
+        previous_read_termination = self.inst.read_termination
+        try:
+            # R&S documents binary REAL,32 trace transfer as the faster path for
+            # trace data. Disabling the text terminator avoids hanging on the
+            # end-of-message if the transport does not deliver a trailing LF in
+            # the way pyvisa.query() expects.
+            self.inst.read_termination = None
+            values = self.inst.query_binary_values(
+                command,
+                datatype="f",
+                is_big_endian=False,
+                container=list,
+                header_fmt="ieee",
+                expect_termination=False,
+            )
+        except Exception as exc:
+            raise self._wrap_io_error(exc) from exc
+        finally:
+            self.inst.read_termination = previous_read_termination
+        return [float(item) for item in values]
+
+    def _read_raw_response(self, command: str, *, expect_binary: bool) -> bytes:
+        self.last_io = command
+        previous_read_termination = self.inst.read_termination
+        chunks = bytearray()
+        try:
+            self.inst.read_termination = None
+            self.inst.write(command)
+            for _ in range(8):
+                try:
+                    chunk = self.inst.read_raw()
+                except Exception as exc:
+                    if chunks:
+                        break
+                    raise self._wrap_io_error(exc) from exc
+                if not chunk:
+                    break
+                chunks.extend(chunk)
+                if expect_binary:
+                    if len(chunks) >= 2 and chunks[:1] == b"#":
+                        digits = chunks[1] - ord("0")
+                        if 0 <= digits <= 9 and len(chunks) >= 2 + digits:
+                            payload_len = int(chunks[2 : 2 + digits].decode("ascii"))
+                            total_len = 2 + digits + payload_len
+                            if len(chunks) >= total_len:
+                                break
+                else:
+                    if b"\n" in chunks or b"\r" in chunks or chunks.count(b",") >= 630:
+                        break
+        finally:
+            self.inst.read_termination = previous_read_termination
+        return bytes(chunks)
+
+    @staticmethod
+    def _parse_ieee_block_f32_le(raw: bytes) -> List[float]:
+        if not raw.startswith(b"#") or len(raw) < 2:
+            raise RuntimeError("Analyzer did not return an IEEE block")
+        digits = raw[1] - ord("0")
+        if digits < 0 or digits > 9:
+            raise RuntimeError("Analyzer returned an invalid IEEE block header")
+        if len(raw) < 2 + digits:
+            raise RuntimeError("Analyzer IEEE block header is incomplete")
+        payload_len = int(raw[2 : 2 + digits].decode("ascii"))
+        start = 2 + digits
+        end = start + payload_len
+        if len(raw) < end:
+            raise RuntimeError("Analyzer IEEE block payload is incomplete")
+        payload = raw[start:end]
+        if payload_len % 4 != 0:
+            raise RuntimeError("Analyzer IEEE block payload length is not aligned to float32")
+        count = payload_len // 4
+        return list(struct.unpack("<" + ("f" * count), payload))
+
+    def _query_binary_float_list_raw(self, command: str) -> List[float]:
+        raw = self._read_raw_response(command, expect_binary=True)
+        if not raw:
+            return []
+        return [float(item) for item in self._parse_ieee_block_f32_le(raw)]
+
+    def _query_ascii_float_list_raw(self, command: str) -> List[float]:
+        raw = self._read_raw_response(command, expect_binary=False)
+        if not raw:
+            return []
+        text = raw.decode("ascii", errors="replace").strip().strip("\x00")
+        if not text:
+            return []
+        return [float(item) for item in text.split(",") if item.strip()]
+
     def _capture_trace_data(
         self,
         center_hz: float,
         span_hz: float,
     ) -> Tuple[List[float], List[float]]:
-        self._write("FORM ASC")
-        trace_levels_dbm = self._query_ascii_float_list("TRAC:DATA? TRACE1")
+        if self.legacy_firmware:
+            raise RuntimeError(self.trace_capture_unsupported_message())
+
+        attempts: List[str] = []
+        trace_levels_dbm: List[float] = []
+
+        trace_attempts = (
+            ("FORM:BORD SWAP", None, "write"),
+            ("FORM:DATA REAL,32", "TRAC:DATA? TRACE1", "binary_raw"),
+            ("FORM:DATA REAL,32", "TRAC? TRACE1", "binary_raw"),
+            ("FORM:DATA REAL,32", "TRAC:DATA:MEM? TRACE1", "binary_mem_raw"),
+            ("FORM:DATA ASC", "TRAC:DATA? TRACE1", "ascii_raw"),
+            ("FORM:DATA ASC", "TRAC? TRACE1", "ascii_raw"),
+            ("FORM:DATA ASC", "TRAC:DATA:MEM? TRACE1", "ascii_mem_raw"),
+            ("FORM:DATA REAL,32", "TRAC:DATA? TRACE1", "binary"),
+            ("FORM:DATA REAL,32", "TRAC? TRACE1", "binary"),
+            ("FORM:DATA REAL,32", "TRAC:DATA:MEM? TRACE1", "binary_mem"),
+            ("FORM:DATA ASC", "TRAC:DATA? TRACE1", "ascii"),
+            ("FORM:DATA ASC", "TRAC? TRACE1", "ascii"),
+            ("FORM:DATA ASC", "TRAC:DATA:MEM? TRACE1", "ascii_mem"),
+        )
+
+        for format_command, query_command, mode in trace_attempts:
+            try:
+                if format_command is not None:
+                    self._write(format_command)
+                if mode == "write":
+                    continue
+                if "_mem" in mode:
+                    self._write("CALC:MATH:COPY:MEM")
+                    self._write("DISP:TRAC:MEM ON")
+                if mode == "binary_raw" or mode == "binary_mem_raw":
+                    trace_levels_dbm = self._query_binary_float_list_raw(query_command)
+                elif mode == "ascii_raw" or mode == "ascii_mem_raw" or mode == "ascii_raw_legacy":
+                    trace_levels_dbm = self._query_ascii_float_list_raw(query_command)
+                elif mode == "binary" or mode == "binary_mem":
+                    trace_levels_dbm = self._query_binary_float_list(query_command)
+                else:
+                    trace_levels_dbm = self._query_ascii_float_list(query_command)
+                if trace_levels_dbm:
+                    break
+            except Exception as exc:
+                prefix = format_command if format_command is not None else "legacy-default"
+                attempts.append(f"{prefix} + {query_command}: {exc}")
+                trace_levels_dbm = []
+
         if not trace_levels_dbm:
-            raise RuntimeError("Analyzer returned no usable trace points")
+            system_errors = self.query_system_errors()
+            detail = "; ".join(attempts) if attempts else "Analyzer returned no usable trace points"
+            if system_errors:
+                detail += "; " + "; ".join(system_errors)
+            raise RuntimeError(detail)
         trace_freqs_hz = build_trace_axis(center_hz, span_hz, len(trace_levels_dbm))
         return trace_freqs_hz, trace_levels_dbm
+
+    def _configure_spectrum_measurement(
+        self,
+        center_hz: float,
+        span_hz: float,
+        settings: AnalyzerSettings,
+    ) -> None:
+        self._write("*CLS")
+        # FW 1.58 rejects several newer display / format / auto-detector
+        # headers. Keep the legacy path on the small set that the compatibility
+        # probe showed to be accepted.
+        if not self.legacy_firmware:
+            self._write("UNIT:POW DBM")
+            self._write("DISP:TRAC:Y:SPAC LOG")
+            self._write(f"DISP:TRAC:Y {settings.display_range_db}dB")
+            self._write(f"INP:IMP {settings.impedance_ohms}")
+            self._write("DET:AUTO OFF")
+            self._write("CALC:MARK1:FREQ:MODE FREQ")
+        self._write(f"DISP:TRAC:Y:RLEV {settings.reference_level_dbm}dBm")
+        self._write(f"INP:ATT:AUTO {'ON' if settings.attenuation_auto else 'OFF'}")
+        self._write(f"INP:GAIN:STAT {'ON' if settings.preamp_on else 'OFF'}")
+        self._write("BAND:AUTO OFF")
+        self._write(f"BAND {settings.rbw_hz}")
+        self._write("BAND:VID:AUTO OFF")
+        self._write(f"BAND:VID {settings.vbw_hz}")
+        self._write("SWE:TIME:AUTO ON")
+        self._write("INIT:CONT OFF")
+        self._write(f"SWE:COUN {settings.sweep_count}")
+        self._write(f"DISP:WIND:TRAC:MODE {TRACE_MODE_TOKENS[settings.trace_mode]}")
+        self._write(f"DET {DETECTOR_TOKENS[settings.detector]}")
+        self._write(f"FREQ:CENT {center_hz}")
+        self._write(f"FREQ:SPAN {span_hz}")
+        self._write("CALC:MARK1 ON")
+        self._write("INIT;*WAI")
 
     def _capture_peak_for_span(
         self,
@@ -459,29 +793,7 @@ class RohdeSchwarzFSH:
         if span_hz <= 0.0:
             return None, None
 
-        self._write("*CLS")
-        self._write("UNIT:POW DBM")
-        self._write("DISP:TRAC:Y:SPAC LOG")
-        self._write(f"DISP:TRAC:Y {settings.display_range_db}dB")
-        self._write(f"DISP:TRAC:Y:RLEV {settings.reference_level_dbm}dBm")
-        self._write(f"INP:ATT:AUTO {'ON' if settings.attenuation_auto else 'OFF'}")
-        self._write(f"INP:GAIN:STAT {'ON' if settings.preamp_on else 'OFF'}")
-        self._write(f"INP:IMP {settings.impedance_ohms}")
-        self._write("BAND:AUTO OFF")
-        self._write(f"BAND {settings.rbw_hz}")
-        self._write("BAND:VID:AUTO OFF")
-        self._write(f"BAND:VID {settings.vbw_hz}")
-        self._write("SWE:TIME:AUTO ON")
-        self._write("INIT:CONT OFF")
-        self._write(f"SWE:COUN {settings.sweep_count}")
-        self._write(f"DISP:WIND:TRAC:MODE {TRACE_MODE_TOKENS[settings.trace_mode]}")
-        self._write("DET:AUTO OFF")
-        self._write(f"DET {DETECTOR_TOKENS[settings.detector]}")
-        self._write(f"FREQ:CENT {center_hz}")
-        self._write(f"FREQ:SPAN {span_hz}")
-        self._write("CALC:MARK1 ON")
-        self._write("CALC:MARK1:FREQ:MODE FREQ")
-        self._write("INIT;*WAI")
+        self._configure_spectrum_measurement(center_hz, span_hz, settings)
         self._write("CALC:MARK1:MAX")
         power_dbm = self._query_float("CALC:MARK1:Y?")
         freq_hz = self._query_float("CALC:MARK1:X?")
@@ -506,43 +818,42 @@ class RohdeSchwarzFSH:
             freq_hz = None
         return power_dbm, freq_hz
 
+    def _capture_marker_at_frequency(
+        self,
+        center_hz: float,
+        span_hz: float,
+        marker_hz: float,
+        settings: AnalyzerSettings,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        if span_hz <= 0.0:
+            return None, None
+
+        self._configure_spectrum_measurement(center_hz, span_hz, settings)
+        self._write(f"CALC:MARK1:X {marker_hz}")
+        power_dbm = self._query_float("CALC:MARK1:Y?")
+        try:
+            freq_hz = self._query_float("CALC:MARK1:X?")
+        except Exception:
+            freq_hz = marker_hz
+        return power_dbm, freq_hz
+
     def capture_trace(
         self,
         step: StepSpec,
         settings: AnalyzerSettings,
     ) -> Tuple[List[float], List[float], SpectrumMetrics]:
+        if settings.capture_trace and self.legacy_firmware:
+            raise RuntimeError(self.trace_capture_unsupported_message())
+
         center_hz = step.center_hz
         span_hz = step.span_hz
         search_left_hz = step.search_left_hz
         search_right_hz = step.search_right_hz
 
-        self._write("*CLS")
-        self._write("UNIT:POW DBM")
-        self._write("DISP:TRAC:Y:SPAC LOG")
-        self._write(f"DISP:TRAC:Y {settings.display_range_db}dB")
-        self._write(f"DISP:TRAC:Y:RLEV {settings.reference_level_dbm}dBm")
-        self._write(f"INP:ATT:AUTO {'ON' if settings.attenuation_auto else 'OFF'}")
-        self._write(f"INP:GAIN:STAT {'ON' if settings.preamp_on else 'OFF'}")
-        self._write(f"INP:IMP {settings.impedance_ohms}")
-        self._write("BAND:AUTO OFF")
-        self._write(f"BAND {settings.rbw_hz}")
-        self._write("BAND:VID:AUTO OFF")
-        self._write(f"BAND:VID {settings.vbw_hz}")
-        self._write("SWE:TIME:AUTO ON")
-        self._write("INIT:CONT OFF")
-        self._write(f"SWE:COUN {settings.sweep_count}")
-        self._write(f"DISP:WIND:TRAC:MODE {TRACE_MODE_TOKENS[settings.trace_mode]}")
-        self._write("DET:AUTO OFF")
-        self._write(f"DET {DETECTOR_TOKENS[settings.detector]}")
-        self._write(f"FREQ:CENT {center_hz}")
-        self._write(f"FREQ:SPAN {span_hz}")
-        self._write("CALC:MARK1 ON")
-        self._write("CALC:MARK1:FREQ:MODE FREQ")
+        self._configure_spectrum_measurement(center_hz, span_hz, settings)
         self._write("CALC:MARK1:X:SLIM ON")
         self._write(f"CALC:MARK1:X:SLIM:LEFT {search_left_hz}")
         self._write(f"CALC:MARK1:X:SLIM:RIGH {search_right_hz}")
-        self._write("FORM ASC")
-        self._write("INIT;*WAI")
         self._write("CALC:MARK1:MAX")
 
         marker_power_dbm = self._query_float("CALC:MARK1:Y?")
@@ -555,6 +866,8 @@ class RohdeSchwarzFSH:
         trace_levels_dbm: List[float]
         sweep_points: int
         trace_freqs_hz: List[float]
+        trace_capture_degraded = False
+        trace_capture_error = None
         if settings.capture_trace:
             try:
                 trace_freqs_hz, trace_levels_dbm = self._capture_trace_data(center_hz, span_hz)
@@ -564,6 +877,8 @@ class RohdeSchwarzFSH:
                 trace_freqs_hz = [fallback_freq_hz]
                 trace_levels_dbm = [marker_power_dbm]
                 sweep_points = 1
+                trace_capture_degraded = True
+                trace_capture_error = str(exc)
                 print(f"[HOST] Analyzer trace fallback after '{self.last_io}': {exc}")
         else:
             fallback_freq_hz = marker_freq_hz if marker_freq_hz is not None else center_hz
@@ -607,6 +922,8 @@ class RohdeSchwarzFSH:
             trace_peak_freq_hz=trace_peak_freq_hz,
             nearest_expected_hz=nearest_expected_hz,
             nearest_error_hz=nearest_error_hz,
+            trace_capture_degraded=trace_capture_degraded,
+            trace_capture_error=trace_capture_error,
         )
         return trace_freqs_hz, trace_levels_dbm, metrics
 
@@ -759,6 +1076,70 @@ def print_step_summary(step: StepSpec, metrics: SpectrumMetrics) -> None:
     print(
         f"[HOST] {step.name}: Power={metrics.power_dbm:.3f} dBm, "
         f"Freq={freq_text}{err_text}{delta_text}{marker_text}{spur_text}"
+    )
+
+
+def format_frequency_label_hz(freq_hz: float) -> str:
+    rounded_hz = int(round(freq_hz))
+    units = (
+        (1_000_000_000, "ghz"),
+        (1_000_000, "mhz"),
+        (1_000, "khz"),
+    )
+    for scale, suffix in units:
+        if rounded_hz % scale == 0 and rounded_hz >= scale:
+            return f"{rounded_hz // scale}{suffix}"
+    return f"{rounded_hz}hz"
+
+
+def capture_trace_step(
+    analyzer: RohdeSchwarzFSH,
+    output_dir: Path,
+    step: StepSpec,
+    settings: AnalyzerSettings,
+) -> StepCaptureSummary:
+    trace_freqs_hz, trace_levels_dbm, metrics = analyzer.capture_trace(step, settings)
+
+    csv_path = output_dir / f"step{step.index:02d}_{step.name}.csv"
+    json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
+    save_trace_csv(csv_path, trace_freqs_hz, trace_levels_dbm)
+    write_step_json(json_path, analyzer.idn, step, metrics)
+
+    summary = StepCaptureSummary(
+        group=step.group,
+        step_index=step.index,
+        name=step.name,
+        marker=step.marker,
+        description=step.description,
+        expected_freq_hz=step.expected_freq_hz,
+        csv_path=str(csv_path.resolve()),
+        metrics=metrics,
+    )
+    return summary
+
+
+def write_step_json(
+    path: Path,
+    analyzer_idn: str,
+    step: StepSpec,
+    metrics: SpectrumMetrics,
+    extra: Optional[dict] = None,
+) -> None:
+    payload = {
+        "group": step.group,
+        "step_index": step.index,
+        "name": step.name,
+        "marker": step.marker,
+        "description": step.description,
+        "expected_freq_hz": step.expected_freq_hz,
+        "metrics": asdict(metrics),
+        "analyzer_idn": analyzer_idn,
+    }
+    if extra:
+        payload.update(extra)
+    path.write_text(
+        json.dumps(payload, indent=2, default=json_default) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -915,6 +1296,123 @@ def parse_args() -> argparse.Namespace:
         help="Exclude this many Hz around the carrier when searching for the strongest spur",
     )
     parser.add_argument(
+        "--phase-noise-span-hz",
+        action="append",
+        type=float,
+        default=[],
+        help="Capture a close-in carrier trace with this span in Hz during matching SFDR steps. Repeat the option to collect multiple spans.",
+    )
+    parser.add_argument(
+        "--phase-noise-carrier-mhz",
+        action="append",
+        type=float,
+        default=[],
+        help="Capture close-in carrier traces for this SFDR carrier in MHz. Defaults to 400 MHz when --phase-noise-span-hz is used.",
+    )
+    parser.add_argument(
+        "--phase-noise-rbw-hz",
+        type=float,
+        default=None,
+        help="Override RBW for close-in carrier traces. Defaults to --rbw-hz.",
+    )
+    parser.add_argument(
+        "--phase-noise-vbw-hz",
+        type=float,
+        default=None,
+        help="Override VBW for close-in carrier traces. Defaults to --vbw-hz.",
+    )
+    parser.add_argument(
+        "--phase-noise-sweep-count",
+        type=int,
+        default=None,
+        help="Override sweep count for close-in carrier traces. Defaults to --sweep-count.",
+    )
+    parser.add_argument(
+        "--phase-noise-trace-mode",
+        choices=sorted(TRACE_MODE_TOKENS.keys()),
+        default=None,
+        help="Override trace mode for close-in carrier traces. Defaults to --trace-mode.",
+    )
+    parser.add_argument(
+        "--phase-noise-detector",
+        choices=sorted(DETECTOR_TOKENS.keys()),
+        default=None,
+        help="Override detector for close-in carrier traces. Defaults to --detector.",
+    )
+    parser.add_argument(
+        "--phase-noise-reference-level-dbm",
+        type=float,
+        default=None,
+        help="Override display reference level for close-in carrier traces. Defaults to --reference-level-dbm.",
+    )
+    parser.add_argument(
+        "--phase-noise-display-range-db",
+        type=float,
+        default=None,
+        help="Override display range for close-in carrier traces. Defaults to --display-range-db.",
+    )
+    parser.add_argument(
+        "--phase-noise-offset-hz",
+        action="append",
+        type=float,
+        default=[],
+        help="Measure marker-only sideband levels at these carrier offsets in Hz. Repeat the option to collect multiple offsets.",
+    )
+    parser.add_argument(
+        "--phase-noise-window-hz",
+        type=float,
+        default=None,
+        help="Span in Hz for each marker-only phase-noise sideband window. Defaults to max(10*RBW, 1 kHz).",
+    )
+    parser.add_argument(
+        "--dynamic-rbw-hz",
+        type=float,
+        default=None,
+        help="Override RBW for dynamic retune capture. Defaults to --rbw-hz.",
+    )
+    parser.add_argument(
+        "--dynamic-vbw-hz",
+        type=float,
+        default=None,
+        help="Override VBW for dynamic retune capture. Defaults to --vbw-hz.",
+    )
+    parser.add_argument(
+        "--dynamic-sweep-count",
+        type=int,
+        default=None,
+        help="Override sweep count for dynamic retune capture. Defaults to 1.",
+    )
+    parser.add_argument(
+        "--dynamic-trace-mode",
+        choices=sorted(TRACE_MODE_TOKENS.keys()),
+        default=None,
+        help="Override trace mode for dynamic retune capture. Defaults to maxhold.",
+    )
+    parser.add_argument(
+        "--dynamic-detector",
+        choices=sorted(DETECTOR_TOKENS.keys()),
+        default=None,
+        help="Override detector for dynamic retune capture. Defaults to --detector.",
+    )
+    parser.add_argument(
+        "--dynamic-reference-level-dbm",
+        type=float,
+        default=None,
+        help="Override display reference level for dynamic retune capture. Defaults to --reference-level-dbm.",
+    )
+    parser.add_argument(
+        "--dynamic-display-range-db",
+        type=float,
+        default=None,
+        help="Override display range for dynamic retune capture. Defaults to --display-range-db.",
+    )
+    parser.add_argument(
+        "--dynamic-intended-margin-hz",
+        type=float,
+        default=DEFAULT_DYNAMIC_INTENDED_MARGIN_HZ,
+        help="Half-width search margin around each intended dynamic retune frequency.",
+    )
+    parser.add_argument(
         "--uart-rtt-samples",
         type=int,
         default=16,
@@ -939,6 +1437,11 @@ def parse_args() -> argparse.Namespace:
         "--skip-sfdr-test",
         action="store_true",
         help="Skip the paused steady-state SFDR tone set even if it is present",
+    )
+    parser.add_argument(
+        "--skip-dynamic-sfdr-test",
+        action="store_true",
+        help="Skip the paused dynamic retune settling test even if it is present",
     )
     parser.add_argument(
         "--skip-throughput-test",
@@ -996,6 +1499,38 @@ def ensure_args(args: argparse.Namespace) -> None:
         raise SystemExit("--sfdr-stop-hz must be greater than --sfdr-start-hz")
     if args.sfdr_guard_hz <= 0:
         raise SystemExit("--sfdr-guard-hz must be greater than 0")
+    if any(item <= 0 for item in args.phase_noise_span_hz):
+        raise SystemExit("--phase-noise-span-hz values must be greater than 0")
+    if any(item <= 0 for item in args.phase_noise_offset_hz):
+        raise SystemExit("--phase-noise-offset-hz values must be greater than 0")
+    if any(item <= 0 for item in args.phase_noise_carrier_mhz):
+        raise SystemExit("--phase-noise-carrier-mhz values must be greater than 0")
+    if args.phase_noise_window_hz is not None and args.phase_noise_window_hz <= 0:
+        raise SystemExit("--phase-noise-window-hz must be greater than 0")
+    if args.phase_noise_sweep_count is not None and args.phase_noise_sweep_count < 1:
+        raise SystemExit("--phase-noise-sweep-count must be at least 1")
+    if args.dynamic_sweep_count is not None and args.dynamic_sweep_count < 1:
+        raise SystemExit("--dynamic-sweep-count must be at least 1")
+    if args.dynamic_intended_margin_hz <= 0:
+        raise SystemExit("--dynamic-intended-margin-hz must be greater than 0")
+    if args.phase_noise_span_hz or args.phase_noise_offset_hz:
+        if args.skip_sfdr_test:
+            raise SystemExit("Phase-noise capture requires the SFDR prompt to run")
+    elif any(
+        value is not None and value != []
+        for value in (
+            args.phase_noise_rbw_hz,
+            args.phase_noise_vbw_hz,
+            args.phase_noise_sweep_count,
+            args.phase_noise_trace_mode,
+            args.phase_noise_detector,
+            args.phase_noise_reference_level_dbm,
+            args.phase_noise_display_range_db,
+        )
+    ) or args.phase_noise_carrier_mhz or args.phase_noise_window_hz is not None:
+        raise SystemExit(
+            "Phase-noise overrides require at least one --phase-noise-span-hz or --phase-noise-offset-hz"
+        )
     if args.uart_rtt_samples < 1:
         raise SystemExit("--uart-rtt-samples must be at least 1")
 
@@ -1022,6 +1557,161 @@ def build_sfdr_settings(args: argparse.Namespace) -> SfdrSettings:
         search_stop_hz=args.sfdr_stop_hz,
         carrier_guard_hz=args.sfdr_guard_hz,
     )
+
+
+def build_phase_noise_settings(
+    args: argparse.Namespace,
+    base: AnalyzerSettings,
+) -> AnalyzerSettings:
+    return AnalyzerSettings(
+        rbw_hz=args.phase_noise_rbw_hz if args.phase_noise_rbw_hz is not None else base.rbw_hz,
+        vbw_hz=args.phase_noise_vbw_hz if args.phase_noise_vbw_hz is not None else base.vbw_hz,
+        sweep_count=args.phase_noise_sweep_count if args.phase_noise_sweep_count is not None else max(base.sweep_count, 10),
+        trace_mode=args.phase_noise_trace_mode if args.phase_noise_trace_mode is not None else "average",
+        detector=args.phase_noise_detector if args.phase_noise_detector is not None else "rms",
+        reference_level_dbm=(
+            args.phase_noise_reference_level_dbm
+            if args.phase_noise_reference_level_dbm is not None
+            else base.reference_level_dbm
+        ),
+        display_range_db=(
+            args.phase_noise_display_range_db
+            if args.phase_noise_display_range_db is not None
+            else base.display_range_db
+        ),
+        attenuation_auto=base.attenuation_auto,
+        preamp_on=base.preamp_on,
+        impedance_ohms=base.impedance_ohms,
+        capture_trace=True,
+    )
+
+
+def build_dynamic_settings(
+    args: argparse.Namespace,
+    base: AnalyzerSettings,
+) -> AnalyzerSettings:
+    return AnalyzerSettings(
+        rbw_hz=args.dynamic_rbw_hz if args.dynamic_rbw_hz is not None else base.rbw_hz,
+        vbw_hz=args.dynamic_vbw_hz if args.dynamic_vbw_hz is not None else base.vbw_hz,
+        sweep_count=args.dynamic_sweep_count if args.dynamic_sweep_count is not None else 1,
+        trace_mode=args.dynamic_trace_mode if args.dynamic_trace_mode is not None else "maxhold",
+        detector=args.dynamic_detector if args.dynamic_detector is not None else base.detector,
+        reference_level_dbm=(
+            args.dynamic_reference_level_dbm
+            if args.dynamic_reference_level_dbm is not None
+            else base.reference_level_dbm
+        ),
+        display_range_db=(
+            args.dynamic_display_range_db
+            if args.dynamic_display_range_db is not None
+            else base.display_range_db
+        ),
+        attenuation_auto=base.attenuation_auto,
+        preamp_on=base.preamp_on,
+        impedance_ohms=base.impedance_ohms,
+        capture_trace=False,
+    )
+
+
+def build_phase_noise_requests(args: argparse.Namespace) -> List[PhaseNoiseRequest]:
+    if not args.phase_noise_span_hz:
+        return []
+
+    carrier_mhz_values = args.phase_noise_carrier_mhz or [400.0]
+    requests: List[PhaseNoiseRequest] = []
+    next_index = 1
+    for carrier_mhz in carrier_mhz_values:
+        carrier_hz = carrier_mhz * 1e6
+        carrier_label = format_frequency_label_hz(carrier_hz)
+        for span_hz in args.phase_noise_span_hz:
+            span_label = format_frequency_label_hz(span_hz)
+            step = StepSpec(
+                group="phase_noise",
+                index=next_index,
+                name=f"phase_noise_{carrier_label}_span_{span_label}",
+                marker="",
+                description=(
+                    f"Close-in carrier trace at {carrier_mhz:g} MHz "
+                    f"with {span_hz:g} Hz span"
+                ),
+                expected_freq_hz=[carrier_hz],
+                span_hz=span_hz,
+                search_margin_hz=max(span_hz / 2.0, 1.0),
+            )
+            requests.append(
+                PhaseNoiseRequest(
+                    carrier_hz=carrier_hz,
+                    span_hz=span_hz,
+                    step_spec=step,
+                )
+            )
+            next_index += 1
+    return requests
+
+
+def build_phase_noise_offset_requests(
+    args: argparse.Namespace,
+    settings: AnalyzerSettings,
+) -> List[PhaseNoiseOffsetRequest]:
+    if not args.phase_noise_offset_hz:
+        return []
+
+    carrier_mhz_values = args.phase_noise_carrier_mhz or [400.0]
+    sideband_window_hz = (
+        args.phase_noise_window_hz
+        if args.phase_noise_window_hz is not None
+        else max(10.0 * settings.rbw_hz, 1_000.0)
+    )
+
+    requests: List[PhaseNoiseOffsetRequest] = []
+    next_index = 1
+    for carrier_mhz in carrier_mhz_values:
+        carrier_hz = carrier_mhz * 1e6
+        carrier_label = format_frequency_label_hz(carrier_hz)
+        for offset_hz in sorted(args.phase_noise_offset_hz):
+            offset_label = format_frequency_label_hz(offset_hz)
+            step = StepSpec(
+                group="phase_noise_offset",
+                index=next_index,
+                name=f"phase_noise_offset_{carrier_label}_{offset_label}",
+                marker="",
+                description=(
+                    f"Marker-only sideband sweep at {carrier_mhz:g} MHz "
+                    f"with {offset_hz:g} Hz offset"
+                ),
+                expected_freq_hz=[carrier_hz],
+                span_hz=sideband_window_hz,
+                search_margin_hz=max(sideband_window_hz / 2.0, 1.0),
+            )
+            requests.append(
+                PhaseNoiseOffsetRequest(
+                    carrier_hz=carrier_hz,
+                    offset_hz=offset_hz,
+                    sideband_window_hz=sideband_window_hz,
+                    step_spec=step,
+                )
+            )
+            next_index += 1
+    return requests
+
+
+def build_dynamic_specs(args: argparse.Namespace) -> List[DynamicRetuneSpec]:
+    specs: List[DynamicRetuneSpec] = []
+    for item in DYNAMIC_RETUNE_STEP_SPECS:
+        specs.append(
+            DynamicRetuneSpec(
+                index=item.index,
+                name=item.name,
+                marker=item.marker,
+                done_marker=item.done_marker,
+                description=item.description,
+                intended_freq_hz=list(item.intended_freq_hz),
+                dwell_ms=item.dwell_ms,
+                transitions=item.transitions,
+                intended_margin_hz=args.dynamic_intended_margin_hz,
+            )
+        )
+    return specs
 
 
 def advance_boot_defaults_or_wait_for_nco(
@@ -1137,7 +1827,13 @@ def capture_step_group(
         uart.wait_for(step.marker, timeout_s)
         uart.wait_for(CONTINUE_PROMPT, timeout_s)
 
-        trace_freqs_hz, trace_levels_dbm, metrics = analyzer.capture_trace(step, settings)
+        summary = capture_trace_step(
+            analyzer=analyzer,
+            output_dir=output_dir,
+            step=step,
+            settings=settings,
+        )
+        metrics = summary.metrics
 
         if reference_power_dbm is None:
             reference_power_dbm = metrics.power_dbm
@@ -1146,38 +1842,11 @@ def capture_step_group(
         metrics.reference_power_dbm = reference_power_dbm
         metrics.reference_step_name = reference_step_name
         metrics.power_delta_db = metrics.power_dbm - reference_power_dbm
-
-        csv_path = output_dir / f"step{step.index:02d}_{step.name}.csv"
-        json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
-        save_trace_csv(csv_path, trace_freqs_hz, trace_levels_dbm)
-        json_path.write_text(
-            json.dumps(
-                {
-                    "group": step.group,
-                    "step_index": step.index,
-                    "name": step.name,
-                    "marker": step.marker,
-                    "description": step.description,
-                    "expected_freq_hz": step.expected_freq_hz,
-                    "metrics": asdict(metrics),
-                    "analyzer_idn": analyzer.idn,
-                },
-                indent=2,
-                default=json_default,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-
-        summary = StepCaptureSummary(
-            group=step.group,
-            step_index=step.index,
-            name=step.name,
-            marker=step.marker,
-            description=step.description,
-            expected_freq_hz=step.expected_freq_hz,
-            csv_path=str(csv_path.resolve()),
-            metrics=metrics,
+        write_step_json(
+            output_dir / f"step{step.index:02d}_{step.name}.json",
+            analyzer.idn,
+            step,
+            metrics,
         )
         summaries.append(summary)
         print_step_summary(step, metrics)
@@ -1196,6 +1865,9 @@ def capture_sfdr_group(
     timeout_s: float,
     settings: AnalyzerSettings,
     sfdr_settings: SfdrSettings,
+    phase_noise_requests: Sequence[PhaseNoiseRequest],
+    phase_noise_offset_requests: Sequence[PhaseNoiseOffsetRequest],
+    phase_noise_settings: AnalyzerSettings,
 ) -> List[StepCaptureSummary]:
     summaries: List[StepCaptureSummary] = []
 
@@ -1214,24 +1886,12 @@ def capture_sfdr_group(
             f"worst_spur,{'' if metrics.spur_freq_hz is None else f'{metrics.spur_freq_hz:.6f}'},{'' if metrics.spur_power_dbm is None else f'{metrics.spur_power_dbm:.6f}'}\n",
             encoding="utf-8",
         )
-        json_path.write_text(
-            json.dumps(
-                {
-                    "group": step.group,
-                    "step_index": step.index,
-                    "name": step.name,
-                    "marker": step.marker,
-                    "description": step.description,
-                    "expected_freq_hz": step.expected_freq_hz,
-                    "metrics": asdict(metrics),
-                    "sfdr_settings": asdict(sfdr_settings),
-                    "analyzer_idn": analyzer.idn,
-                },
-                indent=2,
-                default=json_default,
-            )
-            + "\n",
-            encoding="utf-8",
+        write_step_json(
+            json_path,
+            analyzer.idn,
+            step,
+            metrics,
+            extra={"sfdr_settings": asdict(sfdr_settings)},
         )
 
         summary = StepCaptureSummary(
@@ -1246,7 +1906,420 @@ def capture_sfdr_group(
         )
         summaries.append(summary)
         print_step_summary(step, metrics)
+
+        matching_phase_noise = [
+            request
+            for request in phase_noise_requests
+            if abs(request.carrier_hz - step.expected_freq_hz[0]) <= 1.0
+        ]
+        for request in matching_phase_noise:
+            phase_summary = capture_trace_step(
+                analyzer=analyzer,
+                output_dir=output_dir,
+                step=request.step_spec,
+                settings=phase_noise_settings,
+            )
+            summaries.append(phase_summary)
+            print_step_summary(request.step_spec, phase_summary.metrics)
+
+        matching_phase_noise_offsets = [
+            request
+            for request in phase_noise_offset_requests
+            if abs(request.carrier_hz - step.expected_freq_hz[0]) <= 1.0
+        ]
+        for request in matching_phase_noise_offsets:
+            phase_offset_summary = capture_phase_noise_offset_step(
+                analyzer=analyzer,
+                output_dir=output_dir,
+                request=request,
+                settings=phase_noise_settings,
+                carrier_power_dbm=metrics.power_dbm,
+                carrier_freq_hz=metrics.power_freq_hz,
+            )
+            summaries.append(phase_offset_summary)
+            print_phase_noise_offset_summary(request, phase_offset_summary.metrics)
+
         uart.send_line()
+
+    uart.wait_for(done_marker, timeout_s)
+    return summaries
+
+
+def average_linear_power_dbm(powers_dbm: Sequence[Optional[float]]) -> Optional[float]:
+    usable = [item for item in powers_dbm if item is not None]
+    if not usable:
+        return None
+    linear_avg = sum(10.0 ** (item / 10.0) for item in usable) / float(len(usable))
+    return 10.0 * math.log10(linear_avg)
+
+
+def capture_phase_noise_offset_metrics(
+    analyzer: RohdeSchwarzFSH,
+    request: PhaseNoiseOffsetRequest,
+    settings: AnalyzerSettings,
+    carrier_power_dbm: float,
+    carrier_freq_hz: float,
+) -> PhaseNoiseOffsetMetrics:
+    half_window_hz = request.sideband_window_hz / 2.0
+    sidebands: List[WindowPeak] = []
+
+    for label, target_hz in (
+        ("left", carrier_freq_hz - request.offset_hz),
+        ("right", carrier_freq_hz + request.offset_hz),
+    ):
+        center_hz = target_hz
+        span_hz = max(request.sideband_window_hz, 1.0)
+        power_dbm, freq_hz = analyzer._capture_marker_at_frequency(
+            center_hz=center_hz,
+            span_hz=span_hz,
+            marker_hz=target_hz,
+            settings=settings,
+        )
+        sidebands.append(
+            WindowPeak(
+                label=label,
+                search_left_hz=target_hz - half_window_hz,
+                search_right_hz=target_hz + half_window_hz,
+                power_dbm=power_dbm,
+                freq_hz=freq_hz,
+            )
+        )
+
+    avg_sideband_power_dbm = average_linear_power_dbm(
+        [item.power_dbm for item in sidebands]
+    )
+    avg_sideband_dbc = None
+    avg_sideband_dbc_per_hz = None
+    if avg_sideband_power_dbm is not None:
+        avg_sideband_dbc = avg_sideband_power_dbm - carrier_power_dbm
+        avg_sideband_dbc_per_hz = avg_sideband_dbc - (10.0 * math.log10(max(settings.rbw_hz, 1.0)))
+
+    return PhaseNoiseOffsetMetrics(
+        carrier_power_dbm=carrier_power_dbm,
+        carrier_freq_hz=carrier_freq_hz,
+        offset_hz=request.offset_hz,
+        sideband_window_hz=request.sideband_window_hz,
+        rbw_hz=settings.rbw_hz,
+        vbw_hz=settings.vbw_hz,
+        sweep_count=settings.sweep_count,
+        trace_mode=settings.trace_mode,
+        detector=settings.detector,
+        reference_level_dbm=settings.reference_level_dbm,
+        display_range_db=settings.display_range_db,
+        attenuation_auto=settings.attenuation_auto,
+        preamp_on=settings.preamp_on,
+        impedance_ohms=settings.impedance_ohms,
+        sidebands=sidebands,
+        avg_sideband_power_dbm=avg_sideband_power_dbm,
+        avg_sideband_dbc=avg_sideband_dbc,
+        avg_sideband_dbc_per_hz=avg_sideband_dbc_per_hz,
+    )
+
+
+def capture_phase_noise_offset_step(
+    analyzer: RohdeSchwarzFSH,
+    output_dir: Path,
+    request: PhaseNoiseOffsetRequest,
+    settings: AnalyzerSettings,
+    carrier_power_dbm: float,
+    carrier_freq_hz: float,
+) -> StepCaptureSummary:
+    metrics = capture_phase_noise_offset_metrics(
+        analyzer=analyzer,
+        request=request,
+        settings=settings,
+        carrier_power_dbm=carrier_power_dbm,
+        carrier_freq_hz=carrier_freq_hz,
+    )
+    step = request.step_spec
+    csv_path = output_dir / f"step{step.index:02d}_{step.name}.csv"
+    json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
+
+    lines = ["label,target_left_hz,target_right_hz,measured_freq_hz,measured_power_dbm"]
+    for sideband in metrics.sidebands:
+        lines.append(
+            f"{sideband.label},"
+            f"{sideband.search_left_hz:.6f},"
+            f"{sideband.search_right_hz:.6f},"
+            f"{'' if sideband.freq_hz is None else f'{sideband.freq_hz:.6f}'},"
+            f"{'' if sideband.power_dbm is None else f'{sideband.power_dbm:.6f}'}"
+        )
+    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    json_path.write_text(
+        json.dumps(
+            {
+                "group": "phase_noise_offset",
+                "step_index": step.index,
+                "name": step.name,
+                "description": step.description,
+                "expected_freq_hz": step.expected_freq_hz,
+                "metrics": asdict(metrics),
+                "analyzer_idn": analyzer.idn,
+            },
+            indent=2,
+            default=json_default,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    return StepCaptureSummary(
+        group="phase_noise_offset",
+        step_index=step.index,
+        name=step.name,
+        marker=step.marker,
+        description=step.description,
+        expected_freq_hz=step.expected_freq_hz,
+        csv_path=str(csv_path.resolve()),
+        metrics=metrics,
+    )
+
+
+def print_phase_noise_offset_summary(
+    request: PhaseNoiseOffsetRequest,
+    metrics: PhaseNoiseOffsetMetrics,
+) -> None:
+    sideband_parts: List[str] = []
+    for item in metrics.sidebands:
+        if item.power_dbm is None or item.freq_hz is None:
+            sideband_parts.append(f"{item.label}=n/a")
+        else:
+            sideband_parts.append(
+                f"{item.label}={item.power_dbm:.3f} dBm @ {item.freq_hz / 1e6:.6f} MHz"
+            )
+
+    avg_text = "avg=n/a"
+    if metrics.avg_sideband_power_dbm is not None and metrics.avg_sideband_dbc is not None:
+        avg_text = f"avg={metrics.avg_sideband_power_dbm:.3f} dBm ({metrics.avg_sideband_dbc:.3f} dBc)"
+
+    density_text = "density=n/a"
+    if metrics.avg_sideband_dbc_per_hz is not None:
+        density_text = f"density={metrics.avg_sideband_dbc_per_hz:.3f} dBc/Hz"
+
+    print(
+        f"[HOST] {request.step_spec.name}: carrier={metrics.carrier_power_dbm:.3f} dBm @ "
+        f"{metrics.carrier_freq_hz / 1e6:.6f} MHz, offset={metrics.offset_hz:.0f} Hz, "
+        + ", ".join(sideband_parts)
+        + f", {avg_text}, {density_text}"
+    )
+
+
+def build_spur_search_windows(
+    expected_freq_hz: Sequence[float],
+    search_start_hz: float,
+    search_stop_hz: float,
+    guard_hz: float,
+) -> List[Tuple[str, float, float]]:
+    excluded: List[Tuple[float, float]] = []
+    for freq_hz in sorted(expected_freq_hz):
+        left_hz = max(search_start_hz, freq_hz - guard_hz)
+        right_hz = min(search_stop_hz, freq_hz + guard_hz)
+        if right_hz <= left_hz:
+            continue
+        excluded.append((left_hz, right_hz))
+
+    if not excluded:
+        return [("spur_window_1", search_start_hz, search_stop_hz)]
+
+    windows: List[Tuple[str, float, float]] = []
+    current_left_hz = search_start_hz
+    window_index = 1
+    for left_hz, right_hz in excluded:
+        if left_hz > current_left_hz:
+            windows.append((f"spur_window_{window_index}", current_left_hz, left_hz))
+            window_index += 1
+        current_left_hz = max(current_left_hz, right_hz)
+    if search_stop_hz > current_left_hz:
+        windows.append((f"spur_window_{window_index}", current_left_hz, search_stop_hz))
+    return windows
+
+
+def capture_dynamic_retune_metrics(
+    analyzer: RohdeSchwarzFSH,
+    step: DynamicRetuneSpec,
+    settings: AnalyzerSettings,
+    sfdr_settings: SfdrSettings,
+) -> DynamicRetuneMetrics:
+    exclusion_guard_hz = max(sfdr_settings.carrier_guard_hz, step.intended_margin_hz)
+    intended_peaks: List[WindowPeak] = []
+    for freq_hz in step.intended_freq_hz:
+        left_hz = max(sfdr_settings.search_start_hz, freq_hz - step.intended_margin_hz)
+        right_hz = min(sfdr_settings.search_stop_hz, freq_hz + step.intended_margin_hz)
+        center_hz = (left_hz + right_hz) / 2.0
+        span_hz = max(right_hz - left_hz, 1.0)
+        power_dbm, peak_freq_hz = analyzer._capture_peak_for_span(center_hz, span_hz, settings)
+        intended_peaks.append(
+            WindowPeak(
+                label=f"intended_{int(freq_hz / 1e6)}mhz",
+                search_left_hz=left_hz,
+                search_right_hz=right_hz,
+                power_dbm=power_dbm,
+                freq_hz=peak_freq_hz,
+            )
+        )
+
+    reference_power_dbm = None
+    reference_freq_hz = None
+    for peak in intended_peaks:
+        if peak.power_dbm is None or peak.freq_hz is None:
+            continue
+        if reference_power_dbm is None or peak.power_dbm > reference_power_dbm:
+            reference_power_dbm = peak.power_dbm
+            reference_freq_hz = peak.freq_hz
+
+    unintended_peaks: List[WindowPeak] = []
+    for label, left_hz, right_hz in build_spur_search_windows(
+        step.intended_freq_hz,
+        sfdr_settings.search_start_hz,
+        sfdr_settings.search_stop_hz,
+        exclusion_guard_hz,
+    ):
+        center_hz = (left_hz + right_hz) / 2.0
+        span_hz = max(right_hz - left_hz, 1.0)
+        power_dbm, peak_freq_hz = analyzer._capture_peak_for_span(center_hz, span_hz, settings)
+        unintended_peaks.append(
+            WindowPeak(
+                label=label,
+                search_left_hz=left_hz,
+                search_right_hz=right_hz,
+                power_dbm=power_dbm,
+                freq_hz=peak_freq_hz,
+            )
+        )
+
+    spur_power_dbm = None
+    spur_freq_hz = None
+    for peak in unintended_peaks:
+        if peak.power_dbm is None or peak.freq_hz is None:
+            continue
+        if spur_power_dbm is None or peak.power_dbm > spur_power_dbm:
+            spur_power_dbm = peak.power_dbm
+            spur_freq_hz = peak.freq_hz
+
+    dynamic_spur_margin_db = None
+    if reference_power_dbm is not None and spur_power_dbm is not None:
+        dynamic_spur_margin_db = reference_power_dbm - spur_power_dbm
+
+    return DynamicRetuneMetrics(
+        dwell_ms=step.dwell_ms,
+        transitions=step.transitions,
+        active_duration_ms=step.dwell_ms * step.transitions,
+        search_left_hz=sfdr_settings.search_start_hz,
+        search_right_hz=sfdr_settings.search_stop_hz,
+        carrier_guard_hz=exclusion_guard_hz,
+        intended_margin_hz=step.intended_margin_hz,
+        rbw_hz=settings.rbw_hz,
+        vbw_hz=settings.vbw_hz,
+        sweep_count=settings.sweep_count,
+        trace_mode=settings.trace_mode,
+        detector=settings.detector,
+        reference_level_dbm=settings.reference_level_dbm,
+        display_range_db=settings.display_range_db,
+        attenuation_auto=settings.attenuation_auto,
+        preamp_on=settings.preamp_on,
+        impedance_ohms=settings.impedance_ohms,
+        intended_peaks=intended_peaks,
+        unintended_peaks=unintended_peaks,
+        reference_power_dbm=reference_power_dbm,
+        reference_freq_hz=reference_freq_hz,
+        spur_power_dbm=spur_power_dbm,
+        spur_freq_hz=spur_freq_hz,
+        dynamic_spur_margin_db=dynamic_spur_margin_db,
+    )
+
+
+def print_dynamic_summary(step: DynamicRetuneSpec, metrics: DynamicRetuneMetrics) -> None:
+    intended_parts: List[str] = []
+    for peak in metrics.intended_peaks:
+        if peak.power_dbm is None or peak.freq_hz is None:
+            intended_parts.append(f"{peak.label}=n/a")
+            continue
+        intended_parts.append(
+            f"{peak.label}={peak.power_dbm:.3f} dBm @ {peak.freq_hz / 1e6:.6f} MHz"
+        )
+
+    spur_text = "spur=n/a"
+    if metrics.spur_power_dbm is not None and metrics.spur_freq_hz is not None:
+        spur_text = f"spur={metrics.spur_power_dbm:.3f} dBm @ {metrics.spur_freq_hz / 1e6:.6f} MHz"
+
+    margin_text = "margin=n/a"
+    if metrics.dynamic_spur_margin_db is not None:
+        margin_text = f"margin={metrics.dynamic_spur_margin_db:.3f} dB"
+
+    print(
+        f"[HOST] {step.name}: dwell_ms={metrics.dwell_ms}, "
+        f"transitions={metrics.transitions}, "
+        f"active_ms~={metrics.active_duration_ms}, "
+        + ", ".join(intended_parts)
+        + f", {spur_text}, {margin_text}"
+    )
+
+
+def capture_dynamic_sfdr_group(
+    uart: UartCoordinator,
+    analyzer: RohdeSchwarzFSH,
+    output_dir: Path,
+    step_specs: Sequence[DynamicRetuneSpec],
+    done_marker: str,
+    timeout_s: float,
+    settings: AnalyzerSettings,
+    sfdr_settings: SfdrSettings,
+) -> List[StepCaptureSummary]:
+    summaries: List[StepCaptureSummary] = []
+
+    for step in step_specs:
+        uart.wait_for(step.marker, timeout_s)
+        uart.wait_for(CONTINUE_PROMPT, timeout_s)
+        uart.send_line()
+
+        metrics = capture_dynamic_retune_metrics(analyzer, step, settings, sfdr_settings)
+        csv_path = output_dir / f"step{step.index:02d}_{step.name}.csv"
+        json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
+
+        lines = ["label,search_left_hz,search_right_hz,peak_freq_hz,peak_power_dbm"]
+        for peak in metrics.intended_peaks + metrics.unintended_peaks:
+            lines.append(
+                f"{peak.label},"
+                f"{peak.search_left_hz:.6f},"
+                f"{peak.search_right_hz:.6f},"
+                f"{'' if peak.freq_hz is None else f'{peak.freq_hz:.6f}'},"
+                f"{'' if peak.power_dbm is None else f'{peak.power_dbm:.6f}'}"
+            )
+        csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        json_path.write_text(
+            json.dumps(
+                {
+                    "group": "dynamic_sfdr",
+                    "step_index": step.index,
+                    "name": step.name,
+                    "marker": step.marker,
+                    "description": step.description,
+                    "intended_freq_hz": step.intended_freq_hz,
+                    "metrics": asdict(metrics),
+                    "sfdr_settings": asdict(sfdr_settings),
+                    "analyzer_idn": analyzer.idn,
+                },
+                indent=2,
+                default=json_default,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        summary = StepCaptureSummary(
+            group="dynamic_sfdr",
+            step_index=step.index,
+            name=step.name,
+            marker=step.marker,
+            description=step.description,
+            expected_freq_hz=list(step.intended_freq_hz),
+            csv_path=str(csv_path.resolve()),
+            metrics=metrics,
+        )
+        summaries.append(summary)
+        print_dynamic_summary(step, metrics)
+        uart.wait_for(step.done_marker, timeout_s)
 
     uart.wait_for(done_marker, timeout_s)
     return summaries
@@ -1374,6 +2447,118 @@ def write_sfdr_results_csv(steps: Sequence[StepCaptureSummary], output_path: Pat
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_phase_noise_results_csv(steps: Sequence[StepCaptureSummary], output_path: Path) -> None:
+    phase_steps = [step for step in steps if step.group == "phase_noise"]
+    if not phase_steps:
+        return
+
+    lines = [
+        "carrier_mhz,span_hz,peak_power_dbm,peak_freq_mhz,freq_error_hz,rbw_hz,vbw_hz,sweep_count,trace_points,trace_capture_degraded,trace_capture_error,csv_path"
+    ]
+    for step in sorted(
+        phase_steps,
+        key=lambda item: (item.expected_freq_hz[0], item.metrics.span_hz, item.step_index),
+    ):
+        metrics = step.metrics
+        expected_hz = step.expected_freq_hz[0]
+        freq_error_hz = metrics.power_freq_hz - expected_hz
+        lines.append(
+            f"{expected_hz / 1e6:.6f},"
+            f"{metrics.span_hz:.6f},"
+            f"{metrics.power_dbm:.6f},"
+            f"{metrics.power_freq_hz / 1e6:.6f},"
+            f"{freq_error_hz:.6f},"
+            f"{metrics.rbw_hz:.6f},"
+            f"{metrics.vbw_hz:.6f},"
+            f"{metrics.sweep_count},"
+            f"{metrics.trace_points},"
+            f"{str(metrics.trace_capture_degraded).lower()},"
+            f"\"{'' if metrics.trace_capture_error is None else metrics.trace_capture_error.replace('\"', '\"\"')}\","
+            f"{step.csv_path}"
+        )
+
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_phase_noise_offset_results_csv(steps: Sequence[StepCaptureSummary], output_path: Path) -> None:
+    phase_steps = [step for step in steps if step.group == "phase_noise_offset"]
+    if not phase_steps:
+        return
+
+    lines = [
+        "carrier_mhz,offset_hz,carrier_power_dbm,carrier_freq_mhz,left_power_dbm,left_freq_mhz,right_power_dbm,right_freq_mhz,avg_sideband_power_dbm,avg_sideband_dbc,avg_sideband_dbc_per_hz,csv_path"
+    ]
+    for step in sorted(
+        phase_steps,
+        key=lambda item: (item.expected_freq_hz[0], item.metrics.offset_hz, item.step_index),
+    ):
+        metrics = step.metrics
+        left = next((item for item in metrics.sidebands if item.label == "left"), None)
+        right = next((item for item in metrics.sidebands if item.label == "right"), None)
+        lines.append(
+            f"{step.expected_freq_hz[0] / 1e6:.6f},"
+            f"{metrics.offset_hz:.6f},"
+            f"{metrics.carrier_power_dbm:.6f},"
+            f"{metrics.carrier_freq_hz / 1e6:.6f},"
+            f"{'' if left is None or left.power_dbm is None else f'{left.power_dbm:.6f}'},"
+            f"{'' if left is None or left.freq_hz is None else f'{left.freq_hz / 1e6:.6f}'},"
+            f"{'' if right is None or right.power_dbm is None else f'{right.power_dbm:.6f}'},"
+            f"{'' if right is None or right.freq_hz is None else f'{right.freq_hz / 1e6:.6f}'},"
+            f"{'' if metrics.avg_sideband_power_dbm is None else f'{metrics.avg_sideband_power_dbm:.6f}'},"
+            f"{'' if metrics.avg_sideband_dbc is None else f'{metrics.avg_sideband_dbc:.6f}'},"
+            f"{'' if metrics.avg_sideband_dbc_per_hz is None else f'{metrics.avg_sideband_dbc_per_hz:.6f}'},"
+            f"{step.csv_path}"
+        )
+
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_dynamic_results_csv(steps: Sequence[StepCaptureSummary], output_path: Path) -> None:
+    dynamic_steps = [step for step in steps if step.group == "dynamic_sfdr"]
+    if not dynamic_steps:
+        return
+
+    lines = [
+        "name,dwell_ms,transitions,active_duration_ms,reference_power_dbm,reference_freq_mhz,spur_power_dbm,spur_freq_mhz,dynamic_spur_margin_db,csv_path"
+    ]
+    for step in sorted(dynamic_steps, key=lambda item: item.step_index):
+        metrics = step.metrics
+        lines.append(
+            f"{step.name},"
+            f"{metrics.dwell_ms},"
+            f"{metrics.transitions},"
+            f"{metrics.active_duration_ms},"
+            f"{'' if metrics.reference_power_dbm is None else f'{metrics.reference_power_dbm:.6f}'},"
+            f"{'' if metrics.reference_freq_hz is None else f'{metrics.reference_freq_hz / 1e6:.6f}'},"
+            f"{'' if metrics.spur_power_dbm is None else f'{metrics.spur_power_dbm:.6f}'},"
+            f"{'' if metrics.spur_freq_hz is None else f'{metrics.spur_freq_hz / 1e6:.6f}'},"
+            f"{'' if metrics.dynamic_spur_margin_db is None else f'{metrics.dynamic_spur_margin_db:.6f}'},"
+            f"{step.csv_path}"
+        )
+
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def require_prompt(
+    seen_prompt: Optional[str],
+    required_prompt: str,
+    feature_name: str,
+) -> None:
+    if seen_prompt == required_prompt:
+        return
+
+    if seen_prompt is None:
+        raise RuntimeError(
+            f"{feature_name} was enabled, but the firmware never reached the expected prompt "
+            f"'{required_prompt}'."
+        )
+
+    raise RuntimeError(
+        f"{feature_name} was enabled, but the firmware reached '{seen_prompt}' before "
+        f"'{required_prompt}'. The programmed image does not match the expected prompt flow."
+    )
+
+
 def main() -> int:
     args = parse_args()
     ensure_args(args)
@@ -1389,6 +2574,25 @@ def main() -> int:
     try:
         analyzer = RohdeSchwarzFSH(args.visa_resource, args.visa_backend, args.analyzer_timeout)
         print(f"[HOST] Analyzer connected: {analyzer.idn}")
+
+        analyzer_settings = build_analyzer_settings(args)
+        sfdr_settings = build_sfdr_settings(args)
+        phase_noise_requests = build_phase_noise_requests(args)
+        phase_noise_settings = build_phase_noise_settings(args, analyzer_settings)
+        phase_noise_offset_requests = build_phase_noise_offset_requests(args, phase_noise_settings)
+        dynamic_settings = build_dynamic_settings(args, analyzer_settings)
+        dynamic_specs = build_dynamic_specs(args)
+
+        trace_capture_flags: List[str] = []
+        if analyzer_settings.capture_trace:
+            trace_capture_flags.append("--capture-trace")
+        if phase_noise_requests:
+            trace_capture_flags.append("--phase-noise-span-hz")
+        if analyzer.legacy_firmware and trace_capture_flags:
+            raise SystemExit(
+                f"{analyzer.trace_capture_unsupported_message()} "
+                f"Requested option(s): {', '.join(trace_capture_flags)}."
+            )
 
         uart = UartCoordinator(
             port=args.serial_port,
@@ -1433,8 +2637,6 @@ def main() -> int:
             if not nco_prompt_consumed:
                 uart.wait_for(NCO_START_PROMPT, args.uart_timeout)
 
-        analyzer_settings = build_analyzer_settings(args)
-        sfdr_settings = build_sfdr_settings(args)
         steps: List[StepCaptureSummary] = []
         throughput_results: List[dict] = []
         uart_rtt_result = None
@@ -1464,6 +2666,7 @@ def main() -> int:
             args.uart_timeout,
             extra_needles=[
                 SFDR_START_PROMPT,
+                DYNAMIC_SFDR_START_PROMPT,
                 THROUGHPUT_START_PROMPT,
                 UART_RTT_START_PROMPT,
                 DDS_SWEEP_START_MARKER,
@@ -1492,6 +2695,7 @@ def main() -> int:
                 SFDR_START_PROMPT,
                 args.uart_timeout,
                 extra_needles=[
+                    DYNAMIC_SFDR_START_PROMPT,
                     THROUGHPUT_START_PROMPT,
                     UART_RTT_START_PROMPT,
                     DDS_SWEEP_START_MARKER,
@@ -1514,6 +2718,46 @@ def main() -> int:
                         done_marker=SFDR_DONE_MARKER,
                         timeout_s=args.uart_timeout,
                         settings=analyzer_settings,
+                        sfdr_settings=sfdr_settings,
+                        phase_noise_requests=phase_noise_requests,
+                        phase_noise_offset_requests=phase_noise_offset_requests,
+                        phase_noise_settings=phase_noise_settings,
+                    )
+                )
+            next_prompt = wait_for_optional_prompt(
+                uart,
+                DYNAMIC_SFDR_START_PROMPT,
+                args.uart_timeout,
+                extra_needles=[
+                    THROUGHPUT_START_PROMPT,
+                    UART_RTT_START_PROMPT,
+                    DDS_SWEEP_START_MARKER,
+                ],
+            )
+
+        if not args.skip_dynamic_sfdr_test:
+            require_prompt(
+                seen_prompt=next_prompt,
+                required_prompt=DYNAMIC_SFDR_START_PROMPT,
+                feature_name="Dynamic retune settling test",
+            )
+
+        if next_prompt == DYNAMIC_SFDR_START_PROMPT:
+            if args.skip_dynamic_sfdr_test:
+                uart.send_line("n")
+                print("[HOST] Dynamic retune settling test skipped by host option.")
+            else:
+                uart.send_line("y")
+                print("[HOST] Dynamic retune settling test started.")
+                steps.extend(
+                    capture_dynamic_sfdr_group(
+                        uart=uart,
+                        analyzer=analyzer,
+                        output_dir=output_dir,
+                        step_specs=dynamic_specs,
+                        done_marker=DYNAMIC_SFDR_DONE_MARKER,
+                        timeout_s=args.uart_timeout,
+                        settings=dynamic_settings,
                         sfdr_settings=sfdr_settings,
                     )
                 )
@@ -1578,6 +2822,31 @@ def main() -> int:
             "impedance_ohms": analyzer_settings.impedance_ohms,
             "capture_trace": analyzer_settings.capture_trace,
             "sfdr_settings": asdict(sfdr_settings),
+            "phase_noise": {
+                "enabled": bool(phase_noise_requests) or bool(phase_noise_offset_requests),
+                "carriers_mhz": sorted(
+                    {request.carrier_hz / 1e6 for request in phase_noise_requests}
+                    | {request.carrier_hz / 1e6 for request in phase_noise_offset_requests}
+                ),
+                "spans_hz": sorted({request.span_hz for request in phase_noise_requests}),
+                "settings": asdict(phase_noise_settings),
+            },
+            "phase_noise_offset": {
+                "enabled": bool(phase_noise_offset_requests),
+                "carriers_mhz": sorted({request.carrier_hz / 1e6 for request in phase_noise_offset_requests}),
+                "offsets_hz": sorted({request.offset_hz for request in phase_noise_offset_requests}),
+                "sideband_window_hz": (
+                    sorted({request.sideband_window_hz for request in phase_noise_offset_requests})
+                    if phase_noise_offset_requests
+                    else []
+                ),
+                "settings": asdict(phase_noise_settings),
+            },
+            "dynamic_sfdr": {
+                "enabled": not args.skip_dynamic_sfdr_test,
+                "steps": [asdict(item) for item in dynamic_specs],
+                "settings": asdict(dynamic_settings),
+            },
             "throughput": throughput_results,
             "uart_rtt": uart_rtt_result,
             "steps": steps,
@@ -1601,6 +2870,9 @@ def main() -> int:
 
         write_dds_band_artifacts(summary_path, output_dir, output_dir.name)
         write_sfdr_results_csv(steps, output_dir / "sfdr_results.csv")
+        write_phase_noise_results_csv(steps, output_dir / "phase_noise_results.csv")
+        write_phase_noise_offset_results_csv(steps, output_dir / "phase_noise_offset_results.csv")
+        write_dynamic_results_csv(steps, output_dir / "dynamic_sfdr_results.csv")
         print(f"[HOST] Capture complete. Artifacts written to: {output_dir}")
         return 0
     except Exception as exc:

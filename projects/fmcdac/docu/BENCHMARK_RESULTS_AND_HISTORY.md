@@ -1,6 +1,6 @@
 # Benchmark Results And History
 
-Date: 2026-04-02
+Date: 2026-04-05
 
 This note collects the measurement history that led to the current working
 conclusion.
@@ -94,7 +94,162 @@ Artifacts:
 4. [uart_rtt.json](../capture_runs/20260402T032626Z/uart_rtt.json)
 5. [uart.log](../capture_runs/20260402T032626Z/uart.log)
 
-This is the current primary baseline.
+This remains the current primary baseline and is frozen in
+[Baseline Freeze](./baseline_freeze/README.md).
+
+## Phase 3: Confirmation Runs (2026-04-04)
+
+### Steady-state SFDR confirmation: `sfdr_rerun`
+
+Artifacts:
+
+1. [summary.json](../capture_runs/sfdr_rerun/summary.json)
+2. [sfdr_results.csv](../capture_runs/sfdr_rerun/sfdr_results.csv)
+
+What it showed:
+
+1. the same dominant spur family reappeared at all eight carrier frequencies
+2. the steady-state SFDR values stayed close to the `20260402T032626Z`
+   baseline
+3. the current bench setup was stable enough to trust the steady-state SFDR
+   story as a real baseline
+
+Interpretation:
+
+1. steady-state SFDR is now trustworthy enough to use as a bench baseline
+2. the result is still far below the long-term target, so the main RF-quality
+   issue remains real
+3. the `50 MHz` spur near `729 MHz` is now repeatable, but still not fully
+   explained
+
+### Restart / latency confirmation: `boot_repeatability_20260404T165206Z`
+
+Artifacts:
+
+1. [boot_repeatability.json](../capture_runs/boot_repeatability_20260404T165206Z/boot_repeatability.json)
+2. [boot_repeatability.csv](../capture_runs/boot_repeatability_20260404T165206Z/boot_repeatability.csv)
+
+What it showed:
+
+1. all 5 cycles reached a clean final `SYSREF_STATUS`
+2. every cycle required `fixed_by_tune`
+3. all 5 cycles ended with the same latency signature:
+   `0x03/0x03/0x0A/0x0A`
+4. the aggregate verdict was `STABLE_AFTER_TUNE`
+
+Interpretation:
+
+1. restart behavior is repeatable after tune on the current build
+2. this is good enough to support the current working baseline
+3. it is not yet a "clean from init, no tune required" closure
+
+## Phase 4: Remaining-Blocker Runs (2026-04-05)
+
+### Marker-only phase-noise offset survey: `phase_noise_offset_400mhz` and `phase_noise_offset_400mhz_r2`
+
+Artifacts:
+
+1. [summary.json](../capture_runs/phase_noise_offset_400mhz/summary.json)
+2. [phase_noise_offset_results.csv](../capture_runs/phase_noise_offset_400mhz/phase_noise_offset_results.csv)
+
+What it showed:
+
+1. the new marker-only offset method works on the current FSH8 bench
+2. at `400 MHz`, the averaged sideband levels came out near:
+   - `-33.2 dBc/Hz` at `1 kHz`
+   - `-101.3 dBc/Hz` at `10 kHz`
+   - `-106.8 dBc/Hz` at `100 kHz`
+3. the confirmation rerun stayed within about `0.5 dB` at `10 kHz` and
+   `0.7 dB` at `100 kHz`
+
+Interpretation:
+
+1. the `10 kHz` and `100 kHz` points are usable as a preliminary offset survey
+2. the `1 kHz` point is too close to the carrier skirt to treat as trustworthy
+3. this closes "can the current bench produce reduced close-in offset data?"
+   for the current FSH8 bench
+4. it still does not close "do we have a full paper-grade phase-noise curve?"
+
+### Clean-from-init repeatability: `boot_repeatability_clean_init` and `boot_repeatability_clean_init_rerun`
+
+Artifacts:
+
+1. [boot_repeatability.json](../capture_runs/boot_repeatability_clean_init/boot_repeatability.json)
+2. [boot_repeatability.csv](../capture_runs/boot_repeatability_clean_init/boot_repeatability.csv)
+3. [boot_repeatability.json](../capture_runs/boot_repeatability_clean_init_rerun/boot_repeatability.json)
+4. [boot_repeatability.csv](../capture_runs/boot_repeatability_clean_init_rerun/boot_repeatability.csv)
+
+What it showed:
+
+1. direct pre-tune SYSREF and latency capture is now working
+2. valid cycles came up pre-tune with `SYSREF_STATUS = 0x00000003`
+3. those cycles required tune to reach clean post-tune `0x00000001`
+4. the latency signature was not fully deterministic across the run:
+   - `0x03/0x03/0x0A/0x0A`
+   - `0x02/0x02/0x0A/0x0A`
+5. the first clean-init run had a malformed cycle 1 and was repeated
+6. the replacement rerun captured a valid 5/5 table
+7. all 5 rerun cycles still required tune, and post-tune latency still split
+   across:
+   - `0x03/0x03/0x0A/0x0A`
+   - `0x02/0x02/0x0A/0x0A`
+
+Interpretation:
+
+1. the stronger clean-from-init claim is currently not supported
+2. the replacement rerun also weakens the stronger deterministic-after-tune
+   latency claim
+3. the current build is best described as "recovers cleanly after tune," not as
+   deterministic from init or deterministic after tune
+
+### Dynamic retune repetition: `dynamic_sfdr_run`, `dynamic_sfdr_run_r2`, `dynamic_sfdr_run_r3`, `dynamic_sfdr_run_r4`, `dynamic_sfdr_run_guard10mhz`, `dynamic_sfdr_run_guard10mhz_fixed`, `dynamic_sfdr_run_guard10mhz_fixed_r2`, `dynamic_sfdr_run_guard10mhz_fixed_r3`, `dynamic_sfdr_run_guard10mhz_fixed_r4`, `dynamic_sfdr_run_guard10mhz_fixed_r5`, and `dynamic_sfdr_run_guard10mhz_fixed_r6`
+
+Artifacts:
+
+1. [dynamic_sfdr_results.csv](../capture_runs/dynamic_sfdr_run/dynamic_sfdr_results.csv)
+2. [dynamic_sfdr_results.csv](../capture_runs/dynamic_sfdr_run_r2/dynamic_sfdr_results.csv)
+3. [dynamic_sfdr_results.csv](../capture_runs/dynamic_sfdr_run_r3/dynamic_sfdr_results.csv)
+4. [dynamic_sfdr_results.csv](../capture_runs/dynamic_sfdr_run_r4/dynamic_sfdr_results.csv)
+5. [dynamic_sfdr_results.csv](../capture_runs/dynamic_sfdr_run_guard10mhz/dynamic_sfdr_results.csv)
+6. [dynamic_sfdr_results.csv](../capture_runs/dynamic_sfdr_run_guard10mhz_fixed/dynamic_sfdr_results.csv)
+
+What they showed:
+
+1. the `2 MHz`-guard runs showed that the method worked mechanically, but
+   endpoint dominance was still sensitive to near-endpoint energy
+2. the first widened-guard attempt,
+   [`dynamic_sfdr_run_guard10mhz`](../capture_runs/dynamic_sfdr_run_guard10mhz/),
+   exposed a host-side overlap bug: the intended windows widened to `10 MHz`,
+   but the unintended spur search still excluded only `2 MHz`
+3. the corrected widened-guard run,
+   [`dynamic_sfdr_run_guard10mhz_fixed`](../capture_runs/dynamic_sfdr_run_guard10mhz_fixed/),
+   is the first valid widened-guard result:
+   - `1 ms` favored `100 MHz` with `18.9 dB` guarded margin
+   - `10 ms` favored `100 MHz` with `46.5 dB` guarded margin
+4. later corrected reruns remained split:
+   - `fixed_r2`: `1 ms -> 400 MHz / 40.6 dB`, `10 ms -> 400 MHz / 12.1 dB`
+   - `fixed_r3`: `1 ms -> 100 MHz / 45.4 dB`, `10 ms -> 400 MHz / 12.9 dB`
+   - `fixed_r4`: `1 ms -> 100 MHz / 45.7 dB`, `10 ms -> 100 MHz / 51.9 dB`
+   - `fixed_r5`: `1 ms -> 100 MHz / 48.6 dB`, `10 ms -> 100 MHz / 1.5 dB`
+   - `fixed_r6`: `1 ms -> 400 MHz / 40.4 dB`, `10 ms -> 100 MHz / 36.8 dB`
+5. before the widened-guard correction, the `10 ms` case had already remained
+   unsettled:
+   - first run favored `100 MHz` at `18.3 dB`
+   - second run favored `400 MHz` at `42.4 dB`
+   - third run favored `100 MHz` at `52.4 dB`
+   - fourth run favored `400 MHz` at `49.1 dB`
+
+Interpretation:
+
+1. the dynamic method is real and mechanically useful for exploratory work
+2. [`dynamic_sfdr_run_guard10mhz`](../capture_runs/dynamic_sfdr_run_guard10mhz/)
+   should be treated as a bug-finding run, not as final evidence
+3. the widened-guard bug is fixed, but the corrected method still does not
+   converge to one stable endpoint-dominance or margin story across repeated
+   reruns
+4. on the current asynchronous FSH8 max-hold bench, dynamic SFDR should
+   therefore be treated as closed with a non-repeatable result rather than left
+   pending for more blind repetitions
 
 ## DDS-Band Result Summary
 
@@ -154,8 +309,8 @@ Interpretation:
 Cautions:
 
 1. these values should still be treated as preliminary bench baselines
-2. analyzer setup, attenuation, and sweep choices can influence which spur is
-   detected as dominant
+2. the baseline is now supported by a confirmation rerun under fixed settings,
+   but not yet by a root-cause isolation campaign
 3. the `50 MHz` case in particular still deserves a sanity check because the
    reported worst spur near `729 MHz` is less obviously aligned with the simple
    harmonic pattern seen in the other rows
@@ -204,7 +359,19 @@ Interpretation:
 
 Across the current measurement history:
 
-1. the DDS-band "collapse" story has been effectively refuted by the FSH8
-2. throughput and UART latency baselines are now established
-3. SFDR is the active open metric
-4. NCO has become secondary to the main DDS evaluation path
+1. the DDS-band "collapse" story has been effectively refuted by the FSH8 and
+   is now frozen in the baseline-of-record
+2. throughput and UART latency baselines are established
+3. steady-state SFDR is now confirmed as a trustworthy bench baseline
+4. clean recovery after tune is repeatable, but deterministic latency after
+   tune is not yet closed
+5. the current FSH8 can now produce preliminary close-in offset data through
+   the marker-only phase-noise method
+6. clean-from-init behavior has now been tested directly and is currently a
+   negative result on this build
+7. dynamic retune evidence is now good enough to keep as an exploratory method,
+   but the corrected widened-guard reruns remain non-repeatable, so the current
+   bench does not support freezing a strong dynamic-settling claim
+8. channel skew/coherence remains open and out of scope on the single-input
+   FSH8
+9. NCO has become secondary to the main DDS evaluation path

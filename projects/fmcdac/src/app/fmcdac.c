@@ -175,12 +175,15 @@ static void fmcdac_ad9516_signature_toggle(struct fmcdac_dev *dev);
 static void fmcdac_ad9144_jesd_sanity(struct ad9144_dev *dev,
 				      const struct ad9144_init_param *init_param);
 static void fmcdac_sysref_verify(struct fmcdac_dev *dev);
+static void fmcdac_sysref_snapshot(struct fmcdac_dev *dev, const char *tag);
 static int fmcdac_sysref_tune(struct fmcdac_dev *dev);
 static void fmcdac_latency_readback(struct fmcdac_dev *dev);
+static void fmcdac_latency_readback_tag(struct fmcdac_dev *dev, const char *tag);
 static void fmcdac_phy_prbs_test(struct fmcdac_dev *dev);
 static int fmcdac_nco_discriminator_test(struct fmcdac_dev *dev);
 static int fmcdac_dds_band_diagnostic_test(struct fmcdac_dev *dev);
 static int fmcdac_sfdr_test(struct fmcdac_dev *dev);
+static int fmcdac_dynamic_sfdr_test(struct fmcdac_dev *dev);
 static int fmcdac_throughput_test(struct fmcdac_dev *dev);
 static void fmcdac_uart_rtt_service(void);
 static int fmcdac_read_line(char *buf, size_t len);
@@ -1153,6 +1156,28 @@ static uint32_t fmcdac_ops_per_second(uint32_t ops, uint64_t cycles)
 	return (uint32_t)(((uint64_t)ops * (uint64_t)FMCDAC_BENCH_TIMER_FREQ_HZ) / cycles);
 }
 
+static void fmcdac_delay_ms_precise(uint32_t delay_ms)
+{
+	uint64_t start_cycles;
+	uint64_t wait_cycles;
+
+	if (delay_ms == 0U)
+		return;
+
+	if (FMCDAC_BENCH_TIMER_FREQ_HZ == 0U || fmcdac_timer_init() != 0) {
+		no_os_mdelay(delay_ms);
+		return;
+	}
+
+	wait_cycles = ((uint64_t)delay_ms * (uint64_t)FMCDAC_BENCH_TIMER_FREQ_HZ) / 1000ULL;
+	if (wait_cycles == 0U)
+		wait_cycles = 1U;
+
+	start_cycles = fmcdac_timer_now_cycles();
+	while ((fmcdac_timer_now_cycles() - start_cycles) < wait_cycles)
+		;
+}
+
 
 static void fmcdac_ad9144_jesd_sanity(struct ad9144_dev *dev,
 				      const struct ad9144_init_param *init_param)
@@ -1386,6 +1411,34 @@ static void fmcdac_sysref_verify(struct fmcdac_dev *dev)
 	xil_printf("[SYSREF-VERIFY] Done.\n\r");
 }
 
+static void fmcdac_sysref_snapshot(struct fmcdac_dev *dev, const char *tag)
+{
+	uint8_t sysref_actrl0 = 0;
+	uint32_t tx_sysref_conf = 0;
+	uint32_t tx_sysref_status = 0;
+
+	if (!dev || !dev->ad9144_device || !tag)
+		return;
+
+	ad9144_spi_read(dev->ad9144_device, REG_SYSREF_ACTRL0, &sysref_actrl0);
+	tx_sysref_conf = Xil_In32(TX_JESD_BASEADDR + 0x100);
+	tx_sysref_status = Xil_In32(TX_JESD_BASEADDR + 0x108);
+
+	xil_printf("\n\r[%s] Snapshot before SYSREF tune:\n\r", tag);
+	xil_printf("[%s] SYSREF_ACTRL0 (0x081) = 0x%02X (PD_SYSREF=%u SYSREF_RISE=%u HYS_ON=%u)\n\r",
+		   tag,
+		   sysref_actrl0,
+		   !!(sysref_actrl0 & PD_SYSREF),
+		   !!(sysref_actrl0 & SYSREF_RISE),
+		   !!(sysref_actrl0 & HYS_ON));
+	xil_printf("[%s] TX SYSREF_CONF (0x100) = 0x%08lX (disabled=%lu)\n\r",
+		   tag,
+		   (unsigned long)tx_sysref_conf,
+		   (unsigned long)(tx_sysref_conf & 0x1));
+	xil_printf("[%s] TX SYSREF_STATUS (0x108) = 0x%08lX\n\r",
+		   tag, (unsigned long)tx_sysref_status);
+}
+
 /**
  * @brief Sweep SYSREF edge and LMFC offset to clear alignment error.
  *
@@ -1511,10 +1564,15 @@ done:
  */
 static void fmcdac_latency_readback(struct fmcdac_dev *dev)
 {
+	fmcdac_latency_readback_tag(dev, "LATENCY");
+}
+
+static void fmcdac_latency_readback_tag(struct fmcdac_dev *dev, const char *tag)
+{
 	uint8_t dyn0 = 0, dyn1 = 0;
 	uint8_t var0 = 0, var1 = 0;
 
-	if (!dev || !dev->ad9144_device)
+	if (!dev || !dev->ad9144_device || !tag)
 		return;
 
 	ad9144_spi_read(dev->ad9144_device, REG_DYN_LINK_LATENCY_0, &dyn0);
@@ -1522,8 +1580,8 @@ static void fmcdac_latency_readback(struct fmcdac_dev *dev)
 	ad9144_spi_read(dev->ad9144_device, REG_LMFC_VAR_0, &var0);
 	ad9144_spi_read(dev->ad9144_device, REG_LMFC_VAR_1, &var1);
 
-	xil_printf("[LATENCY] dyn0=0x%02X dyn1=0x%02X var0=0x%02X var1=0x%02X\n\r",
-		   dyn0, dyn1, var0, var1);
+	xil_printf("[%s] dyn0=0x%02X dyn1=0x%02X var0=0x%02X var1=0x%02X\n\r",
+		   tag, dyn0, dyn1, var0, var1);
 }
 
 /**
@@ -1863,6 +1921,54 @@ static int fmcdac_program_dds_pair(struct fmcdac_dev *dev, uint32_t freq_hz,
 			   (unsigned long)freq_hz,
 			   (long)scale_u,
 			   (unsigned long)phase);
+	}
+	axi_dac_dds_sync_commit(dev->ad9144_core);
+
+	return ret;
+}
+
+static int fmcdac_program_dds_pair_silent(struct fmcdac_dev *dev, uint32_t freq_hz,
+					      int32_t scale_u,
+					      uint32_t phase0_mdeg,
+					      uint32_t phase1_mdeg)
+{
+	int32_t ret = 0;
+	uint32_t ch;
+
+	if (!dev || !dev->ad9144_core)
+		return -1;
+
+	axi_dac_dds_sync_hold(dev->ad9144_core);
+	for (ch = 0; ch < dev->ad9144_core->num_channels && ch < 2; ch++) {
+		uint32_t tone0 = ch * 2;
+		uint32_t tone1 = tone0 + 1;
+		uint32_t phase = (ch == 0U) ? phase0_mdeg : phase1_mdeg;
+		int32_t tmp;
+
+		tmp = axi_dac_dds_set_frequency(dev->ad9144_core, tone0, freq_hz);
+		if (tmp < 0)
+			ret = tmp;
+		tmp = axi_dac_dds_set_frequency(dev->ad9144_core, tone1, 0);
+		if (tmp < 0)
+			ret = tmp;
+
+		tmp = axi_dac_dds_set_scale(dev->ad9144_core, tone0, scale_u);
+		if (tmp < 0)
+			ret = tmp;
+		tmp = axi_dac_dds_set_scale(dev->ad9144_core, tone1, 0);
+		if (tmp < 0)
+			ret = tmp;
+
+		tmp = axi_dac_dds_set_phase(dev->ad9144_core, tone0, phase);
+		if (tmp < 0)
+			ret = tmp;
+		tmp = axi_dac_dds_set_phase(dev->ad9144_core, tone1, 0);
+		if (tmp < 0)
+			ret = tmp;
+
+		tmp = axi_dac_set_datasel(dev->ad9144_core, ch, AXI_DAC_DATA_SEL_DDS);
+		if (tmp < 0)
+			ret = tmp;
 	}
 	axi_dac_dds_sync_commit(dev->ad9144_core);
 
@@ -2215,6 +2321,140 @@ static int fmcdac_sfdr_test(struct fmcdac_dev *dev)
 	}
 
 	xil_printf("[%s] Completed steady-state SFDR tone set.\n\r", tag);
+
+	return 0;
+}
+
+static int fmcdac_run_dynamic_toggle_burst(struct fmcdac_dev *dev,
+					       uint32_t start_freq_hz,
+					       uint32_t stop_freq_hz,
+					       int32_t scale_u,
+					       uint32_t dwell_ms,
+					       uint32_t transitions)
+{
+	uint32_t i;
+	int ret;
+
+	for (i = 0; i < transitions; i++) {
+		uint32_t freq_hz = ((i & 1U) == 0U) ? stop_freq_hz : start_freq_hz;
+
+		ret = fmcdac_program_dds_pair_silent(dev, freq_hz, scale_u, 0, 0);
+		if (ret != 0)
+			return ret;
+
+		fmcdac_delay_ms_precise(dwell_ms);
+	}
+
+	return fmcdac_program_dds_pair_silent(dev, stop_freq_hz, scale_u, 0, 0);
+}
+
+static int fmcdac_dynamic_sfdr_test(struct fmcdac_dev *dev)
+{
+	static const char *tag = "DYNAMIC-SFDR";
+	struct dynamic_case {
+		const char *name;
+		uint32_t start_freq_hz;
+		uint32_t stop_freq_hz;
+		uint32_t dwell_ms;
+		uint32_t transitions;
+	};
+	static const struct dynamic_case cases[] = {
+		{
+			.name = "toggle_100_to_400_1ms",
+			.start_freq_hz = 100000000U,
+			.stop_freq_hz = 400000000U,
+			.dwell_ms = 1U,
+			.transitions = 12000U,
+		},
+		{
+			.name = "toggle_100_to_400_10ms",
+			.start_freq_hz = 100000000U,
+			.stop_freq_hz = 400000000U,
+			.dwell_ms = 10U,
+			.transitions = 1200U,
+		},
+	};
+	const int32_t scale_u = 700000;
+	uint8_t interp_mode = 0;
+	uint32_t i;
+	int ret;
+
+	ret = fmcdac_prepare_dds_output(dev, tag);
+	if (ret != 0)
+		return ret;
+
+	ret = ad9144_set_nco(dev->ad9144_device, 0, 0);
+	if (ret != 0) {
+		xil_printf("[%s] Failed to disable NCO before dynamic test: %ld\n\r",
+			   tag, (long)ret);
+		return ret;
+	}
+
+	ad9144_spi_read(dev->ad9144_device, REG_INTERP_MODE, &interp_mode);
+	xil_printf("[%s] Dynamic retune settling test with NCO disabled.\n\r", tag);
+	xil_printf("[%s] Interpolation mode=0x%02X. Bursts toggle 100 MHz <-> 400 MHz while the analyzer measures live spectrum.\n\r",
+		   tag, interp_mode);
+	xil_printf("[%s] DDS scale fixed to %ld micro-units to match the steady-state SFDR baseline.\n\r",
+		   tag, (long)scale_u);
+
+	for (i = 0; i < NO_OS_ARRAY_SIZE(cases); i++) {
+		const struct dynamic_case *step = &cases[i];
+		uint32_t active_ms = step->dwell_ms * step->transitions;
+		uint64_t start_cycles;
+		uint64_t end_cycles;
+		uint32_t elapsed_us;
+
+		ret = fmcdac_program_dds_pair(dev, step->start_freq_hz, scale_u, 0, 0, tag);
+		if (ret != 0) {
+			xil_printf("[%s] Failed to establish starting tone for %s: %ld\n\r",
+				   tag, step->name, (long)ret);
+			return ret;
+		}
+
+		xil_printf("[%s] Step %lu/%lu: %s.\n\r",
+			   tag,
+			   (unsigned long)(i + 1U),
+			   (unsigned long)NO_OS_ARRAY_SIZE(cases),
+			   step->name);
+		xil_printf("[%s] start=%lu Hz stop=%lu Hz dwell_ms=%lu transitions=%lu active_ms~=%lu\n\r",
+			   tag,
+			   (unsigned long)step->start_freq_hz,
+			   (unsigned long)step->stop_freq_hz,
+			   (unsigned long)step->dwell_ms,
+			   (unsigned long)step->transitions,
+			   (unsigned long)active_ms);
+		xil_printf("[%s] Analyzer should measure intended peaks near 100/400 MHz and the strongest unintended spur during the burst.\n\r",
+			   tag);
+		fmcdac_wait_for_enter(tag, "Arm analyzer for the live retune burst.");
+
+		xil_printf("[%s] Burst %lu/%lu running now.\n\r",
+			   tag,
+			   (unsigned long)(i + 1U),
+			   (unsigned long)NO_OS_ARRAY_SIZE(cases));
+		start_cycles = fmcdac_timer_now_cycles();
+		ret = fmcdac_run_dynamic_toggle_burst(dev,
+						      step->start_freq_hz,
+						      step->stop_freq_hz,
+						      scale_u,
+						      step->dwell_ms,
+						      step->transitions);
+		end_cycles = fmcdac_timer_now_cycles();
+		if (ret != 0) {
+			xil_printf("[%s] Burst failed for %s: %ld\n\r",
+				   tag, step->name, (long)ret);
+			return ret;
+		}
+
+		elapsed_us = fmcdac_cycles_to_us(end_cycles - start_cycles);
+		xil_printf("[%s] Completed burst %lu/%lu. elapsed_us=%lu final_freq_hz=%lu\n\r",
+			   tag,
+			   (unsigned long)(i + 1U),
+			   (unsigned long)NO_OS_ARRAY_SIZE(cases),
+			   (unsigned long)elapsed_us,
+			   (unsigned long)step->stop_freq_hz);
+	}
+
+	xil_printf("[%s] Completed dynamic retune settling test.\n\r", tag);
 
 	return 0;
 }
@@ -2971,6 +3211,8 @@ skip_stpl_zero:
 	}
 
 	/* ===== Subclass 1 Diagnostics (after stable link + datapath PRBS) ===== */
+	fmcdac_sysref_snapshot(dev, "SYSREF-PRE");
+	fmcdac_latency_readback_tag(dev, "LATENCY-PRE");
 	fmcdac_sysref_tune(dev);
 	fmcdac_sysref_verify(dev);
 	fmcdac_latency_readback(dev);
@@ -3007,19 +3249,33 @@ skip_stpl_zero:
 			}
 		}
 
-		xil_printf("[SFDR-TEST] Run steady-state SFDR tone set at 50-400 MHz? [y/N]: ");
-		{
-			int run_sfdr = getc(stdin);
-			fmcdac_flush_input();
-			if (run_sfdr == 'y' || run_sfdr == 'Y') {
-				status = fmcdac_sfdr_test(dev);
-				if (status != 0)
-					xil_printf("[SFDR-TEST] Diagnostic setup failed: %d\n\r",
-						   status);
-			} else {
-				xil_printf("[SFDR-TEST] Skipped.\n\r");
-			}
+	xil_printf("[SFDR-TEST] Run steady-state SFDR tone set at 50-400 MHz? [y/N]: ");
+	{
+		int run_sfdr = getc(stdin);
+		fmcdac_flush_input();
+		if (run_sfdr == 'y' || run_sfdr == 'Y') {
+			status = fmcdac_sfdr_test(dev);
+			if (status != 0)
+				xil_printf("[SFDR-TEST] Diagnostic setup failed: %d\n\r",
+					   status);
+		} else {
+			xil_printf("[SFDR-TEST] Skipped.\n\r");
 		}
+	}
+
+	xil_printf("[DYNAMIC-SFDR] Run dynamic retune settling test? [y/N]: ");
+	{
+		int run_dynamic_sfdr = getc(stdin);
+		fmcdac_flush_input();
+		if (run_dynamic_sfdr == 'y' || run_dynamic_sfdr == 'Y') {
+			status = fmcdac_dynamic_sfdr_test(dev);
+			if (status != 0)
+				xil_printf("[DYNAMIC-SFDR] Diagnostic setup failed: %d\n\r",
+					   status);
+		} else {
+			xil_printf("[DYNAMIC-SFDR] Skipped.\n\r");
+		}
+	}
 
 		xil_printf("[THROUGHPUT] Run MicroBlaze throughput benchmark? [y/N]: ");
 		{

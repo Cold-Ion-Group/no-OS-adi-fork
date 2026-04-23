@@ -106,6 +106,7 @@ main()
     NCO tone test        — optional AD9144 on-chip NCO diagnostic
     DDS-band diagnostic  — 10 MHz, 100 MHz, 200 MHz, 230–330 MHz (paused, host-triggered)
     SFDR test            — 50–400 MHz in 50 MHz steps (paused, host-triggered)
+    Dynamic SFDR test    — 100 ↔ 400 MHz retune bursts at 1 ms / 10 ms dwell (paused, host-triggered)
     Throughput benchmark — AXI MMIO, SPI, DDS pair retune rates
     UART RTT service     — host ping/pong latency measurement
     DDS sweep            — 10 → 490 MHz in 10 MHz steps, 50 ms per tone
@@ -125,19 +126,28 @@ main()
 - Automated self-test suite: STPL (zero + pattern), PRBS-7, PRBS-15
 - 10–490 MHz frequency sweep (49 points, no link drops)
 - DDS-band amplitude validation via R&S FSH8 (10–330 MHz verified)
-- SFDR baseline via FSH8 (50–400 MHz, segmented spur search)
+- SFDR baseline via FSH8 (50–400 MHz, segmented spur search, confirmed by rerun)
 - Firmware throughput benchmarks (AXI MMIO: ~737K ops/s, SPI: ~6K ops/s, DDS: ~838 ops/s)
 - Host UART RTT baseline (~3.5 ms average round-trip)
+- Stable-after-tune restart behavior across 5 power cycles
 - Manifest-checked builds (`gen_manifest.ps1` tracks XSA + firmware commit)
-- Host automation via `run_nco_scope_test.py` (DDS-band, SFDR, throughput, UART RTT)
+- Host automation via `run_nco_scope_test.py` (DDS-band, SFDR, marker-only phase-noise offsets, dynamic retune bursts, throughput, UART RTT)
+- Host automation for restart/latency evidence via `capture_boot_repeatability.py`
 
 **Not yet validated:**
 
-- Deterministic latency across 5+ power cycles (infrastructure built, captures pending)
+- Clean-from-init deterministic latency without post-link tune
 - DMA waveform playback from DDR
 - JESD modes other than mode 4
 - Acceptance-grade SFDR (current baseline ~48–60 dBc, target ≥85 dBc)
-- Phase-noise measurement
+- Acceptance-grade phase-noise measurement
+  - current FSH8 `V1.58` firmware blocks scripted dense trace export
+  - marker-only offset measurements are the current reduced baseline
+- Dynamic SFDR / settling during rapid updates or chirps
+  - corrected widened-guard runs are mechanically valid but not repeatable on
+    the asynchronous FSH8 max-hold method
+- Channel skew / coherence evidence under simultaneous updates
+  - deferred while the bench only has a single-input FSH8
 - PHY-level PRBS (needs HDL changes for GTH raw PRBS generation)
 
 ## 7. Key Files
@@ -150,8 +160,17 @@ main()
 | `projects/fmcdac/docu/clock_architecture.md` | Clock tree reference (frequencies, SYSREF policy) |
 | `projects/fmcdac/docu/CURRENT_EVALUATION_STATUS.md` | Active evaluation status and latest baselines |
 | `projects/fmcdac/docu/BENCHMARK_RESULTS_AND_HISTORY.md` | Measurement history and run artifacts |
+| `projects/fmcdac/docu/baseline_freeze/README.md` | Frozen baseline-of-record and confirmation artifact links |
 
 ## 8. Forward Plan
+
+For the current measurement campaign, use this blocker-closure order first:
+
+1. FSH8 trace-export resolution for a dense phase-noise curve
+2. synchronized/gated dynamic settling capture if a strong retune claim is
+   still required
+3. defer channel skew / coherence until a multi-channel RF instrument is
+   available
 
 1. **SFDR refinement** — improve measurement confidence; determine how much of the
    current ~48–60 dBc baseline is converter/board vs bench configuration.

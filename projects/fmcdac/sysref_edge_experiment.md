@@ -2,10 +2,37 @@
 
 ## Summary
 
-Rising edge **must** be the AD9144 init default. Falling edge from init permanently
-bricks SYSREF alignment — the tune sweep cannot recover without a full power cycle.
+This note is now **historical evidence**, not the current policy authority.
 
-## Experiment (2026-02-20)
+What still holds:
+
+1. Rising edge must remain the AD9144 init default.
+2. Starting with falling edge from init was observed to brick alignment in the
+   2026-02-20 experiment below.
+
+What no longer holds as a current-project statement:
+
+1. "Tune should always skip on every boot."
+2. "Changing edge after DATA state cannot produce a clean runtime state on the
+   current build."
+
+Current boot evidence on the default `1966 MSPS, 2x interpolation` build
+captured in
+[`boot_repeatability_20260404T163827Z`](./capture_runs/boot_repeatability_20260404T163827Z/)
+shows a different runtime behavior:
+
+1. AD9144 still starts with rising-edge SYSREF.
+2. Every observed boot entered `fmcdac_sysref_tune()`.
+3. The tune converged immediately to `falling edge + offset 0`.
+4. The final FPGA `SYSREF_STATUS` was clean (`0x00000001`) on all 5 cycles.
+5. Two latency signatures were observed (`0x03/0x03/0x0A/0x0A` and
+   `0x04/0x04/0x0A/0x0A`), so deterministic latency is still open.
+
+Use this file as background on the "falling-from-init is bad" result only.
+For current runtime policy, use the current boot-repeatability artifacts and the
+live comments in `fmcdac.c`.
+
+## Historical Experiment (2026-02-20)
 
 ### Setup
 - AD9144 at 983 MSPS, JESD204B Mode 4, Subclass 1
@@ -41,8 +68,13 @@ to the FPGA TX LMFC. This phase offset is latched into the link during ILAS and
 cannot be corrected post-link-up — changing the capture edge after DATA state only
 affects future SYSREF detection, not the already-established LMFC phase relationship.
 
-### Resolution
+### Historical Resolution
 
 `SYSREF_RISE` (0x04) is hardcoded in both `ad9144_setup()` and
-`ad9144_setup_legacy()`. The tune sweep remains as a safety net but should
-report "No alignment error - skipping tune" on every boot.
+`ad9144_setup_legacy()`.
+
+That part is still correct.
+
+The older expectation that the tune sweep should always report
+"No alignment error - skipping tune" on every boot is no longer supported by
+the current 2026-04-04 boot-repeatability data.

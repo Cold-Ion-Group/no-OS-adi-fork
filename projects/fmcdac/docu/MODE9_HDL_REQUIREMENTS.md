@@ -1,5 +1,10 @@
 # JESD Mode 9: FPGA-Generated Signals Above 491 MHz
 
+> Historical note: this file is retained as architectural design history, not
+> current execution guidance. Current benchmarking and closure status live in
+> [STATUS_ONE_PAGER.md](./STATUS_ONE_PAGER.md) and
+> [CURRENT_EVALUATION_STATUS.md](./CURRENT_EVALUATION_STATUS.md).
+
 **Date**: 2026-04-02 (updated)
 **Status**: Architectural option — not currently in active development
 **Platform**: AD9144-FMC-EBZ on KCU116 (Kintex UltraScale XCKU5P)

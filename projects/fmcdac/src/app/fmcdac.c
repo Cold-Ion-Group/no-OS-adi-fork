@@ -77,6 +77,10 @@ static enum fmcdac_clock_mode g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
 #define FMCDAC_MANUAL_DEBUG_MODE 0
 #endif
 
+#ifndef FMCDAC_ENABLE_BENCHMARK_PROMPTS
+#define FMCDAC_ENABLE_BENCHMARK_PROMPTS 1
+#endif
+
 #ifndef FMCDAC_AWG_SCHED_BASEADDR
 #define FMCDAC_AWG_SCHED_BASEADDR 0U
 #endif
@@ -94,6 +98,7 @@ static enum fmcdac_clock_mode g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
 #endif
 
 static const int g_fmcdac_manual_debug_mode = (FMCDAC_MANUAL_DEBUG_MODE != 0);
+static const int g_fmcdac_enable_benchmark_prompts = (FMCDAC_ENABLE_BENCHMARK_PROMPTS != 0);
 
 static void fmcdac_flush_input(void);
 
@@ -188,6 +193,8 @@ static int fmcdac_throughput_test(struct fmcdac_dev *dev);
 static void fmcdac_uart_rtt_service(void);
 static int fmcdac_read_line(char *buf, size_t len);
 static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev);
+static void fmcdac_run_benchmark_prompt_flow(struct fmcdac_dev *dev);
+static int force_dds_tone(struct fmcdac_dev *dev);
 static int fmcdac_timer_init(void);
 static uint64_t fmcdac_timer_now_cycles(void);
 static uint32_t fmcdac_cycles_to_us(uint64_t cycles);
@@ -2002,8 +2009,8 @@ static void fmcdac_nco_readback(struct fmcdac_dev *dev, const char *tag)
 
 static void fmcdac_wait_for_enter(const char *tag, const char *message)
 {
-	if (!g_fmcdac_manual_debug_mode) {
-		xil_printf("[%s] Manual wait skipped (FMCDAC_MANUAL_DEBUG_MODE=0): %s\n\r",
+	if (!g_fmcdac_enable_benchmark_prompts) {
+		xil_printf("[%s] Benchmark wait skipped (FMCDAC_ENABLE_BENCHMARK_PROMPTS=0): %s\n\r",
 			   tag, message);
 		return;
 	}
@@ -2133,6 +2140,100 @@ static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev)
 	awg_sched_dump_artifacts(events, event_count, &sched_status);
 
 	return 0;
+}
+
+static void fmcdac_run_benchmark_prompt_flow(struct fmcdac_dev *dev)
+{
+	int status;
+
+	xil_printf("[BENCH] Interactive benchmark prompt flow enabled.\n\r");
+
+	xil_printf("[NCO-TEST] Run 10 MHz DDS + AD9144 NCO discriminator test? [y/N]: ");
+	{
+		int run_nco = getc(stdin);
+		fmcdac_flush_input();
+		if (run_nco == 'y' || run_nco == 'Y') {
+			status = fmcdac_nco_discriminator_test(dev);
+			if (status != 0)
+				xil_printf("[NCO-TEST] Diagnostic setup failed: %d\n\r",
+					   status);
+		} else {
+			xil_printf("[NCO-TEST] Skipped.\n\r");
+		}
+	}
+
+	xil_printf("[DDS-BAND] Run focused DDS sweep diagnostic around 230-330 MHz? [y/N]: ");
+	{
+		int run_dds_band = getc(stdin);
+		fmcdac_flush_input();
+		if (run_dds_band == 'y' || run_dds_band == 'Y') {
+			status = fmcdac_dds_band_diagnostic_test(dev);
+			if (status != 0)
+				xil_printf("[DDS-BAND] Diagnostic setup failed: %d\n\r",
+					   status);
+		} else {
+			xil_printf("[DDS-BAND] Skipped. Continuing to normal DDS sweep.\n\r");
+		}
+	}
+
+	xil_printf("[SFDR-TEST] Run steady-state SFDR tone set at 50-400 MHz? [y/N]: ");
+	{
+		int run_sfdr = getc(stdin);
+		fmcdac_flush_input();
+		if (run_sfdr == 'y' || run_sfdr == 'Y') {
+			status = fmcdac_sfdr_test(dev);
+			if (status != 0)
+				xil_printf("[SFDR-TEST] Diagnostic setup failed: %d\n\r",
+					   status);
+		} else {
+			xil_printf("[SFDR-TEST] Skipped.\n\r");
+		}
+	}
+
+	xil_printf("[DYNAMIC-SFDR] Run dynamic retune settling test? [y/N]: ");
+	{
+		int run_dynamic_sfdr = getc(stdin);
+		fmcdac_flush_input();
+		if (run_dynamic_sfdr == 'y' || run_dynamic_sfdr == 'Y') {
+			status = fmcdac_dynamic_sfdr_test(dev);
+			if (status != 0)
+				xil_printf("[DYNAMIC-SFDR] Diagnostic setup failed: %d\n\r",
+					   status);
+		} else {
+			xil_printf("[DYNAMIC-SFDR] Skipped.\n\r");
+		}
+	}
+
+	xil_printf("[THROUGHPUT] Run MicroBlaze throughput benchmark? [y/N]: ");
+	{
+		int run_throughput = getc(stdin);
+		fmcdac_flush_input();
+		if (run_throughput == 'y' || run_throughput == 'Y') {
+			status = fmcdac_throughput_test(dev);
+			if (status != 0)
+				xil_printf("[THROUGHPUT] Benchmark failed: %d\n\r",
+					   status);
+		} else {
+			xil_printf("[THROUGHPUT] Skipped.\n\r");
+		}
+	}
+
+	xil_printf("[UART-RTT] Run host UART round-trip benchmark? [y/N]: ");
+	{
+		int run_uart_rtt = getc(stdin);
+		fmcdac_flush_input();
+		if (run_uart_rtt == 'y' || run_uart_rtt == 'Y')
+			fmcdac_uart_rtt_service();
+		else
+			xil_printf("[UART-RTT] Skipped.\n\r");
+	}
+
+	if (g_fmcdac_manual_debug_mode) {
+		xil_printf("[MANUAL] FMCDAC_MANUAL_DEBUG_MODE=1; running manual DDS sweep after benchmarks.\n\r");
+		force_dds_tone(dev);
+	} else {
+		xil_printf("[MANUAL] FMCDAC_MANUAL_DEBUG_MODE=0; manual DDS sweep disabled after benchmarks.\n\r");
+	}
 }
 
 static int fmcdac_nco_discriminator_test(struct fmcdac_dev *dev)
@@ -3218,97 +3319,15 @@ skip_stpl_zero:
 	fmcdac_latency_readback(dev);
 	fmcdac_phy_prbs_test(dev);
 
-	if (g_fmcdac_manual_debug_mode) {
-		xil_printf("[MANUAL] FMCDAC_MANUAL_DEBUG_MODE=1; enabling interactive diagnostics.\n\r");
+	xil_printf("[SCHED-DET] Running scheduler path before benchmark prompts.\n\r");
+	status = fmcdac_run_scheduler_deterministic_path(dev);
+	if (status != 0)
+		xil_printf("[SCHED-DET] Deterministic scheduler path failed: %d\n\r", status);
 
-		xil_printf("[NCO-TEST] Run 10 MHz DDS + AD9144 NCO discriminator test? [y/N]: ");
-		{
-			int run_nco = getc(stdin);
-			fmcdac_flush_input();
-			if (run_nco == 'y' || run_nco == 'Y') {
-				status = fmcdac_nco_discriminator_test(dev);
-				if (status != 0)
-					xil_printf("[NCO-TEST] Diagnostic setup failed: %d\n\r",
-						   status);
-			} else {
-				xil_printf("[NCO-TEST] Skipped.\n\r");
-			}
-		}
-
-		xil_printf("[DDS-BAND] Run focused DDS sweep diagnostic around 230-330 MHz? [y/N]: ");
-		{
-			int run_dds_band = getc(stdin);
-			fmcdac_flush_input();
-			if (run_dds_band == 'y' || run_dds_band == 'Y') {
-				status = fmcdac_dds_band_diagnostic_test(dev);
-				if (status != 0)
-					xil_printf("[DDS-BAND] Diagnostic setup failed: %d\n\r",
-						   status);
-			} else {
-				xil_printf("[DDS-BAND] Skipped. Continuing to normal DDS sweep.\n\r");
-			}
-		}
-
-	xil_printf("[SFDR-TEST] Run steady-state SFDR tone set at 50-400 MHz? [y/N]: ");
-	{
-		int run_sfdr = getc(stdin);
-		fmcdac_flush_input();
-		if (run_sfdr == 'y' || run_sfdr == 'Y') {
-			status = fmcdac_sfdr_test(dev);
-			if (status != 0)
-				xil_printf("[SFDR-TEST] Diagnostic setup failed: %d\n\r",
-					   status);
-		} else {
-			xil_printf("[SFDR-TEST] Skipped.\n\r");
-		}
-	}
-
-	xil_printf("[DYNAMIC-SFDR] Run dynamic retune settling test? [y/N]: ");
-	{
-		int run_dynamic_sfdr = getc(stdin);
-		fmcdac_flush_input();
-		if (run_dynamic_sfdr == 'y' || run_dynamic_sfdr == 'Y') {
-			status = fmcdac_dynamic_sfdr_test(dev);
-			if (status != 0)
-				xil_printf("[DYNAMIC-SFDR] Diagnostic setup failed: %d\n\r",
-					   status);
-		} else {
-			xil_printf("[DYNAMIC-SFDR] Skipped.\n\r");
-		}
-	}
-
-		xil_printf("[THROUGHPUT] Run MicroBlaze throughput benchmark? [y/N]: ");
-		{
-			int run_throughput = getc(stdin);
-			fmcdac_flush_input();
-			if (run_throughput == 'y' || run_throughput == 'Y') {
-				status = fmcdac_throughput_test(dev);
-				if (status != 0)
-					xil_printf("[THROUGHPUT] Benchmark failed: %d\n\r",
-						   status);
-			} else {
-				xil_printf("[THROUGHPUT] Skipped.\n\r");
-			}
-		}
-
-		xil_printf("[UART-RTT] Run host UART round-trip benchmark? [y/N]: ");
-		{
-			int run_uart_rtt = getc(stdin);
-			fmcdac_flush_input();
-			if (run_uart_rtt == 'y' || run_uart_rtt == 'Y')
-				fmcdac_uart_rtt_service();
-			else
-				xil_printf("[UART-RTT] Skipped.\n\r");
-		}
-
-		/* Manual DDS tone test/sweep path */
-		force_dds_tone(dev);
-	} else {
-		xil_printf("[MANUAL] FMCDAC_MANUAL_DEBUG_MODE=0; interactive prompts and manual DDS sweep disabled.\n\r");
-		status = fmcdac_run_scheduler_deterministic_path(dev);
-		if (status != 0)
-			xil_printf("[SCHED-DET] Deterministic scheduler path failed: %d\n\r", status);
-	}
+	if (g_fmcdac_enable_benchmark_prompts)
+		fmcdac_run_benchmark_prompt_flow(dev);
+	else
+		xil_printf("[BENCH] FMCDAC_ENABLE_BENCHMARK_PROMPTS=0; benchmark prompts disabled.\n\r");
 
 	return test_errors ? -test_errors : 0;
 }

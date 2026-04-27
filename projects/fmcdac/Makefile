@@ -2,6 +2,11 @@ TINYIIOD ?= n
 HARDWARE := system_top.xsa
 include ../../tools/scripts/generic_variables.mk
 
+# On Windows, default to copying sources into the generated Xilinx app tree.
+# The generic build defaults to LINK_SRCS=y, which uses mklink and fails on
+# shells without symlink privilege, leaving build/app sources missing.
+LINK_SRCS := n
+
 include src.mk
 
 include ../../tools/scripts/generic.mk

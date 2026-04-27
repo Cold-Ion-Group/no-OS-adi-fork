@@ -537,6 +537,48 @@ class RohdeSchwarzFSH:
             "leave --capture-trace disabled, or upgrade the analyzer firmware."
         )
 
+    def apply_preset(self, preset_mode: str) -> None:
+        if preset_mode == "off":
+            return
+        if preset_mode == "system":
+            self._write("SYST:PRES")
+        elif preset_mode == "reset":
+            self._write("*RST")
+        else:
+            raise ValueError(f"Unsupported analyzer preset mode: {preset_mode}")
+        # Give the analyzer a brief settle interval after a global preset/reset.
+        time.sleep(1.0)
+        self._write("*CLS")
+
+    def _safe_query_text(self, command: str) -> dict:
+        try:
+            return {"ok": True, "value": self._query_text(command)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def readback_state(self) -> dict:
+        state = {
+            "idn": self.idn,
+            "firmware_major": self.firmware_major,
+            "legacy_firmware": self.legacy_firmware,
+            "queries": {},
+            "system_errors": self.query_system_errors(),
+        }
+        for command in (
+            "FREQ:CENT?",
+            "FREQ:SPAN?",
+            "BAND?",
+            "BAND:VID?",
+            "SWE:COUN?",
+            "DET?",
+            "DISP:TRAC:Y:RLEV?",
+            "INP:ATT:AUTO?",
+            "INP:GAIN:STAT?",
+            "UNIT:POW?",
+        ):
+            state["queries"][command] = self._safe_query_text(command)
+        return state
+
     def _wrap_io_error(self, exc: Exception) -> RuntimeError:
         return RuntimeError(f"Analyzer SCPI failed at '{self.last_io}': {exc}")
 
@@ -1097,13 +1139,20 @@ def capture_trace_step(
     output_dir: Path,
     step: StepSpec,
     settings: AnalyzerSettings,
+    dump_analyzer_state: bool = False,
 ) -> StepCaptureSummary:
     trace_freqs_hz, trace_levels_dbm, metrics = analyzer.capture_trace(step, settings)
 
     csv_path = output_dir / f"step{step.index:02d}_{step.name}.csv"
     json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
     save_trace_csv(csv_path, trace_freqs_hz, trace_levels_dbm)
-    write_step_json(json_path, analyzer.idn, step, metrics)
+    write_step_json(
+        json_path,
+        analyzer.idn,
+        step,
+        metrics,
+        extra=build_step_extra(analyzer, dump_analyzer_state),
+    )
 
     summary = StepCaptureSummary(
         group=step.group,
@@ -1122,7 +1171,7 @@ def write_step_json(
     path: Path,
     analyzer_idn: str,
     step: StepSpec,
-    metrics: SpectrumMetrics,
+    metrics: Any,
     extra: Optional[dict] = None,
 ) -> None:
     payload = {
@@ -1141,6 +1190,17 @@ def write_step_json(
         json.dumps(payload, indent=2, default=json_default) + "\n",
         encoding="utf-8",
     )
+
+
+def build_step_extra(
+    analyzer: RohdeSchwarzFSH,
+    dump_analyzer_state: bool,
+    extra: Optional[dict] = None,
+) -> dict:
+    payload = dict(extra or {})
+    if dump_analyzer_state:
+        payload["analyzer_state"] = analyzer.readback_state()
+    return payload
 
 
 def parse_args() -> argparse.Namespace:
@@ -1205,6 +1265,17 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=30.0,
         help="Analyzer VISA timeout in seconds",
+    )
+    parser.add_argument(
+        "--analyzer-preset",
+        choices=["off", "system", "reset"],
+        default="off",
+        help="Apply an analyzer-wide preset/reset after connect. Use for state-control debugging on FSH8.",
+    )
+    parser.add_argument(
+        "--dump-analyzer-state",
+        action="store_true",
+        help="Attach analyzer readback state and error queue snapshots to per-step JSON artifacts.",
     )
     parser.add_argument(
         "--make-timeout",
@@ -1818,6 +1889,7 @@ def capture_step_group(
     done_marker: str,
     timeout_s: float,
     settings: AnalyzerSettings,
+    dump_analyzer_state: bool = False,
 ) -> List[StepCaptureSummary]:
     summaries: List[StepCaptureSummary] = []
     reference_power_dbm: Optional[float] = None
@@ -1832,6 +1904,7 @@ def capture_step_group(
             output_dir=output_dir,
             step=step,
             settings=settings,
+            dump_analyzer_state=dump_analyzer_state,
         )
         metrics = summary.metrics
 
@@ -1868,6 +1941,7 @@ def capture_sfdr_group(
     phase_noise_requests: Sequence[PhaseNoiseRequest],
     phase_noise_offset_requests: Sequence[PhaseNoiseOffsetRequest],
     phase_noise_settings: AnalyzerSettings,
+    dump_analyzer_state: bool = False,
 ) -> List[StepCaptureSummary]:
     summaries: List[StepCaptureSummary] = []
 
@@ -1891,7 +1965,11 @@ def capture_sfdr_group(
             analyzer.idn,
             step,
             metrics,
-            extra={"sfdr_settings": asdict(sfdr_settings)},
+            extra=build_step_extra(
+                analyzer,
+                dump_analyzer_state,
+                {"sfdr_settings": asdict(sfdr_settings)},
+            ),
         )
 
         summary = StepCaptureSummary(
@@ -1918,6 +1996,7 @@ def capture_sfdr_group(
                 output_dir=output_dir,
                 step=request.step_spec,
                 settings=phase_noise_settings,
+                dump_analyzer_state=dump_analyzer_state,
             )
             summaries.append(phase_summary)
             print_step_summary(request.step_spec, phase_summary.metrics)
@@ -1935,6 +2014,7 @@ def capture_sfdr_group(
                 settings=phase_noise_settings,
                 carrier_power_dbm=metrics.power_dbm,
                 carrier_freq_hz=metrics.power_freq_hz,
+                dump_analyzer_state=dump_analyzer_state,
             )
             summaries.append(phase_offset_summary)
             print_phase_noise_offset_summary(request, phase_offset_summary.metrics)
@@ -2023,6 +2103,7 @@ def capture_phase_noise_offset_step(
     settings: AnalyzerSettings,
     carrier_power_dbm: float,
     carrier_freq_hz: float,
+    dump_analyzer_state: bool = False,
 ) -> StepCaptureSummary:
     metrics = capture_phase_noise_offset_metrics(
         analyzer=analyzer,
@@ -2046,22 +2127,12 @@ def capture_phase_noise_offset_step(
         )
     csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    json_path.write_text(
-        json.dumps(
-            {
-                "group": "phase_noise_offset",
-                "step_index": step.index,
-                "name": step.name,
-                "description": step.description,
-                "expected_freq_hz": step.expected_freq_hz,
-                "metrics": asdict(metrics),
-                "analyzer_idn": analyzer.idn,
-            },
-            indent=2,
-            default=json_default,
-        )
-        + "\n",
-        encoding="utf-8",
+    write_step_json(
+        json_path,
+        analyzer.idn,
+        step,
+        metrics,
+        extra=build_step_extra(analyzer, dump_analyzer_state),
     )
 
     return StepCaptureSummary(
@@ -2265,6 +2336,7 @@ def capture_dynamic_sfdr_group(
     timeout_s: float,
     settings: AnalyzerSettings,
     sfdr_settings: SfdrSettings,
+    dump_analyzer_state: bool = False,
 ) -> List[StepCaptureSummary]:
     summaries: List[StepCaptureSummary] = []
 
@@ -2287,24 +2359,25 @@ def capture_dynamic_sfdr_group(
                 f"{'' if peak.power_dbm is None else f'{peak.power_dbm:.6f}'}"
             )
         csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        json_path.write_text(
-            json.dumps(
-                {
-                    "group": "dynamic_sfdr",
-                    "step_index": step.index,
-                    "name": step.name,
-                    "marker": step.marker,
-                    "description": step.description,
-                    "intended_freq_hz": step.intended_freq_hz,
-                    "metrics": asdict(metrics),
-                    "sfdr_settings": asdict(sfdr_settings),
-                    "analyzer_idn": analyzer.idn,
-                },
-                indent=2,
-                default=json_default,
-            )
-            + "\n",
-            encoding="utf-8",
+        write_step_json(
+            json_path,
+            analyzer.idn,
+            StepSpec(
+                group="dynamic_sfdr",
+                index=step.index,
+                name=step.name,
+                marker=step.marker,
+                description=step.description,
+                expected_freq_hz=list(step.intended_freq_hz),
+                span_hz=max(sfdr_settings.search_stop_hz - sfdr_settings.search_start_hz, 1.0),
+                search_margin_hz=step.intended_margin_hz,
+            ),
+            metrics,
+            extra=build_step_extra(
+                analyzer,
+                dump_analyzer_state,
+                {"intended_freq_hz": step.intended_freq_hz, "sfdr_settings": asdict(sfdr_settings)},
+            ),
         )
 
         summary = StepCaptureSummary(
@@ -2574,6 +2647,10 @@ def main() -> int:
     try:
         analyzer = RohdeSchwarzFSH(args.visa_resource, args.visa_backend, args.analyzer_timeout)
         print(f"[HOST] Analyzer connected: {analyzer.idn}")
+        if args.analyzer_preset != "off":
+            print(f"[HOST] Applying analyzer preset: {args.analyzer_preset}")
+            analyzer.apply_preset(args.analyzer_preset)
+            print("[HOST] Analyzer preset complete.")
 
         analyzer_settings = build_analyzer_settings(args)
         sfdr_settings = build_sfdr_settings(args)
@@ -2657,6 +2734,7 @@ def main() -> int:
                     done_marker=NCO_DONE_MARKER,
                     timeout_s=args.uart_timeout,
                     settings=analyzer_settings,
+                    dump_analyzer_state=args.dump_analyzer_state,
                 )
             )
 
@@ -2688,6 +2766,7 @@ def main() -> int:
                         done_marker=DDS_BAND_DONE_MARKER,
                         timeout_s=args.uart_timeout,
                         settings=analyzer_settings,
+                        dump_analyzer_state=args.dump_analyzer_state,
                     )
                 )
             next_prompt = wait_for_optional_prompt(
@@ -2722,6 +2801,7 @@ def main() -> int:
                         phase_noise_requests=phase_noise_requests,
                         phase_noise_offset_requests=phase_noise_offset_requests,
                         phase_noise_settings=phase_noise_settings,
+                        dump_analyzer_state=args.dump_analyzer_state,
                     )
                 )
             next_prompt = wait_for_optional_prompt(
@@ -2759,6 +2839,7 @@ def main() -> int:
                         timeout_s=args.uart_timeout,
                         settings=dynamic_settings,
                         sfdr_settings=sfdr_settings,
+                        dump_analyzer_state=args.dump_analyzer_state,
                     )
                 )
             next_prompt = wait_for_optional_prompt(
@@ -2809,6 +2890,7 @@ def main() -> int:
         summary = {
             "timestamp_utc": utc_timestamp(),
             "analyzer_idn": analyzer.idn,
+            "analyzer_preset": args.analyzer_preset,
             "serial_port": args.serial_port,
             "rbw_hz": analyzer_settings.rbw_hz,
             "vbw_hz": analyzer_settings.vbw_hz,
@@ -2851,6 +2933,8 @@ def main() -> int:
             "uart_rtt": uart_rtt_result,
             "steps": steps,
         }
+        if args.dump_analyzer_state:
+            summary["final_analyzer_state"] = analyzer.readback_state()
         summary_path = output_dir / "summary.json"
         summary_path.write_text(
             json.dumps(summary, indent=2, default=json_default) + "\n",

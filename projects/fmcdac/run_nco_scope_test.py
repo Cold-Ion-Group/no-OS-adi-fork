@@ -19,6 +19,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import struct
 import subprocess
@@ -48,9 +49,9 @@ BOOT_RATE_PROMPT = "Available sampling rates:"
 NCO_START_PROMPT = "[NCO-TEST] Run 10 MHz DDS + AD9144 NCO discriminator test? [y/N]:"
 CONTINUE_PROMPT = "Press ENTER to continue..."
 NCO_DONE_MARKER = "[NCO-TEST] NCO disabled. Returning control to the DDS sweep."
-DDS_BAND_START_PROMPT = "[DDS-BAND] Run focused DDS sweep diagnostic around 230-330 MHz? [y/N]:"
+DDS_BAND_START_PROMPT = "[DDS-BAND] Run focused DDS sweep diagnostic"
 DDS_BAND_DONE_MARKER = "[DDS-BAND] Completed focused DDS band diagnostic. Returning to normal DDS sweep."
-SFDR_START_PROMPT = "[SFDR-TEST] Run steady-state SFDR tone set at 50-400 MHz? [y/N]:"
+SFDR_START_PROMPT = "[SFDR-TEST] Run steady-state SFDR tone set"
 SFDR_DONE_MARKER = "[SFDR-TEST] Completed steady-state SFDR tone set."
 DYNAMIC_SFDR_START_PROMPT = "[DYNAMIC-SFDR] Run dynamic retune settling test? [y/N]:"
 DYNAMIC_SFDR_DONE_MARKER = "[DYNAMIC-SFDR] Completed dynamic retune settling test."
@@ -60,6 +61,7 @@ UART_RTT_START_PROMPT = "[UART-RTT] Run host UART round-trip benchmark? [y/N]:"
 UART_RTT_READY_MARKER = "[UART-RTT] Ready. Send 'PING <token>' and wait for 'PONG <token>'. Send DONE to exit."
 UART_RTT_DONE_MARKER = "[UART-RTT] Done."
 DDS_SWEEP_START_MARKER = "[DDS] AXI DAC core:"
+AWG_SWEEP_START_PROMPT = "[AWG-SWEEP] Run AWG scheduler DDS sweep? [y/N]:"
 TRACE_MODE_TOKENS = {
     "write": "WRIT",
     "average": "AVER",
@@ -78,6 +80,33 @@ DEFAULT_SFDR_GUARD_HZ = 2_000_000.0
 DEFAULT_SFDR_MIN_SEARCH_HZ = 5_000_000.0
 DEFAULT_SFDR_MAX_SEARCH_HZ = 1_000_000_000.0
 DEFAULT_DYNAMIC_INTENDED_MARGIN_HZ = 2_000_000.0
+DEFAULT_BULK_PROMPT_DISABLE_STEP_THRESHOLD = 1000
+LEGACY_DDS_BAND_FREQS_HZ = [
+    10_000_000.0,
+    100_000_000.0,
+    200_000_000.0,
+    230_000_000.0,
+    240_000_000.0,
+    250_000_000.0,
+    260_000_000.0,
+    270_000_000.0,
+    280_000_000.0,
+    290_000_000.0,
+    300_000_000.0,
+    310_000_000.0,
+    320_000_000.0,
+    330_000_000.0,
+]
+LEGACY_SFDR_FREQS_HZ = [
+    50_000_000.0,
+    100_000_000.0,
+    150_000_000.0,
+    200_000_000.0,
+    250_000_000.0,
+    300_000_000.0,
+    350_000_000.0,
+    400_000_000.0,
+]
 
 
 @dataclass(frozen=True)
@@ -154,6 +183,13 @@ class DynamicRetuneSpec:
     dwell_ms: int
     transitions: int
     intended_margin_hz: float
+
+
+@dataclass(frozen=True)
+class SweepRange:
+    start_hz: float
+    stop_hz: float
+    step_hz: float
 
 
 @dataclass
@@ -299,33 +335,52 @@ NCO_STEP_SPECS = [
     ),
 ]
 
-DDS_BAND_STEP_SPECS = [
-    StepSpec("dds_band", 1, "dds_10mhz", "[DDS-BAND] Step 1/14: 10 MHz DDS tone.", "DDS reference at 10 MHz", [10_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("dds_band", 2, "dds_100mhz", "[DDS-BAND] Step 2/14: 100 MHz DDS tone.", "DDS reference at 100 MHz", [100_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("dds_band", 3, "dds_200mhz", "[DDS-BAND] Step 3/14: 200 MHz DDS tone.", "DDS reference at 200 MHz", [200_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("dds_band", 4, "dds_230mhz", "[DDS-BAND] Step 4/14: 230 MHz DDS tone.", "Pre-band checkpoint at 230 MHz", [230_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("dds_band", 5, "dds_240mhz", "[DDS-BAND] Step 5/14: 240 MHz DDS tone.", "Pre-band checkpoint at 240 MHz", [240_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("dds_band", 6, "dds_250mhz", "[DDS-BAND] Step 6/14: 250 MHz DDS tone.", "Approaching the reported droop region", [250_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("dds_band", 7, "dds_260mhz", "[DDS-BAND] Step 7/14: 260 MHz DDS tone.", "Start of the reported low-amplitude region", [260_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("dds_band", 8, "dds_270mhz", "[DDS-BAND] Step 8/14: 270 MHz DDS tone.", "Problem-band checkpoint at 270 MHz", [270_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("dds_band", 9, "dds_280mhz", "[DDS-BAND] Step 9/14: 280 MHz DDS tone.", "Problem-band checkpoint at 280 MHz", [280_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("dds_band", 10, "dds_290mhz", "[DDS-BAND] Step 10/14: 290 MHz DDS tone.", "Reported transition to no visible waveform", [290_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("dds_band", 11, "dds_300mhz", "[DDS-BAND] Step 11/14: 300 MHz DDS tone.", "Problem-band checkpoint at 300 MHz", [300_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("dds_band", 12, "dds_310mhz", "[DDS-BAND] Step 12/14: 310 MHz DDS tone.", "Problem-band checkpoint at 310 MHz", [310_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("dds_band", 13, "dds_320mhz", "[DDS-BAND] Step 13/14: 320 MHz DDS tone.", "Problem-band checkpoint at 320 MHz", [320_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("dds_band", 14, "dds_330mhz", "[DDS-BAND] Step 14/14: 330 MHz DDS tone.", "Problem-band checkpoint at 330 MHz", [330_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-]
+def format_step_freq_label(freq_hz: float) -> str:
+    mhz = freq_hz / 1_000_000.0
+    if abs(mhz - round(mhz)) < 1e-9:
+        return f"{int(round(mhz))} MHz"
+    khz = freq_hz / 1_000.0
+    if abs(khz - round(khz)) < 1e-6:
+        return f"{int(round(khz))} kHz"
+    return f"{freq_hz:.0f} Hz"
 
-SFDR_STEP_SPECS = [
-    StepSpec("sfdr", 1, "sfdr_50mhz", "[SFDR-TEST] Step 1/8: 50 MHz DDS tone.", "Steady-state SFDR carrier at 50 MHz", [50_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("sfdr", 2, "sfdr_100mhz", "[SFDR-TEST] Step 2/8: 100 MHz DDS tone.", "Steady-state SFDR carrier at 100 MHz", [100_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("sfdr", 3, "sfdr_150mhz", "[SFDR-TEST] Step 3/8: 150 MHz DDS tone.", "Steady-state SFDR carrier at 150 MHz", [150_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("sfdr", 4, "sfdr_200mhz", "[SFDR-TEST] Step 4/8: 200 MHz DDS tone.", "Steady-state SFDR carrier at 200 MHz", [200_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("sfdr", 5, "sfdr_250mhz", "[SFDR-TEST] Step 5/8: 250 MHz DDS tone.", "Steady-state SFDR carrier at 250 MHz", [250_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("sfdr", 6, "sfdr_300mhz", "[SFDR-TEST] Step 6/8: 300 MHz DDS tone.", "Steady-state SFDR carrier at 300 MHz", [300_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("sfdr", 7, "sfdr_350mhz", "[SFDR-TEST] Step 7/8: 350 MHz DDS tone.", "Steady-state SFDR carrier at 350 MHz", [350_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-    StepSpec("sfdr", 8, "sfdr_400mhz", "[SFDR-TEST] Step 8/8: 400 MHz DDS tone.", "Steady-state SFDR carrier at 400 MHz", [400_000_000.0], DEFAULT_DDS_SPAN_HZ, DEFAULT_DDS_SEARCH_MARGIN_HZ),
-]
+
+def format_step_freq_slug(freq_hz: float) -> str:
+    khz = int(round(freq_hz / 1_000.0))
+    if khz % 1000 == 0:
+        return f"{khz // 1000}mhz"
+    return f"{khz}khz"
+
+
+def build_uniform_freq_list(start_hz: float, stop_hz: float, step_hz: float) -> List[float]:
+    count = int(round((stop_hz - start_hz) / step_hz)) + 1
+    return [start_hz + (idx * step_hz) for idx in range(count)]
+
+
+def build_single_tone_step_specs(
+    group: str,
+    tag: str,
+    freqs_hz: Sequence[float],
+    description_prefix: str,
+) -> List[StepSpec]:
+    total = len(freqs_hz)
+    specs: List[StepSpec] = []
+    for index, freq_hz in enumerate(freqs_hz, start=1):
+        freq_label = format_step_freq_label(freq_hz)
+        freq_slug = format_step_freq_slug(freq_hz)
+        specs.append(
+            StepSpec(
+                group=group,
+                index=index,
+                name=f"{group}_{freq_slug}",
+                marker=f"[{tag}] Step {index}/{total}: {freq_label} DDS tone.",
+                description=f"{description_prefix} at {freq_label}",
+                expected_freq_hz=[freq_hz],
+                span_hz=DEFAULT_DDS_SPAN_HZ,
+                search_margin_hz=DEFAULT_DDS_SEARCH_MARGIN_HZ,
+            )
+        )
+    return specs
 
 DYNAMIC_RETUNE_STEP_SPECS = [
     DynamicRetuneSpec(
@@ -1140,19 +1195,21 @@ def capture_trace_step(
     step: StepSpec,
     settings: AnalyzerSettings,
     dump_analyzer_state: bool = False,
+    write_json: bool = True,
 ) -> StepCaptureSummary:
     trace_freqs_hz, trace_levels_dbm, metrics = analyzer.capture_trace(step, settings)
 
     csv_path = output_dir / f"step{step.index:02d}_{step.name}.csv"
     json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
     save_trace_csv(csv_path, trace_freqs_hz, trace_levels_dbm)
-    write_step_json(
-        json_path,
-        analyzer.idn,
-        step,
-        metrics,
-        extra=build_step_extra(analyzer, dump_analyzer_state),
-    )
+    if write_json:
+        write_step_json(
+            json_path,
+            analyzer.idn,
+            step,
+            metrics,
+            extra=build_step_extra(analyzer, dump_analyzer_state),
+        )
 
     summary = StepCaptureSummary(
         group=step.group,
@@ -1347,6 +1404,113 @@ def parse_args() -> argparse.Namespace:
         "--capture-trace",
         action="store_true",
         help="Also read back TRAC:DATA? TRACE1 for DDS-band and optional NCO steps. SFDR uses segmented marker sweeps to avoid FSH8 trace-transfer timeouts.",
+    )
+    parser.add_argument(
+        "--run-awg-sweep",
+        action="store_true",
+        help="Trigger the AWG scheduler DDS sweep prompt before DDS-band.",
+    )
+    parser.add_argument(
+        "--awg-sweep-start-hz",
+        type=float,
+        default=None,
+        help="AWG sweep start frequency in Hz (requires stop/step).",
+    )
+    parser.add_argument(
+        "--awg-sweep-stop-hz",
+        type=float,
+        default=None,
+        help="AWG sweep stop frequency in Hz (requires start/step).",
+    )
+    parser.add_argument(
+        "--awg-sweep-step-hz",
+        type=float,
+        default=None,
+        help="AWG sweep step frequency in Hz (requires start/stop).",
+    )
+    parser.add_argument(
+        "--awg-sweep-dwell-us",
+        type=int,
+        default=None,
+        help="AWG sweep dwell time per step in microseconds.",
+    )
+    parser.add_argument(
+        "--awg-sweep-scale-u",
+        type=int,
+        default=None,
+        help="AWG sweep DDS scale in micro-units (1.0=1_000_000).",
+    )
+    parser.add_argument(
+        "--awg-sweep-start-ticks",
+        type=int,
+        default=None,
+        help="AWG sweep start tick offset (scheduler ticks).",
+    )
+    parser.add_argument(
+        "--awg-sweep-tone",
+        type=int,
+        default=None,
+        help="AWG sweep tone index (usually 0).",
+    )
+    parser.add_argument(
+        "--awg-sched-baseaddr",
+        type=lambda text: int(text, 0),
+        default=None,
+        help="AWG scheduler base address (e.g. 0x44AA0000).",
+    )
+    parser.add_argument(
+        "--awg-sched-max-events",
+        type=int,
+        default=None,
+        help="Override AWG scheduler event depth in firmware.",
+    )
+    parser.add_argument(
+        "--awg-sched-tick-hz",
+        type=int,
+        default=None,
+        help="Override AWG scheduler tick rate used for dwell timing.",
+    )
+    parser.add_argument(
+        "--awg-sched-timeout-ms",
+        type=int,
+        default=None,
+        help="Override AWG scheduler done timeout in ms.",
+    )
+    parser.add_argument(
+        "--dds-band-sweep-start-hz",
+        type=float,
+        default=None,
+        help="Override the firmware DDS-band sweep start frequency in Hz. Requires stop and step too.",
+    )
+    parser.add_argument(
+        "--dds-band-sweep-stop-hz",
+        type=float,
+        default=None,
+        help="Override the firmware DDS-band sweep stop frequency in Hz. Requires start and step too.",
+    )
+    parser.add_argument(
+        "--dds-band-sweep-step-hz",
+        type=float,
+        default=None,
+        help="Override the firmware DDS-band sweep step in Hz. Requires start and stop too.",
+    )
+    parser.add_argument(
+        "--sfdr-sweep-start-hz",
+        type=float,
+        default=None,
+        help="Override the firmware steady-state SFDR sweep start frequency in Hz. Requires stop and step too.",
+    )
+    parser.add_argument(
+        "--sfdr-sweep-stop-hz",
+        type=float,
+        default=None,
+        help="Override the firmware steady-state SFDR sweep stop frequency in Hz. Requires start and step too.",
+    )
+    parser.add_argument(
+        "--sfdr-sweep-step-hz",
+        type=float,
+        default=None,
+        help="Override the firmware steady-state SFDR sweep step in Hz. Requires start and stop too.",
     )
     parser.add_argument(
         "--sfdr-start-hz",
@@ -1550,6 +1714,34 @@ def tristate_arg(value: str) -> Optional[bool]:
     return value == "on"
 
 
+def parse_optional_sweep_range(
+    start_hz: Optional[float],
+    stop_hz: Optional[float],
+    step_hz: Optional[float],
+    label: str,
+) -> Optional[SweepRange]:
+    values = (start_hz, stop_hz, step_hz)
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise SystemExit(f"{label} sweep override requires start, stop, and step together")
+    assert start_hz is not None
+    assert stop_hz is not None
+    assert step_hz is not None
+    if start_hz <= 0 or stop_hz <= 0 or step_hz <= 0:
+        raise SystemExit(f"{label} sweep start, stop, and step must all be greater than 0")
+    if stop_hz < start_hz:
+        raise SystemExit(f"{label} sweep stop must be greater than or equal to start")
+    span_hz = stop_hz - start_hz
+    steps_float = span_hz / step_hz
+    steps_rounded = round(steps_float)
+    if not math.isclose(steps_float, steps_rounded, rel_tol=0.0, abs_tol=1e-9):
+        raise SystemExit(f"{label} sweep range must land exactly on the stop frequency")
+    if int(steps_rounded) + 1 < 1:
+        raise SystemExit(f"{label} sweep must contain at least one point")
+    return SweepRange(start_hz=start_hz, stop_hz=stop_hz, step_hz=step_hz)
+
+
 def ensure_args(args: argparse.Namespace) -> None:
     if args.list_visa:
         resources = RohdeSchwarzFSH.list_resources(args.visa_backend)
@@ -1566,6 +1758,24 @@ def ensure_args(args: argparse.Namespace) -> None:
         raise SystemExit("--serial-port is required for coordinated UART + analyzer operation")
     if args.sweep_count < 1:
         raise SystemExit("--sweep-count must be at least 1")
+    parse_optional_sweep_range(
+        args.dds_band_sweep_start_hz,
+        args.dds_band_sweep_stop_hz,
+        args.dds_band_sweep_step_hz,
+        "DDS-band",
+    )
+    parse_optional_sweep_range(
+        args.sfdr_sweep_start_hz,
+        args.sfdr_sweep_stop_hz,
+        args.sfdr_sweep_step_hz,
+        "SFDR",
+    )
+    parse_optional_sweep_range(
+        args.awg_sweep_start_hz,
+        args.awg_sweep_stop_hz,
+        args.awg_sweep_step_hz,
+        "AWG-sweep",
+    )
     if args.sfdr_stop_hz <= args.sfdr_start_hz:
         raise SystemExit("--sfdr-stop-hz must be greater than --sfdr-start-hz")
     if args.sfdr_guard_hz <= 0:
@@ -1604,6 +1814,8 @@ def ensure_args(args: argparse.Namespace) -> None:
         )
     if args.uart_rtt_samples < 1:
         raise SystemExit("--uart-rtt-samples must be at least 1")
+    if args.awg_sched_baseaddr is not None and args.awg_sched_baseaddr < 0:
+        raise SystemExit("--awg-sched-baseaddr must be non-negative")
 
 
 def build_analyzer_settings(args: argparse.Namespace) -> AnalyzerSettings:
@@ -1628,6 +1840,119 @@ def build_sfdr_settings(args: argparse.Namespace) -> SfdrSettings:
         search_stop_hz=args.sfdr_stop_hz,
         carrier_guard_hz=args.sfdr_guard_hz,
     )
+
+
+def build_dds_band_step_specs(args: argparse.Namespace) -> List[StepSpec]:
+    custom = parse_optional_sweep_range(
+        args.dds_band_sweep_start_hz,
+        args.dds_band_sweep_stop_hz,
+        args.dds_band_sweep_step_hz,
+        "DDS-band",
+    )
+    freqs_hz = (
+        build_uniform_freq_list(custom.start_hz, custom.stop_hz, custom.step_hz)
+        if custom
+        else LEGACY_DDS_BAND_FREQS_HZ
+    )
+    return build_single_tone_step_specs(
+        group="dds_band",
+        tag="DDS-BAND",
+        freqs_hz=freqs_hz,
+        description_prefix="DDS-band tone",
+    )
+
+
+def build_sfdr_step_specs(args: argparse.Namespace) -> List[StepSpec]:
+    custom = parse_optional_sweep_range(
+        args.sfdr_sweep_start_hz,
+        args.sfdr_sweep_stop_hz,
+        args.sfdr_sweep_step_hz,
+        "SFDR",
+    )
+    freqs_hz = (
+        build_uniform_freq_list(custom.start_hz, custom.stop_hz, custom.step_hz)
+        if custom
+        else LEGACY_SFDR_FREQS_HZ
+    )
+    return build_single_tone_step_specs(
+        group="sfdr",
+        tag="SFDR-TEST",
+        freqs_hz=freqs_hz,
+        description_prefix="Steady-state SFDR carrier",
+    )
+
+
+def build_sweep_override_cflags(
+    args: argparse.Namespace,
+    benchmark_prompts_disabled: bool = False,
+) -> str:
+    defines: List[str] = []
+    dds_band = parse_optional_sweep_range(
+        args.dds_band_sweep_start_hz,
+        args.dds_band_sweep_stop_hz,
+        args.dds_band_sweep_step_hz,
+        "DDS-band",
+    )
+    sfdr = parse_optional_sweep_range(
+        args.sfdr_sweep_start_hz,
+        args.sfdr_sweep_stop_hz,
+        args.sfdr_sweep_step_hz,
+        "SFDR",
+    )
+    awg = parse_optional_sweep_range(
+        args.awg_sweep_start_hz,
+        args.awg_sweep_stop_hz,
+        args.awg_sweep_step_hz,
+        "AWG-sweep",
+    )
+    if dds_band:
+        defines.extend(
+            [
+                f"-DFMCDAC_DDS_BAND_SWEEP_START_HZ={int(round(dds_band.start_hz))}U",
+                f"-DFMCDAC_DDS_BAND_SWEEP_STOP_HZ={int(round(dds_band.stop_hz))}U",
+                f"-DFMCDAC_DDS_BAND_SWEEP_STEP_HZ={int(round(dds_band.step_hz))}U",
+            ]
+        )
+    if sfdr:
+        defines.extend(
+            [
+                f"-DFMCDAC_SFDR_SWEEP_START_HZ={int(round(sfdr.start_hz))}U",
+                f"-DFMCDAC_SFDR_SWEEP_STOP_HZ={int(round(sfdr.stop_hz))}U",
+                f"-DFMCDAC_SFDR_SWEEP_STEP_HZ={int(round(sfdr.step_hz))}U",
+            ]
+        )
+    if awg:
+        defines.extend(
+            [
+                f"-DFMCDAC_AWG_SWEEP_START_HZ={int(round(awg.start_hz))}U",
+                f"-DFMCDAC_AWG_SWEEP_STOP_HZ={int(round(awg.stop_hz))}U",
+                f"-DFMCDAC_AWG_SWEEP_STEP_HZ={int(round(awg.step_hz))}U",
+                "-DFMCDAC_ENABLE_AWG_SWEEP_PROMPT=1",
+            ]
+        )
+    if args.awg_sweep_dwell_us is not None:
+        defines.append(f"-DFMCDAC_AWG_SWEEP_DWELL_US={args.awg_sweep_dwell_us}U")
+    if args.awg_sweep_scale_u is not None:
+        defines.append(f"-DFMCDAC_AWG_SWEEP_SCALE_U={args.awg_sweep_scale_u}")
+    if args.awg_sweep_start_ticks is not None:
+        defines.append(f"-DFMCDAC_AWG_SWEEP_START_TICKS={args.awg_sweep_start_ticks}U")
+    if args.awg_sweep_tone is not None:
+        defines.append(f"-DFMCDAC_AWG_SWEEP_TONE={args.awg_sweep_tone}U")
+    if args.awg_sched_baseaddr is not None:
+        defines.append(f"-DFMCDAC_AWG_SCHED_BASEADDR=0x{args.awg_sched_baseaddr:X}U")
+    if args.awg_sched_max_events is not None:
+        defines.append(f"-DFMCDAC_AWG_SCHED_MAX_EVENTS={args.awg_sched_max_events}U")
+    if args.awg_sched_tick_hz is not None:
+        defines.append(f"-DFMCDAC_AWG_SCHED_TICK_HZ={args.awg_sched_tick_hz}U")
+    if args.awg_sched_timeout_ms is not None:
+        defines.append(f"-DFMCDAC_AWG_SCHED_DONE_TIMEOUT_MS={args.awg_sched_timeout_ms}U")
+    if args.run_awg_sweep:
+        defines.append("-DFMCDAC_ENABLE_AWG_SWEEP_PROMPT=1")
+    if benchmark_prompts_disabled:
+        defines.append("-DFMCDAC_ENABLE_BENCHMARK_PROMPTS=0")
+    if not defines:
+        return ""
+    return " ".join(defines)
 
 
 def build_phase_noise_settings(
@@ -1833,12 +2158,29 @@ def resolve_xilinx_settings(args: argparse.Namespace) -> List[Path]:
     return [Path(item) for item in args.xilinx_settings]
 
 
-def build_make_run_command(settings_files: List[Path], make_args: str) -> str:
+def build_make_run_command(
+    settings_files: List[Path],
+    make_args: str,
+    update_first: bool = False,
+    clean_first: bool = False,
+) -> str:
     parts: List[str] = []
     for item in settings_files:
         if not item.is_file():
             raise RuntimeError(f"Xilinx settings file not found: {item}")
         parts.append(f'call "{item}"')
+
+    if update_first:
+        update_command = "make update"
+        if make_args.strip():
+            update_command += f" {make_args.strip()}"
+        parts.append(update_command)
+
+    if clean_first:
+        clean_command = "make clean"
+        if make_args.strip():
+            clean_command += f" {make_args.strip()}"
+        parts.append(clean_command)
 
     make_command = "make run"
     if make_args.strip():
@@ -1847,20 +2189,36 @@ def build_make_run_command(settings_files: List[Path], make_args: str) -> str:
     return " && ".join(parts)
 
 
+def combine_make_args(*items: str) -> str:
+    return " ".join(item.strip() for item in items if item and item.strip())
+
+
 def run_make_run(
     project_dir: Path,
     uart: UartCoordinator,
     timeout_s: float,
     settings_files: List[Path],
     make_args: str,
+    extra_env: Optional[dict[str, str]] = None,
+    update_first: bool = False,
+    clean_first: bool = False,
 ) -> None:
-    command = build_make_run_command(settings_files, make_args)
+    command = build_make_run_command(
+        settings_files,
+        make_args,
+        update_first=update_first,
+        clean_first=clean_first,
+    )
     escaped_command = command.replace('"', '""')
     command_line = f'cmd.exe /d /c "{escaped_command}"'
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     try:
         proc = subprocess.Popen(
             command_line,
             cwd=str(project_dir),
+            env=env,
         )
     except FileNotFoundError as exc:  # pragma: no cover - Windows-specific
         raise RuntimeError("Could not find 'cmd.exe' or 'make' in PATH") from exc
@@ -1889,6 +2247,7 @@ def capture_step_group(
     done_marker: str,
     timeout_s: float,
     settings: AnalyzerSettings,
+    benchmark_prompts_enabled: bool,
     dump_analyzer_state: bool = False,
 ) -> List[StepCaptureSummary]:
     summaries: List[StepCaptureSummary] = []
@@ -1897,7 +2256,8 @@ def capture_step_group(
 
     for step in step_specs:
         uart.wait_for(step.marker, timeout_s)
-        uart.wait_for(CONTINUE_PROMPT, timeout_s)
+        if benchmark_prompts_enabled:
+            uart.wait_for(CONTINUE_PROMPT, timeout_s)
 
         summary = capture_trace_step(
             analyzer=analyzer,
@@ -1905,6 +2265,7 @@ def capture_step_group(
             step=step,
             settings=settings,
             dump_analyzer_state=dump_analyzer_state,
+            write_json=dump_analyzer_state,
         )
         metrics = summary.metrics
 
@@ -1915,12 +2276,6 @@ def capture_step_group(
         metrics.reference_power_dbm = reference_power_dbm
         metrics.reference_step_name = reference_step_name
         metrics.power_delta_db = metrics.power_dbm - reference_power_dbm
-        write_step_json(
-            output_dir / f"step{step.index:02d}_{step.name}.json",
-            analyzer.idn,
-            step,
-            metrics,
-        )
         summaries.append(summary)
         print_step_summary(step, metrics)
         uart.send_line()
@@ -1941,13 +2296,15 @@ def capture_sfdr_group(
     phase_noise_requests: Sequence[PhaseNoiseRequest],
     phase_noise_offset_requests: Sequence[PhaseNoiseOffsetRequest],
     phase_noise_settings: AnalyzerSettings,
+    benchmark_prompts_enabled: bool,
     dump_analyzer_state: bool = False,
 ) -> List[StepCaptureSummary]:
     summaries: List[StepCaptureSummary] = []
 
     for step in step_specs:
         uart.wait_for(step.marker, timeout_s)
-        uart.wait_for(CONTINUE_PROMPT, timeout_s)
+        if benchmark_prompts_enabled:
+            uart.wait_for(CONTINUE_PROMPT, timeout_s)
 
         metrics = analyzer.capture_sfdr(step, settings, sfdr_settings)
         json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
@@ -1960,17 +2317,18 @@ def capture_sfdr_group(
             f"worst_spur,{'' if metrics.spur_freq_hz is None else f'{metrics.spur_freq_hz:.6f}'},{'' if metrics.spur_power_dbm is None else f'{metrics.spur_power_dbm:.6f}'}\n",
             encoding="utf-8",
         )
-        write_step_json(
-            json_path,
-            analyzer.idn,
-            step,
-            metrics,
-            extra=build_step_extra(
-                analyzer,
-                dump_analyzer_state,
-                {"sfdr_settings": asdict(sfdr_settings)},
-            ),
-        )
+        if dump_analyzer_state:
+            write_step_json(
+                json_path,
+                analyzer.idn,
+                step,
+                metrics,
+                extra=build_step_extra(
+                    analyzer,
+                    dump_analyzer_state,
+                    {"sfdr_settings": asdict(sfdr_settings)},
+                ),
+            )
 
         summary = StepCaptureSummary(
             group=step.group,
@@ -1997,6 +2355,7 @@ def capture_sfdr_group(
                 step=request.step_spec,
                 settings=phase_noise_settings,
                 dump_analyzer_state=dump_analyzer_state,
+                write_json=dump_analyzer_state,
             )
             summaries.append(phase_summary)
             print_step_summary(request.step_spec, phase_summary.metrics)
@@ -2336,13 +2695,15 @@ def capture_dynamic_sfdr_group(
     timeout_s: float,
     settings: AnalyzerSettings,
     sfdr_settings: SfdrSettings,
+    benchmark_prompts_enabled: bool,
     dump_analyzer_state: bool = False,
 ) -> List[StepCaptureSummary]:
     summaries: List[StepCaptureSummary] = []
 
     for step in step_specs:
         uart.wait_for(step.marker, timeout_s)
-        uart.wait_for(CONTINUE_PROMPT, timeout_s)
+        if benchmark_prompts_enabled:
+            uart.wait_for(CONTINUE_PROMPT, timeout_s)
         uart.send_line()
 
         metrics = capture_dynamic_retune_metrics(analyzer, step, settings, sfdr_settings)
@@ -2359,26 +2720,27 @@ def capture_dynamic_sfdr_group(
                 f"{'' if peak.power_dbm is None else f'{peak.power_dbm:.6f}'}"
             )
         csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        write_step_json(
-            json_path,
-            analyzer.idn,
-            StepSpec(
-                group="dynamic_sfdr",
-                index=step.index,
-                name=step.name,
-                marker=step.marker,
-                description=step.description,
-                expected_freq_hz=list(step.intended_freq_hz),
-                span_hz=max(sfdr_settings.search_stop_hz - sfdr_settings.search_start_hz, 1.0),
-                search_margin_hz=step.intended_margin_hz,
-            ),
-            metrics,
-            extra=build_step_extra(
-                analyzer,
-                dump_analyzer_state,
-                {"intended_freq_hz": step.intended_freq_hz, "sfdr_settings": asdict(sfdr_settings)},
-            ),
-        )
+        if dump_analyzer_state:
+            write_step_json(
+                json_path,
+                analyzer.idn,
+                StepSpec(
+                    group="dynamic_sfdr",
+                    index=step.index,
+                    name=step.name,
+                    marker=step.marker,
+                    description=step.description,
+                    expected_freq_hz=list(step.intended_freq_hz),
+                    span_hz=max(sfdr_settings.search_stop_hz - sfdr_settings.search_start_hz, 1.0),
+                    search_margin_hz=step.intended_margin_hz,
+                ),
+                metrics,
+                extra=build_step_extra(
+                    analyzer,
+                    dump_analyzer_state,
+                    {"intended_freq_hz": step.intended_freq_hz, "sfdr_settings": asdict(sfdr_settings)},
+                ),
+            )
 
         summary = StepCaptureSummary(
             group="dynamic_sfdr",
@@ -2659,6 +3021,17 @@ def main() -> int:
         phase_noise_offset_requests = build_phase_noise_offset_requests(args, phase_noise_settings)
         dynamic_settings = build_dynamic_settings(args, analyzer_settings)
         dynamic_specs = build_dynamic_specs(args)
+        dds_band_step_specs = build_dds_band_step_specs(args)
+        sfdr_step_specs = build_sfdr_step_specs(args)
+        benchmark_prompts_disabled = (
+            len(dds_band_step_specs) >= DEFAULT_BULK_PROMPT_DISABLE_STEP_THRESHOLD
+            or len(sfdr_step_specs) >= DEFAULT_BULK_PROMPT_DISABLE_STEP_THRESHOLD
+        )
+        extra_cflags = build_sweep_override_cflags(args, benchmark_prompts_disabled)
+        make_env = {"NEW_CFLAGS": extra_cflags} if extra_cflags else None
+        force_update_rebuild = bool(extra_cflags)
+        force_clean_rebuild = bool(extra_cflags)
+        make_args = combine_make_args(args.make_args)
 
         trace_capture_flags: List[str] = []
         if analyzer_settings.capture_trace:
@@ -2692,7 +3065,10 @@ def main() -> int:
                 uart=uart,
                 timeout_s=args.make_timeout,
                 settings_files=settings_files,
-                make_args=args.make_args,
+                make_args=make_args,
+                extra_env=make_env,
+                update_first=force_update_rebuild,
+                clean_first=force_clean_rebuild,
             )
             print("[HOST] 'make run' completed.")
 
@@ -2734,6 +3110,7 @@ def main() -> int:
                     done_marker=NCO_DONE_MARKER,
                     timeout_s=args.uart_timeout,
                     settings=analyzer_settings,
+                        benchmark_prompts_enabled=not benchmark_prompts_disabled,
                     dump_analyzer_state=args.dump_analyzer_state,
                 )
             )
@@ -2743,6 +3120,7 @@ def main() -> int:
             DDS_BAND_START_PROMPT,
             args.uart_timeout,
             extra_needles=[
+                AWG_SWEEP_START_PROMPT,
                 SFDR_START_PROMPT,
                 DYNAMIC_SFDR_START_PROMPT,
                 THROUGHPUT_START_PROMPT,
@@ -2750,6 +3128,25 @@ def main() -> int:
                 DDS_SWEEP_START_MARKER,
             ],
         )
+        if next_prompt == AWG_SWEEP_START_PROMPT:
+            if args.run_awg_sweep:
+                uart.send_line("y")
+                print("[HOST] AWG scheduler sweep started.")
+            else:
+                uart.send_line("n")
+                print("[HOST] AWG scheduler sweep skipped by host option.")
+            next_prompt = wait_for_optional_prompt(
+                uart,
+                DDS_BAND_START_PROMPT,
+                args.uart_timeout,
+                extra_needles=[
+                    SFDR_START_PROMPT,
+                    DYNAMIC_SFDR_START_PROMPT,
+                    THROUGHPUT_START_PROMPT,
+                    UART_RTT_START_PROMPT,
+                    DDS_SWEEP_START_MARKER,
+                ],
+            )
         if next_prompt == DDS_BAND_START_PROMPT:
             if args.skip_dds_band_test:
                 uart.send_line("n")
@@ -2762,10 +3159,11 @@ def main() -> int:
                         uart=uart,
                         analyzer=analyzer,
                         output_dir=output_dir,
-                        step_specs=DDS_BAND_STEP_SPECS,
+                        step_specs=dds_band_step_specs,
                         done_marker=DDS_BAND_DONE_MARKER,
                         timeout_s=args.uart_timeout,
                         settings=analyzer_settings,
+                        benchmark_prompts_enabled=not benchmark_prompts_disabled,
                         dump_analyzer_state=args.dump_analyzer_state,
                     )
                 )
@@ -2793,7 +3191,7 @@ def main() -> int:
                         uart=uart,
                         analyzer=analyzer,
                         output_dir=output_dir,
-                        step_specs=SFDR_STEP_SPECS,
+                        step_specs=sfdr_step_specs,
                         done_marker=SFDR_DONE_MARKER,
                         timeout_s=args.uart_timeout,
                         settings=analyzer_settings,
@@ -2801,6 +3199,7 @@ def main() -> int:
                         phase_noise_requests=phase_noise_requests,
                         phase_noise_offset_requests=phase_noise_offset_requests,
                         phase_noise_settings=phase_noise_settings,
+                        benchmark_prompts_enabled=not benchmark_prompts_disabled,
                         dump_analyzer_state=args.dump_analyzer_state,
                     )
                 )
@@ -2839,6 +3238,7 @@ def main() -> int:
                         timeout_s=args.uart_timeout,
                         settings=dynamic_settings,
                         sfdr_settings=sfdr_settings,
+                        benchmark_prompts_enabled=not benchmark_prompts_disabled,
                         dump_analyzer_state=args.dump_analyzer_state,
                     )
                 )
@@ -2904,6 +3304,28 @@ def main() -> int:
             "impedance_ohms": analyzer_settings.impedance_ohms,
             "capture_trace": analyzer_settings.capture_trace,
             "sfdr_settings": asdict(sfdr_settings),
+            "dds_band_sweep": {
+                "start_hz": dds_band_step_specs[0].expected_freq_hz[0] if dds_band_step_specs else None,
+                "stop_hz": dds_band_step_specs[-1].expected_freq_hz[0] if dds_band_step_specs else None,
+                "step_count": len(dds_band_step_specs),
+                "custom": parse_optional_sweep_range(
+                    args.dds_band_sweep_start_hz,
+                    args.dds_band_sweep_stop_hz,
+                    args.dds_band_sweep_step_hz,
+                    "DDS-band",
+                ) is not None,
+            },
+            "sfdr_sweep": {
+                "start_hz": sfdr_step_specs[0].expected_freq_hz[0] if sfdr_step_specs else None,
+                "stop_hz": sfdr_step_specs[-1].expected_freq_hz[0] if sfdr_step_specs else None,
+                "step_count": len(sfdr_step_specs),
+                "custom": parse_optional_sweep_range(
+                    args.sfdr_sweep_start_hz,
+                    args.sfdr_sweep_stop_hz,
+                    args.sfdr_sweep_step_hz,
+                    "SFDR",
+                ) is not None,
+            },
             "phase_noise": {
                 "enabled": bool(phase_noise_requests) or bool(phase_noise_offset_requests),
                 "carriers_mhz": sorted(

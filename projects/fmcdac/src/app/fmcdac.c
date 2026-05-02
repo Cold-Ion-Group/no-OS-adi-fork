@@ -97,6 +97,76 @@ static enum fmcdac_clock_mode g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
 #define FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS 2000U
 #endif
 
+#ifndef FMCDAC_ENABLE_AWG_SWEEP_PROMPT
+#define FMCDAC_ENABLE_AWG_SWEEP_PROMPT 0
+#endif
+
+#ifndef FMCDAC_AWG_SWEEP_START_HZ
+#define FMCDAC_AWG_SWEEP_START_HZ 0U
+#endif
+
+#ifndef FMCDAC_AWG_SWEEP_STOP_HZ
+#define FMCDAC_AWG_SWEEP_STOP_HZ 0U
+#endif
+
+#ifndef FMCDAC_AWG_SWEEP_STEP_HZ
+#define FMCDAC_AWG_SWEEP_STEP_HZ 0U
+#endif
+
+#ifndef FMCDAC_AWG_SWEEP_DWELL_US
+#define FMCDAC_AWG_SWEEP_DWELL_US 1000U
+#endif
+
+#ifndef FMCDAC_AWG_SWEEP_SCALE_U
+#define FMCDAC_AWG_SWEEP_SCALE_U 700000
+#endif
+
+#ifndef FMCDAC_AWG_SWEEP_START_TICKS
+#define FMCDAC_AWG_SWEEP_START_TICKS 1000U
+#endif
+
+#ifndef FMCDAC_AWG_SWEEP_TONE
+#define FMCDAC_AWG_SWEEP_TONE 0U
+#endif
+
+#ifndef FMCDAC_CUSTOM_SWEEP_LOG_INTERVAL
+#define FMCDAC_CUSTOM_SWEEP_LOG_INTERVAL 1000U
+#endif
+
+#ifndef FMCDAC_DDS_BAND_SWEEP_START_HZ
+#define FMCDAC_DDS_BAND_SWEEP_START_HZ 0U
+#endif
+
+#ifndef FMCDAC_DDS_BAND_SWEEP_STOP_HZ
+#define FMCDAC_DDS_BAND_SWEEP_STOP_HZ 0U
+#endif
+
+#ifndef FMCDAC_DDS_BAND_SWEEP_STEP_HZ
+#define FMCDAC_DDS_BAND_SWEEP_STEP_HZ 0U
+#endif
+
+#ifndef FMCDAC_SFDR_SWEEP_START_HZ
+#define FMCDAC_SFDR_SWEEP_START_HZ 0U
+#endif
+
+#ifndef FMCDAC_SFDR_SWEEP_STOP_HZ
+#define FMCDAC_SFDR_SWEEP_STOP_HZ 0U
+#endif
+
+#ifndef FMCDAC_SFDR_SWEEP_STEP_HZ
+#define FMCDAC_SFDR_SWEEP_STEP_HZ 0U
+#endif
+
+#if (FMCDAC_DDS_BAND_SWEEP_STEP_HZ > 0U) && \
+	(FMCDAC_DDS_BAND_SWEEP_STOP_HZ < FMCDAC_DDS_BAND_SWEEP_START_HZ)
+#error "FMCDAC_DDS_BAND_SWEEP_STOP_HZ must be >= FMCDAC_DDS_BAND_SWEEP_START_HZ"
+#endif
+
+#if (FMCDAC_SFDR_SWEEP_STEP_HZ > 0U) && \
+	(FMCDAC_SFDR_SWEEP_STOP_HZ < FMCDAC_SFDR_SWEEP_START_HZ)
+#error "FMCDAC_SFDR_SWEEP_STOP_HZ must be >= FMCDAC_SFDR_SWEEP_START_HZ"
+#endif
+
 static const int g_fmcdac_manual_debug_mode = (FMCDAC_MANUAL_DEBUG_MODE != 0);
 static const int g_fmcdac_enable_benchmark_prompts = (FMCDAC_ENABLE_BENCHMARK_PROMPTS != 0);
 
@@ -193,7 +263,14 @@ static int fmcdac_throughput_test(struct fmcdac_dev *dev);
 static void fmcdac_uart_rtt_service(void);
 static int fmcdac_read_line(char *buf, size_t len);
 static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev);
+static int fmcdac_run_awg_sweep_test(struct fmcdac_dev *dev);
 static void fmcdac_run_benchmark_prompt_flow(struct fmcdac_dev *dev);
+static int fmcdac_dds_band_sweep_override_enabled(void);
+static int fmcdac_sfdr_sweep_override_enabled(void);
+static int fmcdac_awg_sweep_enabled(void);
+static uint32_t fmcdac_sweep_point_count(uint32_t start_hz, uint32_t stop_hz,
+					 uint32_t step_hz);
+static void fmcdac_format_freq_label(uint32_t freq_hz, char *buf, size_t buf_sz);
 static int force_dds_tone(struct fmcdac_dev *dev);
 static int fmcdac_timer_init(void);
 static uint64_t fmcdac_timer_now_cycles(void);
@@ -1060,6 +1137,20 @@ static void fmcdac_delay_seconds(uint32_t seconds, uint32_t heartbeat_s)
 				   (unsigned long)(i + 1),
 				   (unsigned long)seconds);
 	}
+}
+
+static int fmcdac_should_log_custom_sweep(uint32_t index, uint32_t total)
+{
+	if (total <= 32U)
+		return 1;
+
+	if (index < 3U)
+		return 1;
+
+	if ((index + 1U) == total)
+		return 1;
+
+	return ((index + 1U) % FMCDAC_CUSTOM_SWEEP_LOG_INTERVAL) == 0U;
 }
 
 
@@ -2010,8 +2101,7 @@ static void fmcdac_nco_readback(struct fmcdac_dev *dev, const char *tag)
 static void fmcdac_wait_for_enter(const char *tag, const char *message)
 {
 	if (!g_fmcdac_enable_benchmark_prompts) {
-		xil_printf("[%s] Benchmark wait skipped (FMCDAC_ENABLE_BENCHMARK_PROMPTS=0): %s\n\r",
-			   tag, message);
+		fmcdac_flush_input();
 		return;
 	}
 
@@ -2142,6 +2232,274 @@ static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev)
 	return 0;
 }
 
+static int fmcdac_awg_sweep_enabled(void)
+{
+	return (FMCDAC_AWG_SWEEP_START_HZ > 0U) &&
+	       (FMCDAC_AWG_SWEEP_STOP_HZ >= FMCDAC_AWG_SWEEP_START_HZ) &&
+	       (FMCDAC_AWG_SWEEP_STEP_HZ > 0U);
+}
+
+static uint16_t fmcdac_awg_scale_reg_from_u(int32_t scale_u)
+{
+	uint32_t scale_reg;
+
+	scale_reg = (scale_u < 0) ? (uint32_t)(-scale_u) : (uint32_t)scale_u;
+	if (scale_reg >= 1999000U)
+		scale_reg = 1999000U;
+	scale_reg = (uint32_t)(((uint64_t)scale_reg * 0x4000U) / 1000000U);
+	if (scale_u < 0)
+		scale_reg |= 0x8000U;
+
+	return (uint16_t)scale_reg;
+}
+
+static uint16_t fmcdac_awg_phase_reg_from_mdeg(uint32_t phase_mdeg)
+{
+	uint64_t val64 = (uint64_t)phase_mdeg * 0x10000ULL + (360000U / 2U);
+
+	val64 = val64 / 360000U;
+	return (uint16_t)val64;
+}
+
+static int fmcdac_awg_ftw16_from_hz(const struct axi_dac *dac,
+				    uint32_t freq_hz,
+				    uint16_t *ftw_out)
+{
+	uint64_t val64;
+
+	if (!dac || !ftw_out || dac->clock_hz == 0U)
+		return -EINVAL;
+
+	val64 = (uint64_t)freq_hz * 0xFFFFULL;
+	val64 = val64 / dac->clock_hz;
+	*ftw_out = (uint16_t)val64;
+	return 0;
+}
+
+static int fmcdac_run_awg_sweep_test(struct fmcdac_dev *dev)
+{
+	static const char *tag = "AWG-SWEEP";
+	awg_sched_cfg_t sched_cfg;
+	awg_sched_status_t sched_status;
+	awg_event_v1_t *events = NULL;
+	uint32_t sweep_count;
+	uint32_t i;
+	uint32_t freq_hz;
+	uint16_t ftw16;
+	uint16_t scale_reg;
+	uint16_t phase_reg;
+	uint64_t step_ticks;
+	uint64_t start_ticks;
+	int ret;
+
+	if (FMCDAC_AWG_SCHED_BASEADDR == 0U) {
+		xil_printf("[%s] Skipped: FMCDAC_AWG_SCHED_BASEADDR is 0.\n\r", tag);
+		return 0;
+	}
+
+	if (!fmcdac_awg_sweep_enabled()) {
+		xil_printf("[%s] Skipped: FMCDAC_AWG_SWEEP_* not configured.\n\r", tag);
+		return 0;
+	}
+
+	if (!dev || !dev->ad9144_core) {
+		xil_printf("[%s] Failed: DAC core unavailable.\n\r", tag);
+		return -EINVAL;
+	}
+
+	if (dev->ad9144_core->dds_phase_dw > 16U) {
+		xil_printf("[%s] Skipped: DDS_PHASE_DW=%u requires 32-bit FTW support.\n\r",
+			   tag, (unsigned)dev->ad9144_core->dds_phase_dw);
+		return -ENOTSUP;
+	}
+
+	ret = fmcdac_prepare_dds_output(dev, tag);
+	if (ret != 0)
+		return ret;
+
+	ret = ad9144_set_nco(dev->ad9144_device, 0, 0);
+	if (ret != 0) {
+		xil_printf("[%s] Failed to disable NCO before AWG sweep: %ld\n\r",
+			   tag, (long)ret);
+		return ret;
+	}
+
+	sweep_count = fmcdac_sweep_point_count(FMCDAC_AWG_SWEEP_START_HZ,
+					       FMCDAC_AWG_SWEEP_STOP_HZ,
+					       FMCDAC_AWG_SWEEP_STEP_HZ);
+	if (sweep_count == 0U) {
+		xil_printf("[%s] Skipped: sweep count is zero.\n\r", tag);
+		return 0;
+	}
+
+	if (sweep_count > FMCDAC_AWG_SCHED_MAX_EVENTS) {
+		xil_printf("[%s] Limiting sweep_count=%lu to max_events=%lu.\n\r",
+			   tag,
+			   (unsigned long)sweep_count,
+			   (unsigned long)FMCDAC_AWG_SCHED_MAX_EVENTS);
+		sweep_count = FMCDAC_AWG_SCHED_MAX_EVENTS;
+	}
+
+	step_ticks = ((uint64_t)FMCDAC_AWG_SCHED_TICK_HZ *
+		      (uint64_t)FMCDAC_AWG_SWEEP_DWELL_US) / 1000000U;
+	if (step_ticks == 0U)
+		step_ticks = 1U;
+	start_ticks = FMCDAC_AWG_SWEEP_START_TICKS;
+	if (start_ticks < step_ticks)
+		start_ticks = step_ticks;
+
+	events = calloc(sweep_count, sizeof(*events));
+	if (!events) {
+		xil_printf("[%s] Failed: out of memory for %lu events.\n\r",
+			   tag, (unsigned long)sweep_count);
+		return -ENOMEM;
+	}
+
+	scale_reg = fmcdac_awg_scale_reg_from_u(FMCDAC_AWG_SWEEP_SCALE_U);
+	phase_reg = fmcdac_awg_phase_reg_from_mdeg(0U);
+
+	for (i = 0U; i < sweep_count; i++) {
+		freq_hz = FMCDAC_AWG_SWEEP_START_HZ + (i * FMCDAC_AWG_SWEEP_STEP_HZ);
+		ret = fmcdac_awg_ftw16_from_hz(dev->ad9144_core, freq_hz, &ftw16);
+		if (ret != 0) {
+			xil_printf("[%s] Failed to compute FTW for %lu Hz: %d\n\r",
+				   tag, (unsigned long)freq_hz, ret);
+			goto cleanup;
+		}
+
+		events[i].timestamp_ticks = start_ticks + ((uint64_t)i * step_ticks);
+		events[i].channel = 0U;
+		events[i].flags = AWG_SCHED_FLAG_PHASE_REINIT;
+		events[i].payload.tone = (uint16_t)FMCDAC_AWG_SWEEP_TONE;
+		events[i].payload.freq_lsb16 = ftw16;
+		events[i].payload.scale = scale_reg;
+		events[i].payload.phase = phase_reg;
+	}
+
+	xil_printf("[%s] START count=%lu start_hz=%lu stop_hz=%lu step_hz=%lu dwell_us=%lu step_ticks=%lu\n\r",
+		   tag,
+		   (unsigned long)sweep_count,
+		   (unsigned long)FMCDAC_AWG_SWEEP_START_HZ,
+		   (unsigned long)FMCDAC_AWG_SWEEP_STOP_HZ,
+		   (unsigned long)FMCDAC_AWG_SWEEP_STEP_HZ,
+		   (unsigned long)FMCDAC_AWG_SWEEP_DWELL_US,
+		   (unsigned long)step_ticks);
+
+	sched_cfg.base_addr = FMCDAC_AWG_SCHED_BASEADDR;
+	sched_cfg.max_events = FMCDAC_AWG_SCHED_MAX_EVENTS;
+	sched_cfg.tick_hz = FMCDAC_AWG_SCHED_TICK_HZ;
+	sched_cfg.done_timeout_ms = FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS;
+
+	ret = awg_sched_config(&sched_cfg);
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_config() failed: %d\n\r", tag, ret);
+		goto cleanup;
+	}
+
+	ret = awg_sched_set_epoch();
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_set_epoch() failed: %d\n\r", tag, ret);
+		goto cleanup;
+	}
+
+	ret = awg_sched_verify_events(events, sweep_count);
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_verify_events() failed: %d\n\r", tag, ret);
+		goto cleanup;
+	}
+
+	ret = awg_sched_load_events(events, sweep_count);
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_load_events() failed: %d\n\r", tag, ret);
+		goto cleanup;
+	}
+
+	ret = awg_sched_arm();
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_arm() failed: %d\n\r", tag, ret);
+		goto cleanup;
+	}
+
+	ret = awg_sched_start();
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_start() failed: %d\n\r", tag, ret);
+		goto cleanup;
+	}
+
+	ret = awg_sched_wait_done(FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS, &sched_status);
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_wait_done() failed: %d\n\r", tag, ret);
+		goto cleanup;
+	}
+
+	ret = awg_sched_get_status(&sched_status);
+	if (ret != 0) {
+		xil_printf("[%s] awg_sched_get_status() failed: %d\n\r", tag, ret);
+		goto cleanup;
+	}
+
+	xil_printf("[%s] DONE armed=%u running=%u done=%u error=%u err_code=0x%02lX "
+		   "current=%lu loaded=%lu commit=%lu status=0x%08lX\n\r",
+		   tag,
+		   sched_status.armed ? 1U : 0U,
+		   sched_status.running ? 1U : 0U,
+		   sched_status.done ? 1U : 0U,
+		   sched_status.error ? 1U : 0U,
+		   (unsigned long)sched_status.err_code,
+		   (unsigned long)sched_status.current_event,
+		   (unsigned long)sched_status.loaded_events,
+		   (unsigned long)sched_status.commit_count,
+		   (unsigned long)sched_status.hw_status_word);
+
+	awg_sched_dump_artifacts(events, sweep_count, &sched_status);
+	ret = 0;
+
+cleanup:
+	free(events);
+	return ret;
+}
+
+static int fmcdac_dds_band_sweep_override_enabled(void)
+{
+	return (FMCDAC_DDS_BAND_SWEEP_START_HZ > 0U) &&
+	       (FMCDAC_DDS_BAND_SWEEP_STOP_HZ >= FMCDAC_DDS_BAND_SWEEP_START_HZ) &&
+	       (FMCDAC_DDS_BAND_SWEEP_STEP_HZ > 0U);
+}
+
+static int fmcdac_sfdr_sweep_override_enabled(void)
+{
+	return (FMCDAC_SFDR_SWEEP_START_HZ > 0U) &&
+	       (FMCDAC_SFDR_SWEEP_STOP_HZ >= FMCDAC_SFDR_SWEEP_START_HZ) &&
+	       (FMCDAC_SFDR_SWEEP_STEP_HZ > 0U);
+}
+
+static uint32_t fmcdac_sweep_point_count(uint32_t start_hz, uint32_t stop_hz,
+					 uint32_t step_hz)
+{
+	if (step_hz == 0U || stop_hz < start_hz)
+		return 0U;
+
+	return ((stop_hz - start_hz) / step_hz) + 1U;
+}
+
+static void fmcdac_format_freq_label(uint32_t freq_hz, char *buf, size_t buf_sz)
+{
+	if (buf_sz == 0U)
+		return;
+
+	if ((freq_hz % 1000000U) == 0U) {
+		snprintf(buf, buf_sz, "%lu MHz", (unsigned long)(freq_hz / 1000000U));
+		return;
+	}
+
+	if ((freq_hz % 1000U) == 0U) {
+		snprintf(buf, buf_sz, "%lu kHz", (unsigned long)(freq_hz / 1000U));
+		return;
+	}
+
+	snprintf(buf, buf_sz, "%lu Hz", (unsigned long)freq_hz);
+}
+
 static void fmcdac_run_benchmark_prompt_flow(struct fmcdac_dev *dev)
 {
 	int status;
@@ -2162,7 +2520,30 @@ static void fmcdac_run_benchmark_prompt_flow(struct fmcdac_dev *dev)
 		}
 	}
 
-	xil_printf("[DDS-BAND] Run focused DDS sweep diagnostic around 230-330 MHz? [y/N]: ");
+#if FMCDAC_ENABLE_AWG_SWEEP_PROMPT
+	xil_printf("[AWG-SWEEP] Run AWG scheduler DDS sweep? [y/N]: ");
+	{
+		int run_awg = getc(stdin);
+		fmcdac_flush_input();
+		if (run_awg == 'y' || run_awg == 'Y') {
+			status = fmcdac_run_awg_sweep_test(dev);
+			if (status != 0)
+				xil_printf("[AWG-SWEEP] Sweep failed: %d\n\r",
+					   status);
+		} else {
+			xil_printf("[AWG-SWEEP] Skipped.\n\r");
+		}
+	}
+#endif
+
+	if (fmcdac_dds_band_sweep_override_enabled()) {
+		xil_printf("[DDS-BAND] Run focused DDS sweep diagnostic (%lu Hz to %lu Hz in %lu Hz steps)? [y/N]: ",
+			   (unsigned long)FMCDAC_DDS_BAND_SWEEP_START_HZ,
+			   (unsigned long)FMCDAC_DDS_BAND_SWEEP_STOP_HZ,
+			   (unsigned long)FMCDAC_DDS_BAND_SWEEP_STEP_HZ);
+	} else {
+		xil_printf("[DDS-BAND] Run focused DDS sweep diagnostic around 230-330 MHz? [y/N]: ");
+	}
 	{
 		int run_dds_band = getc(stdin);
 		fmcdac_flush_input();
@@ -2176,7 +2557,14 @@ static void fmcdac_run_benchmark_prompt_flow(struct fmcdac_dev *dev)
 		}
 	}
 
-	xil_printf("[SFDR-TEST] Run steady-state SFDR tone set at 50-400 MHz? [y/N]: ");
+	if (fmcdac_sfdr_sweep_override_enabled()) {
+		xil_printf("[SFDR-TEST] Run steady-state SFDR tone set (%lu Hz to %lu Hz in %lu Hz steps)? [y/N]: ",
+			   (unsigned long)FMCDAC_SFDR_SWEEP_START_HZ,
+			   (unsigned long)FMCDAC_SFDR_SWEEP_STOP_HZ,
+			   (unsigned long)FMCDAC_SFDR_SWEEP_STEP_HZ);
+	} else {
+		xil_printf("[SFDR-TEST] Run steady-state SFDR tone set at 50-400 MHz? [y/N]: ");
+	}
 	{
 		int run_sfdr = getc(stdin);
 		fmcdac_flush_input();
@@ -2318,6 +2706,7 @@ static int fmcdac_dds_band_diagnostic_test(struct fmcdac_dev *dev)
 	const int32_t scale_u = 999000;
 	uint8_t interp_mode = 0;
 	uint32_t i;
+	uint32_t custom_count = 0U;
 	int ret;
 
 	ret = fmcdac_prepare_dds_output(dev, tag);
@@ -2334,35 +2723,70 @@ static int fmcdac_dds_band_diagnostic_test(struct fmcdac_dev *dev)
 	ad9144_spi_read(dev->ad9144_device, REG_INTERP_MODE, &interp_mode);
 	xil_printf("[%s] Focused DDS sweep diagnostic with NCO disabled.\n\r",
 		   tag);
-	xil_printf("[%s] Interpolation mode=0x%02X. Capturing 10/100/200 MHz references plus 230-330 MHz in 10 MHz steps.\n\r",
-		   tag, interp_mode);
+	if (fmcdac_dds_band_sweep_override_enabled()) {
+		custom_count = fmcdac_sweep_point_count(
+			FMCDAC_DDS_BAND_SWEEP_START_HZ,
+			FMCDAC_DDS_BAND_SWEEP_STOP_HZ,
+			FMCDAC_DDS_BAND_SWEEP_STEP_HZ);
+		xil_printf("[%s] Interpolation mode=0x%02X. Capturing %lu custom points from %lu Hz to %lu Hz in %lu Hz steps.\n\r",
+			   tag, interp_mode,
+			   (unsigned long)custom_count,
+			   (unsigned long)FMCDAC_DDS_BAND_SWEEP_START_HZ,
+			   (unsigned long)FMCDAC_DDS_BAND_SWEEP_STOP_HZ,
+			   (unsigned long)FMCDAC_DDS_BAND_SWEEP_STEP_HZ);
+		for (i = 0; i < custom_count; i++) {
+			uint32_t freq_hz = FMCDAC_DDS_BAND_SWEEP_START_HZ +
+					 (i * FMCDAC_DDS_BAND_SWEEP_STEP_HZ);
+			char freq_label[32];
 
-	for (i = 0; i < NO_OS_ARRAY_SIZE(freqs_mhz); i++) {
-		uint32_t freq_mhz = freqs_mhz[i];
-		uint32_t freq_hz = freq_mhz * 1000000U;
+			ret = fmcdac_program_dds_pair(dev, freq_hz, scale_u, 0, 0, tag);
+			if (ret != 0) {
+				xil_printf("[%s] DDS programming failed at %lu Hz: %ld\n\r",
+					   tag, (unsigned long)freq_hz, (long)ret);
+				return ret;
+			}
 
-		ret = fmcdac_program_dds_pair(dev, freq_hz, scale_u, 0, 0, tag);
-		if (ret != 0) {
-			xil_printf("[%s] DDS programming failed at %lu MHz: %ld\n\r",
-				   tag, (unsigned long)freq_mhz, (long)ret);
-			return ret;
+			if (fmcdac_should_log_custom_sweep(i, custom_count)) {
+				fmcdac_format_freq_label(freq_hz, freq_label, sizeof(freq_label));
+				xil_printf("[%s] Step %lu/%lu: %s DDS tone.\n\r",
+					   tag,
+					   (unsigned long)(i + 1U),
+					   (unsigned long)custom_count,
+					   freq_label);
+			}
+			fmcdac_wait_for_enter(tag, "Observe the DDS tone.");
 		}
+	} else {
+		xil_printf("[%s] Interpolation mode=0x%02X. Capturing 10/100/200 MHz references plus 230-330 MHz in 10 MHz steps.\n\r",
+			   tag, interp_mode);
 
-		xil_printf("[%s] Step %lu/%lu: %lu MHz DDS tone.\n\r",
-			   tag,
-			   (unsigned long)(i + 1),
-			   (unsigned long)NO_OS_ARRAY_SIZE(freqs_mhz),
-			   (unsigned long)freq_mhz);
+		for (i = 0; i < NO_OS_ARRAY_SIZE(freqs_mhz); i++) {
+			uint32_t freq_mhz = freqs_mhz[i];
+			uint32_t freq_hz = freq_mhz * 1000000U;
 
-		if (freq_mhz < 230U) {
-			xil_printf("[%s] Reference checkpoint before the observed droop band.\n\r",
-				   tag);
-		} else {
-			xil_printf("[%s] Problem-band checkpoint near the observed 260-290 MHz amplitude loss.\n\r",
-				   tag);
+			ret = fmcdac_program_dds_pair(dev, freq_hz, scale_u, 0, 0, tag);
+			if (ret != 0) {
+				xil_printf("[%s] DDS programming failed at %lu MHz: %ld\n\r",
+					   tag, (unsigned long)freq_mhz, (long)ret);
+				return ret;
+			}
+
+			xil_printf("[%s] Step %lu/%lu: %lu MHz DDS tone.\n\r",
+				   tag,
+				   (unsigned long)(i + 1),
+				   (unsigned long)NO_OS_ARRAY_SIZE(freqs_mhz),
+				   (unsigned long)freq_mhz);
+
+			if (freq_mhz < 230U) {
+				xil_printf("[%s] Reference checkpoint before the observed droop band.\n\r",
+					   tag);
+			} else {
+				xil_printf("[%s] Problem-band checkpoint near the observed 260-290 MHz amplitude loss.\n\r",
+					   tag);
+			}
+
+			fmcdac_wait_for_enter(tag, "Observe the DDS tone.");
 		}
-
-		fmcdac_wait_for_enter(tag, "Observe the DDS tone.");
 	}
 
 	xil_printf("[%s] Completed focused DDS band diagnostic. Returning to normal DDS sweep.\n\r",
@@ -2380,6 +2804,7 @@ static int fmcdac_sfdr_test(struct fmcdac_dev *dev)
 	const int32_t scale_u = 700000;
 	uint8_t interp_mode = 0;
 	uint32_t i;
+	uint32_t custom_count = 0U;
 	int ret;
 
 	ret = fmcdac_prepare_dds_output(dev, tag);
@@ -2395,30 +2820,65 @@ static int fmcdac_sfdr_test(struct fmcdac_dev *dev)
 
 	ad9144_spi_read(dev->ad9144_device, REG_INTERP_MODE, &interp_mode);
 	xil_printf("[%s] Steady-state SFDR tone set with NCO disabled.\n\r", tag);
-	xil_printf("[%s] Interpolation mode=0x%02X. Holding 50-400 MHz in 50 MHz steps.\n\r",
-		   tag, interp_mode);
 	xil_printf("[%s] DDS scale fixed to %ld micro-units to keep some spur headroom.\n\r",
 		   tag, (long)scale_u);
+	if (fmcdac_sfdr_sweep_override_enabled()) {
+		custom_count = fmcdac_sweep_point_count(
+			FMCDAC_SFDR_SWEEP_START_HZ,
+			FMCDAC_SFDR_SWEEP_STOP_HZ,
+			FMCDAC_SFDR_SWEEP_STEP_HZ);
+		xil_printf("[%s] Interpolation mode=0x%02X. Holding %lu custom points from %lu Hz to %lu Hz in %lu Hz steps.\n\r",
+			   tag, interp_mode,
+			   (unsigned long)custom_count,
+			   (unsigned long)FMCDAC_SFDR_SWEEP_START_HZ,
+			   (unsigned long)FMCDAC_SFDR_SWEEP_STOP_HZ,
+			   (unsigned long)FMCDAC_SFDR_SWEEP_STEP_HZ);
+		for (i = 0; i < custom_count; i++) {
+			uint32_t freq_hz = FMCDAC_SFDR_SWEEP_START_HZ +
+					 (i * FMCDAC_SFDR_SWEEP_STEP_HZ);
+			char freq_label[32];
 
-	for (i = 0; i < NO_OS_ARRAY_SIZE(freqs_mhz); i++) {
-		uint32_t freq_mhz = freqs_mhz[i];
-		uint32_t freq_hz = freq_mhz * 1000000U;
+			ret = fmcdac_program_dds_pair(dev, freq_hz, scale_u, 0, 0, tag);
+			if (ret != 0) {
+				xil_printf("[%s] DDS programming failed at %lu Hz: %ld\n\r",
+					   tag, (unsigned long)freq_hz, (long)ret);
+				return ret;
+			}
 
-		ret = fmcdac_program_dds_pair(dev, freq_hz, scale_u, 0, 0, tag);
-		if (ret != 0) {
-			xil_printf("[%s] DDS programming failed at %lu MHz: %ld\n\r",
-				   tag, (unsigned long)freq_mhz, (long)ret);
-			return ret;
+			if (fmcdac_should_log_custom_sweep(i, custom_count)) {
+				fmcdac_format_freq_label(freq_hz, freq_label, sizeof(freq_label));
+				xil_printf("[%s] Step %lu/%lu: %s DDS tone.\n\r",
+					   tag,
+					   (unsigned long)(i + 1U),
+					   (unsigned long)custom_count,
+					   freq_label);
+			}
+			fmcdac_wait_for_enter(tag, "Observe the steady-state tone.");
 		}
+	} else {
+		xil_printf("[%s] Interpolation mode=0x%02X. Holding 50-400 MHz in 50 MHz steps.\n\r",
+			   tag, interp_mode);
 
-		xil_printf("[%s] Step %lu/%lu: %lu MHz DDS tone.\n\r",
-			   tag,
-			   (unsigned long)(i + 1),
-			   (unsigned long)NO_OS_ARRAY_SIZE(freqs_mhz),
-			   (unsigned long)freq_mhz);
-		xil_printf("[%s] Analyzer should capture carrier power and strongest spur for SFDR.\n\r",
-			   tag);
-		fmcdac_wait_for_enter(tag, "Observe the steady-state tone.");
+		for (i = 0; i < NO_OS_ARRAY_SIZE(freqs_mhz); i++) {
+			uint32_t freq_mhz = freqs_mhz[i];
+			uint32_t freq_hz = freq_mhz * 1000000U;
+
+			ret = fmcdac_program_dds_pair(dev, freq_hz, scale_u, 0, 0, tag);
+			if (ret != 0) {
+				xil_printf("[%s] DDS programming failed at %lu MHz: %ld\n\r",
+					   tag, (unsigned long)freq_mhz, (long)ret);
+				return ret;
+			}
+
+			xil_printf("[%s] Step %lu/%lu: %lu MHz DDS tone.\n\r",
+				   tag,
+				   (unsigned long)(i + 1),
+				   (unsigned long)NO_OS_ARRAY_SIZE(freqs_mhz),
+				   (unsigned long)freq_mhz);
+			xil_printf("[%s] Analyzer should capture carrier power and strongest spur for SFDR.\n\r",
+				   tag);
+			fmcdac_wait_for_enter(tag, "Observe the steady-state tone.");
+		}
 	}
 
 	xil_printf("[%s] Completed steady-state SFDR tone set.\n\r", tag);

@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,31 +19,93 @@ extern "C" {
 
 /*
  * Payload format version 1 (16 bytes, 4x32b BRAM words):
- *   word0[15:0]   tone
- *   word0[31:16]  freq_lsb16
- *   word1[15:0]   scale
- *   word1[31:16]  reserved0
- *   word2[15:0]   phase
- *   word2[31:16]  reserved1
- *   word3[31:0]   user_word3
+ *
+ * The active HDL contract is bit-packed:
+ *   payload[15:0] = scale
+ *   payload[16 +: DDS_PHASE_DW] = init
+ *   payload[16 + DDS_PHASE_DW +: DDS_PHASE_DW] = incr
+ *   remaining upper bits = reserved / must be zero
+ *
+ * DDS_PHASE_DW is an HDL build parameter. For the current KCU116 AWG image it
+ * is 32, so the payload carries 16-bit scale plus 32-bit init and 32-bit incr.
  */
 typedef union {
+	struct AWG_SCHED_PACKED {
+		uint32_t words[4];
+	};
 	struct AWG_SCHED_PACKED {
 		uint32_t word0;
 		uint32_t word1;
 		uint32_t word2;
 		uint32_t word3;
 	};
-	struct AWG_SCHED_PACKED {
-		uint16_t tone;
-		uint16_t freq_lsb16;
-		uint16_t scale;
-		uint16_t reserved0;
-		uint16_t phase;
-		uint16_t reserved1;
-		uint32_t user_word3;
-	};
 } awg_payload_v1_t;
+
+static inline uint32_t awg_payload_v1_mask(uint8_t width)
+{
+	if (width >= 32U)
+		return 0xFFFFFFFFU;
+	if (width == 0U)
+		return 0U;
+	return (uint32_t)((1UL << width) - 1UL);
+}
+
+static inline void awg_payload_v1_write_bits(awg_payload_v1_t *payload,
+					     uint32_t bit_offset,
+					     uint8_t width,
+					     uint32_t value)
+{
+	uint32_t bits_left;
+	uint32_t word_idx;
+	uint32_t bit_in_word;
+	uint32_t chunk;
+	uint32_t mask;
+	uint32_t chunk_value;
+
+	if (!payload || width == 0U)
+		return;
+
+	bits_left = width;
+	while (bits_left > 0U) {
+		word_idx = bit_offset / 32U;
+		bit_in_word = bit_offset % 32U;
+		chunk = 32U - bit_in_word;
+		if (chunk > bits_left)
+			chunk = bits_left;
+
+		mask = (chunk == 32U) ? 0xFFFFFFFFU : (uint32_t)((1UL << chunk) - 1UL);
+		chunk_value = value & mask;
+		payload->words[word_idx] |= chunk_value << bit_in_word;
+
+		if (chunk == 32U)
+			value = 0U;
+		else
+			value >>= chunk;
+		bit_offset += chunk;
+		bits_left -= chunk;
+	}
+}
+
+static inline void awg_payload_v1_set_dds(awg_payload_v1_t *payload,
+					  uint16_t scale,
+					  uint32_t init,
+					  uint32_t incr,
+					  uint8_t dds_phase_dw)
+{
+	uint32_t phase_mask;
+
+	if (!payload)
+		return;
+
+	memset(payload, 0, sizeof(*payload));
+	phase_mask = awg_payload_v1_mask(dds_phase_dw);
+	init &= phase_mask;
+	incr &= phase_mask;
+
+	awg_payload_v1_write_bits(payload, 0U, 16U, scale);
+	awg_payload_v1_write_bits(payload, 16U, dds_phase_dw, init);
+	awg_payload_v1_write_bits(payload, 16U + dds_phase_dw, dds_phase_dw, incr);
+}
 
 /*
  * Event format version 1 (32 bytes = 256 bits):
@@ -74,10 +137,6 @@ _Static_assert(offsetof(awg_payload_v1_t, word0) == 0U, "payload.word0 offset mi
 _Static_assert(offsetof(awg_payload_v1_t, word1) == 4U, "payload.word1 offset mismatch");
 _Static_assert(offsetof(awg_payload_v1_t, word2) == 8U, "payload.word2 offset mismatch");
 _Static_assert(offsetof(awg_payload_v1_t, word3) == 12U, "payload.word3 offset mismatch");
-_Static_assert(offsetof(awg_payload_v1_t, tone) == 0U, "payload.tone offset mismatch");
-_Static_assert(offsetof(awg_payload_v1_t, freq_lsb16) == 2U, "payload.freq_lsb16 offset mismatch");
-_Static_assert(offsetof(awg_payload_v1_t, scale) == 4U, "payload.scale offset mismatch");
-_Static_assert(offsetof(awg_payload_v1_t, phase) == 8U, "payload.phase offset mismatch");
 _Static_assert(sizeof(awg_event_v1_t) == 32U, "awg_event_v1_t size mismatch");
 _Static_assert(offsetof(awg_event_v1_t, timestamp_ticks) == 0U, "event.timestamp offset mismatch");
 _Static_assert(offsetof(awg_event_v1_t, channel) == 8U, "event.channel offset mismatch");
@@ -91,9 +150,9 @@ _Static_assert(offsetof(awg_event_v1_t, reserved) == 28U, "event.reserved offset
 /*
  * Static scheduler configuration.
  *
- * tick_hz is informational only — the actual tick rate is a static HDL build
- * parameter readable at runtime via IP_CAPS.  It is not written to any hardware
- * register.
+ * tick_hz is informational only. The current HDL/software contract does not
+ * expose scheduler tick rate via IP_CAPS, so firmware and host must agree on
+ * the tick rate explicitly. It is not written to any hardware register.
  *
  * log_fn, if non-NULL, is called instead of xil_printf for all diagnostic
  * output.  This decouples the subsystem from the Xilinx BSP and makes the

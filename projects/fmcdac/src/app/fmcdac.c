@@ -90,11 +90,19 @@ static enum fmcdac_clock_mode g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
 #endif
 
 #ifndef FMCDAC_AWG_SCHED_TICK_HZ
-#define FMCDAC_AWG_SCHED_TICK_HZ 1000000U
+#define FMCDAC_AWG_SCHED_TICK_HZ 100000000U
 #endif
 
 #ifndef FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS
 #define FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS 2000U
+#endif
+
+#ifndef FMCDAC_ENABLE_AWG_SCHED_CONSOLE
+#define FMCDAC_ENABLE_AWG_SCHED_CONSOLE 0
+#endif
+
+#ifndef FMCDAC_ENABLE_SCHED_DET_SMOKETEST
+#define FMCDAC_ENABLE_SCHED_DET_SMOKETEST 0
 #endif
 
 #ifndef FMCDAC_ENABLE_AWG_SWEEP_PROMPT
@@ -169,6 +177,9 @@ static enum fmcdac_clock_mode g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
 
 static const int g_fmcdac_manual_debug_mode = (FMCDAC_MANUAL_DEBUG_MODE != 0);
 static const int g_fmcdac_enable_benchmark_prompts = (FMCDAC_ENABLE_BENCHMARK_PROMPTS != 0);
+static awg_event_v1_t g_fmcdac_sched_console_events[FMCDAC_AWG_SCHED_MAX_EVENTS];
+static uint32_t g_fmcdac_sched_console_loaded_count;
+static int g_fmcdac_sched_console_configured;
 
 static void fmcdac_flush_input(void);
 
@@ -262,8 +273,11 @@ static int fmcdac_dynamic_sfdr_test(struct fmcdac_dev *dev);
 static int fmcdac_throughput_test(struct fmcdac_dev *dev);
 static void fmcdac_uart_rtt_service(void);
 static int fmcdac_read_line(char *buf, size_t len);
+static int fmcdac_read_exact(uint8_t *buf, size_t len);
+static int fmcdac_read_exact_hex(uint8_t *buf, size_t len);
 static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev);
 static int fmcdac_run_awg_sweep_test(struct fmcdac_dev *dev);
+static void fmcdac_run_awg_sched_console(struct fmcdac_dev *dev);
 static void fmcdac_run_benchmark_prompt_flow(struct fmcdac_dev *dev);
 static int fmcdac_dds_band_sweep_override_enabled(void);
 static int fmcdac_sfdr_sweep_override_enabled(void);
@@ -1187,6 +1201,67 @@ static int fmcdac_read_line(char *buf, size_t len)
 
 	buf[pos] = '\0';
 	return (int)pos;
+}
+
+static int fmcdac_read_exact(uint8_t *buf, size_t len)
+{
+	size_t pos = 0;
+	int c;
+
+	if (!buf)
+		return -1;
+
+	while (pos < len) {
+		c = getc(stdin);
+		if (c == EOF)
+			continue;
+		buf[pos++] = (uint8_t)c;
+	}
+
+	return 0;
+}
+
+static int fmcdac_hex_nibble_value(int c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return 10 + (c - 'a');
+	if (c >= 'A' && c <= 'F')
+		return 10 + (c - 'A');
+	return -1;
+}
+
+static int fmcdac_read_exact_hex(uint8_t *buf, size_t len)
+{
+	size_t pos = 0;
+	int c;
+	int hi_nibble = -1;
+
+	if (!buf)
+		return -1;
+
+	while (pos < len) {
+		c = getc(stdin);
+		if (c == EOF)
+			continue;
+		if (c == '\r' || c == '\n' || c == ' ' || c == '\t')
+			continue;
+
+		c = fmcdac_hex_nibble_value(c);
+		if (c < 0)
+			return -1;
+
+		if (hi_nibble < 0) {
+			hi_nibble = c;
+			continue;
+		}
+
+		buf[pos++] = (uint8_t)((hi_nibble << 4) | c);
+		hi_nibble = -1;
+	}
+
+	return (hi_nibble < 0) ? 0 : -1;
 }
 
 static uint64_t fmcdac_timer_now_cycles(void)
@@ -2146,34 +2221,26 @@ static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev)
 	events[0].timestamp_ticks = 1000U;
 	events[0].channel = 0U;
 	events[0].flags = AWG_SCHED_FLAG_PHASE_REINIT;
-	events[0].payload.tone = events[0].channel;
-	events[0].payload.freq_lsb16 = 0x1000U;
-	events[0].payload.scale = 0x7FFFU;
-	events[0].payload.phase = 0x0000U;
+	awg_payload_v1_set_dds(&events[0].payload, 0x7FFFU, 0x00000000U,
+			       0x00001000U, dev->ad9144_core->dds_phase_dw);
 
 	events[1].timestamp_ticks = 2000U;
 	events[1].channel = 0U;
 	events[1].flags = AWG_SCHED_FLAG_PHASE_REINIT;
-	events[1].payload.tone = events[1].channel;
-	events[1].payload.freq_lsb16 = 0x2000U;
-	events[1].payload.scale = 0x7FFFU;
-	events[1].payload.phase = 0x0000U;
+	awg_payload_v1_set_dds(&events[1].payload, 0x7FFFU, 0x00000000U,
+			       0x00002000U, dev->ad9144_core->dds_phase_dw);
 
 	events[2].timestamp_ticks = 3000U;
 	events[2].channel = 1U;
 	events[2].flags = AWG_SCHED_FLAG_PHASE_REINIT;
-	events[2].payload.tone = events[2].channel;
-	events[2].payload.freq_lsb16 = 0x3000U;
-	events[2].payload.scale = 0x6FFFU;
-	events[2].payload.phase = 0x2000U;
+	awg_payload_v1_set_dds(&events[2].payload, 0x6FFFU, 0x00002000U,
+			       0x00003000U, dev->ad9144_core->dds_phase_dw);
 
 	events[3].timestamp_ticks = 4000U;
 	events[3].channel = 1U;
 	events[3].flags = AWG_SCHED_FLAG_PHASE_REINIT;
-	events[3].payload.tone = events[3].channel;
-	events[3].payload.freq_lsb16 = 0x4000U;
-	events[3].payload.scale = 0x6FFFU;
-	events[3].payload.phase = 0x2000U;
+	awg_payload_v1_set_dds(&events[3].payload, 0x6FFFU, 0x00002000U,
+			       0x00004000U, dev->ad9144_core->dds_phase_dw);
 
 	xil_printf("[%s] Built %lu events in-memory.\n\r",
 		   tag, (unsigned long)event_count);
@@ -2253,26 +2320,40 @@ static uint16_t fmcdac_awg_scale_reg_from_u(int32_t scale_u)
 	return (uint16_t)scale_reg;
 }
 
-static uint16_t fmcdac_awg_phase_reg_from_mdeg(uint32_t phase_mdeg)
+static uint32_t fmcdac_awg_phase_init_from_mdeg(uint32_t phase_mdeg,
+						uint8_t dds_phase_dw)
 {
-	uint64_t val64 = (uint64_t)phase_mdeg * 0x10000ULL + (360000U / 2U);
+	uint64_t modulus;
+	uint64_t val64;
 
+	if (dds_phase_dw == 0U || dds_phase_dw > 32U)
+		return 0U;
+
+	modulus = 1ULL << dds_phase_dw;
+	val64 = (uint64_t)phase_mdeg * modulus + (360000U / 2U);
 	val64 = val64 / 360000U;
-	return (uint16_t)val64;
+	return (uint32_t)(val64 & (modulus - 1ULL));
 }
 
-static int fmcdac_awg_ftw16_from_hz(const struct axi_dac *dac,
-				    uint32_t freq_hz,
-				    uint16_t *ftw_out)
+static int fmcdac_awg_ftw_from_hz(const struct axi_dac *dac,
+				  uint32_t freq_hz,
+				  uint32_t *ftw_out)
 {
+	uint8_t dds_phase_dw;
+	uint64_t modulus;
 	uint64_t val64;
 
 	if (!dac || !ftw_out || dac->clock_hz == 0U)
 		return -EINVAL;
 
-	val64 = (uint64_t)freq_hz * 0xFFFFULL;
+	dds_phase_dw = dac->dds_phase_dw;
+	if (dds_phase_dw == 0U || dds_phase_dw > 32U)
+		return -EINVAL;
+
+	modulus = 1ULL << dds_phase_dw;
+	val64 = (uint64_t)freq_hz * modulus;
 	val64 = val64 / dac->clock_hz;
-	*ftw_out = (uint16_t)val64;
+	*ftw_out = (uint32_t)(val64 & (modulus - 1ULL));
 	return 0;
 }
 
@@ -2285,9 +2366,9 @@ static int fmcdac_run_awg_sweep_test(struct fmcdac_dev *dev)
 	uint32_t sweep_count;
 	uint32_t i;
 	uint32_t freq_hz;
-	uint16_t ftw16;
+	uint32_t ftw;
 	uint16_t scale_reg;
-	uint16_t phase_reg;
+	uint32_t phase_init;
 	uint64_t step_ticks;
 	uint64_t start_ticks;
 	int ret;
@@ -2307,10 +2388,10 @@ static int fmcdac_run_awg_sweep_test(struct fmcdac_dev *dev)
 		return -EINVAL;
 	}
 
-	if (dev->ad9144_core->dds_phase_dw > 16U) {
-		xil_printf("[%s] Skipped: DDS_PHASE_DW=%u requires 32-bit FTW support.\n\r",
-			   tag, (unsigned)dev->ad9144_core->dds_phase_dw);
-		return -ENOTSUP;
+	if (FMCDAC_AWG_SWEEP_TONE != 0U) {
+		xil_printf("[%s] WARN: FMCDAC_AWG_SWEEP_TONE=%lu is ignored. "
+			   "The scheduler payload does not carry per-tone select.\n\r",
+			   tag, (unsigned long)FMCDAC_AWG_SWEEP_TONE);
 	}
 
 	ret = fmcdac_prepare_dds_output(dev, tag);
@@ -2333,11 +2414,12 @@ static int fmcdac_run_awg_sweep_test(struct fmcdac_dev *dev)
 	}
 
 	if (sweep_count > FMCDAC_AWG_SCHED_MAX_EVENTS) {
-		xil_printf("[%s] Limiting sweep_count=%lu to max_events=%lu.\n\r",
+		xil_printf("[%s] Failed: requested_count=%lu exceeds max_events=%lu. "
+			   "Reduce the sweep or upload events in a separate run.\n\r",
 			   tag,
 			   (unsigned long)sweep_count,
 			   (unsigned long)FMCDAC_AWG_SCHED_MAX_EVENTS);
-		sweep_count = FMCDAC_AWG_SCHED_MAX_EVENTS;
+		return -E2BIG;
 	}
 
 	step_ticks = ((uint64_t)FMCDAC_AWG_SCHED_TICK_HZ *
@@ -2356,11 +2438,11 @@ static int fmcdac_run_awg_sweep_test(struct fmcdac_dev *dev)
 	}
 
 	scale_reg = fmcdac_awg_scale_reg_from_u(FMCDAC_AWG_SWEEP_SCALE_U);
-	phase_reg = fmcdac_awg_phase_reg_from_mdeg(0U);
+	phase_init = fmcdac_awg_phase_init_from_mdeg(0U, dev->ad9144_core->dds_phase_dw);
 
 	for (i = 0U; i < sweep_count; i++) {
 		freq_hz = FMCDAC_AWG_SWEEP_START_HZ + (i * FMCDAC_AWG_SWEEP_STEP_HZ);
-		ret = fmcdac_awg_ftw16_from_hz(dev->ad9144_core, freq_hz, &ftw16);
+		ret = fmcdac_awg_ftw_from_hz(dev->ad9144_core, freq_hz, &ftw);
 		if (ret != 0) {
 			xil_printf("[%s] Failed to compute FTW for %lu Hz: %d\n\r",
 				   tag, (unsigned long)freq_hz, ret);
@@ -2370,10 +2452,8 @@ static int fmcdac_run_awg_sweep_test(struct fmcdac_dev *dev)
 		events[i].timestamp_ticks = start_ticks + ((uint64_t)i * step_ticks);
 		events[i].channel = 0U;
 		events[i].flags = AWG_SCHED_FLAG_PHASE_REINIT;
-		events[i].payload.tone = (uint16_t)FMCDAC_AWG_SWEEP_TONE;
-		events[i].payload.freq_lsb16 = ftw16;
-		events[i].payload.scale = scale_reg;
-		events[i].payload.phase = phase_reg;
+		awg_payload_v1_set_dds(&events[i].payload, scale_reg, phase_init, ftw,
+				       dev->ad9144_core->dds_phase_dw);
 	}
 
 	xil_printf("[%s] START count=%lu start_hz=%lu stop_hz=%lu step_hz=%lu dwell_us=%lu step_ticks=%lu\n\r",
@@ -3145,6 +3225,377 @@ static void fmcdac_uart_rtt_service(void)
 		   tag, (unsigned long)exchanges);
 }
 
+static void fmcdac_awg_sched_console_dump(const awg_sched_status_t *status)
+{
+	xil_printf("[AWG-UART] ARTIFACT_BEGIN\n\r");
+	awg_sched_dump_artifacts(g_fmcdac_sched_console_events,
+				 g_fmcdac_sched_console_loaded_count,
+				 status);
+	xil_printf("[AWG-UART] ARTIFACT_END\n\r");
+}
+
+static int fmcdac_awg_sched_console_configure(void)
+{
+	awg_sched_cfg_t sched_cfg;
+	int ret;
+
+	if (FMCDAC_AWG_SCHED_BASEADDR == 0U)
+		return -ENODEV;
+
+	sched_cfg.base_addr = FMCDAC_AWG_SCHED_BASEADDR;
+	sched_cfg.max_events = FMCDAC_AWG_SCHED_MAX_EVENTS;
+	sched_cfg.tick_hz = FMCDAC_AWG_SCHED_TICK_HZ;
+	sched_cfg.done_timeout_ms = FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS;
+	sched_cfg.log_fn = NULL;
+
+	ret = awg_sched_config(&sched_cfg);
+	if (ret == 0) {
+		g_fmcdac_sched_console_configured = 1;
+		g_fmcdac_sched_console_loaded_count = 0U;
+	}
+
+	return ret;
+}
+
+static void fmcdac_awg_sched_console_emit_info(const struct fmcdac_dev *dev)
+{
+	unsigned long dds_clock_hz = 0UL;
+	unsigned dds_phase_dw = 0U;
+
+	if (dev && dev->ad9144_core) {
+		dds_clock_hz = (unsigned long)dev->ad9144_core->clock_hz;
+		dds_phase_dw = (unsigned)dev->ad9144_core->dds_phase_dw;
+	}
+
+	xil_printf("[AWG-UART] INFO base=0x%08lX max_events=%lu tick_hz=%lu "
+		   "timeout_ms=%lu dds_clock_hz=%lu dds_phase_dw=%u loaded=%lu "
+		   "configured=%u\n\r",
+		   (unsigned long)FMCDAC_AWG_SCHED_BASEADDR,
+		   (unsigned long)FMCDAC_AWG_SCHED_MAX_EVENTS,
+		   (unsigned long)FMCDAC_AWG_SCHED_TICK_HZ,
+		   (unsigned long)FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS,
+		   dds_clock_hz,
+		   dds_phase_dw,
+		   (unsigned long)g_fmcdac_sched_console_loaded_count,
+		   (unsigned)g_fmcdac_sched_console_configured);
+}
+
+static void fmcdac_awg_sched_console_emit_error(const char *reason)
+{
+	xil_printf("[AWG-UART] ERROR reason=%s\n\r", reason ? reason : "unknown");
+}
+
+static void fmcdac_awg_sched_console_emit_count_error(const char *reason,
+						      uint32_t requested_count)
+{
+	xil_printf("[AWG-UART] ERROR reason=%s requested_count=%lu max_events=%lu\n\r",
+		   reason ? reason : "unknown",
+		   (unsigned long)requested_count,
+		   (unsigned long)FMCDAC_AWG_SCHED_MAX_EVENTS);
+}
+
+static int fmcdac_awg_sched_console_loadbin(struct fmcdac_dev *dev,
+					    const char *line)
+{
+	static const char *prefix = "LOADBIN ";
+	char *endptr;
+	unsigned long count_ul;
+	uint32_t count;
+	size_t payload_bytes;
+	int ret;
+
+	if (!dev || !dev->ad9144_core || !dev->ad9144_device) {
+		fmcdac_awg_sched_console_emit_error("dac_core_unavailable");
+		return -EINVAL;
+	}
+
+	if (FMCDAC_AWG_SCHED_BASEADDR == 0U) {
+		fmcdac_awg_sched_console_emit_error("scheduler_baseaddr_zero");
+		return -ENODEV;
+	}
+
+	count_ul = strtoul(line + strlen(prefix), &endptr, 0);
+	if ((line + strlen(prefix)) == endptr || *endptr != '\0') {
+		fmcdac_awg_sched_console_emit_error("bad_loadbin_syntax");
+		return -EINVAL;
+	}
+
+	count = (uint32_t)count_ul;
+	if (count == 0U) {
+		fmcdac_awg_sched_console_emit_error("empty_event_table");
+		return -EINVAL;
+	}
+
+	if (count > FMCDAC_AWG_SCHED_MAX_EVENTS) {
+		fmcdac_awg_sched_console_emit_count_error("too_many_events", count);
+		return -E2BIG;
+	}
+
+	xil_printf("[AWG-UART] CONFIG BEGIN base=0x%08lX\n\r",
+		   (unsigned long)FMCDAC_AWG_SCHED_BASEADDR);
+	ret = fmcdac_awg_sched_console_configure();
+	if (ret != 0) {
+		xil_printf("[AWG-UART] ERROR reason=config_failed status=%d\n\r", ret);
+		return ret;
+	}
+	xil_printf("[AWG-UART] CONFIG OK\n\r");
+
+	payload_bytes = (size_t)count * sizeof(g_fmcdac_sched_console_events[0]);
+	xil_printf("[AWG-UART] LOADBIN READY count=%lu bytes=%lu\n\r",
+		   (unsigned long)count,
+		   (unsigned long)payload_bytes);
+
+	xil_printf("[AWG-UART] LOADBIN RX BEGIN bytes=%lu hex_chars=%lu\n\r",
+		   (unsigned long)payload_bytes,
+		   (unsigned long)(payload_bytes * 2U));
+	ret = fmcdac_read_exact_hex((uint8_t *)g_fmcdac_sched_console_events, payload_bytes);
+	if (ret != 0) {
+		fmcdac_awg_sched_console_emit_error("payload_read_failed");
+		return ret;
+	}
+	xil_printf("[AWG-UART] LOADBIN RX OK bytes=%lu\n\r",
+		   (unsigned long)payload_bytes);
+
+	xil_printf("[AWG-UART] LOADBIN COMMIT BEGIN count=%lu\n\r",
+		   (unsigned long)count);
+	ret = awg_sched_load_events(g_fmcdac_sched_console_events, count);
+	if (ret != 0) {
+		xil_printf("[AWG-UART] ERROR reason=load_failed status=%d requested_count=%lu max_events=%lu\n\r",
+			   ret,
+			   (unsigned long)count,
+			   (unsigned long)FMCDAC_AWG_SCHED_MAX_EVENTS);
+		g_fmcdac_sched_console_loaded_count = 0U;
+		return ret;
+	}
+
+	g_fmcdac_sched_console_loaded_count = count;
+	xil_printf("[AWG-UART] LOADBIN OK count=%lu bytes=%lu\n\r",
+		   (unsigned long)count,
+		   (unsigned long)payload_bytes);
+	return 0;
+}
+
+static int fmcdac_awg_sched_console_status(void)
+{
+	awg_sched_status_t status;
+	int ret;
+
+	if (!g_fmcdac_sched_console_configured) {
+		fmcdac_awg_sched_console_emit_error("scheduler_not_configured");
+		return -ENODEV;
+	}
+
+	ret = awg_sched_get_status(&status);
+	if (ret != 0) {
+		xil_printf("[AWG-UART] ERROR reason=status_failed status=%d\n\r", ret);
+		return ret;
+	}
+
+	xil_printf("[AWG-UART] STATUS armed=%u running=%u done=%u error=%u "
+		   "err_code=0x%02lX current=%lu loaded=%lu commit=%lu "
+		   "reinit=%lu reinit_reject=%lu irq=0x%08lX\n\r",
+		   (unsigned)status.armed,
+		   (unsigned)status.running,
+		   (unsigned)status.done,
+		   (unsigned)status.error,
+		   (unsigned long)status.err_code,
+		   (unsigned long)status.current_event,
+		   (unsigned long)status.loaded_events,
+		   (unsigned long)status.commit_count,
+		   (unsigned long)status.reinit_count,
+		   (unsigned long)status.reinit_reject_count,
+		   (unsigned long)status.irq_status_latched);
+	return 0;
+}
+
+static int fmcdac_awg_sched_console_run(struct fmcdac_dev *dev)
+{
+	awg_sched_status_t status;
+	int ret;
+
+	if (!g_fmcdac_sched_console_configured) {
+		fmcdac_awg_sched_console_emit_error("scheduler_not_configured");
+		return -ENODEV;
+	}
+
+	if (g_fmcdac_sched_console_loaded_count == 0U) {
+		fmcdac_awg_sched_console_emit_error("no_events_loaded");
+		return -EINVAL;
+	}
+
+	if (!dev || !dev->ad9144_core || !dev->ad9144_device) {
+		fmcdac_awg_sched_console_emit_error("dac_core_unavailable");
+		return -EINVAL;
+	}
+
+	ret = fmcdac_prepare_dds_output(dev, "AWG-UART");
+	if (ret != 0) {
+		xil_printf("[AWG-UART] ERROR reason=prepare_dds_failed status=%d\n\r", ret);
+		return ret;
+	}
+
+	ret = ad9144_set_nco(dev->ad9144_device, 0, 0);
+	if (ret != 0) {
+		xil_printf("[AWG-UART] ERROR reason=disable_nco_failed status=%ld\n\r",
+			   (long)ret);
+		return ret;
+	}
+
+	ret = awg_sched_set_epoch();
+	if (ret != 0) {
+		xil_printf("[AWG-UART] ERROR reason=set_epoch_failed status=%d\n\r", ret);
+		return ret;
+	}
+
+	ret = awg_sched_start();
+	if (ret != 0) {
+		xil_printf("[AWG-UART] ERROR reason=start_failed status=%d\n\r", ret);
+		return ret;
+	}
+
+	ret = awg_sched_wait_done(FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS, &status);
+	if (ret != 0) {
+		(void)awg_sched_get_status(&status);
+		fmcdac_awg_sched_console_dump(&status);
+		xil_printf("[AWG-UART] ERROR reason=wait_done_failed status=%d "
+			   "err_code=0x%02lX current=%lu loaded=%lu commit=%lu "
+			   "reinit=%lu reinit_reject=%lu irq=0x%08lX hw_status=0x%08lX\n\r",
+			   ret,
+			   (unsigned long)status.err_code,
+			   (unsigned long)status.current_event,
+			   (unsigned long)status.loaded_events,
+			   (unsigned long)status.commit_count,
+			   (unsigned long)status.reinit_count,
+			   (unsigned long)status.reinit_reject_count,
+			   (unsigned long)status.irq_status_latched,
+			   (unsigned long)status.hw_status_word);
+		return ret;
+	}
+
+	ret = awg_sched_get_status(&status);
+	if (ret != 0) {
+		xil_printf("[AWG-UART] ERROR reason=status_failed status=%d\n\r", ret);
+		return ret;
+	}
+
+	fmcdac_awg_sched_console_dump(&status);
+	xil_printf("[AWG-UART] RUN DONE loaded=%lu commit=%lu done=%u error=%u\n\r",
+		   (unsigned long)status.loaded_events,
+		   (unsigned long)status.commit_count,
+		   (unsigned)status.done,
+		   (unsigned)status.error);
+	return 0;
+}
+
+static int fmcdac_awg_sched_console_abort(void)
+{
+	awg_sched_status_t status;
+	int ret;
+
+	if (!g_fmcdac_sched_console_configured) {
+		fmcdac_awg_sched_console_emit_error("scheduler_not_configured");
+		return -ENODEV;
+	}
+
+	ret = awg_sched_stop();
+	if (ret != 0) {
+		xil_printf("[AWG-UART] ERROR reason=stop_failed status=%d\n\r", ret);
+		return ret;
+	}
+
+	ret = awg_sched_get_status(&status);
+	if (ret != 0) {
+		xil_printf("[AWG-UART] ERROR reason=status_failed status=%d\n\r", ret);
+		return ret;
+	}
+
+	fmcdac_awg_sched_console_dump(&status);
+	xil_printf("[AWG-UART] ABORT DONE loaded=%lu current=%lu running=%u done=%u error=%u\n\r",
+		   (unsigned long)status.loaded_events,
+		   (unsigned long)status.current_event,
+		   (unsigned)status.running,
+		   (unsigned)status.done,
+		   (unsigned)status.error);
+	return 0;
+}
+
+static int fmcdac_awg_sched_console_dump_status(void)
+{
+	awg_sched_status_t status;
+	int ret;
+
+	if (!g_fmcdac_sched_console_configured) {
+		fmcdac_awg_sched_console_emit_error("scheduler_not_configured");
+		return -ENODEV;
+	}
+
+	ret = awg_sched_get_status(&status);
+	if (ret != 0) {
+		xil_printf("[AWG-UART] ERROR reason=status_failed status=%d\n\r", ret);
+		return ret;
+	}
+
+	fmcdac_awg_sched_console_dump(&status);
+	return 0;
+}
+
+static void fmcdac_run_awg_sched_console(struct fmcdac_dev *dev)
+{
+	char line[64];
+
+	g_fmcdac_sched_console_loaded_count = 0U;
+	g_fmcdac_sched_console_configured = 0;
+
+	xil_printf("[AWG-UART] CONSOLE BEGIN base=0x%08lX max_events=%lu tick_hz=%lu timeout_ms=%lu\n\r",
+		   (unsigned long)FMCDAC_AWG_SCHED_BASEADDR,
+		   (unsigned long)FMCDAC_AWG_SCHED_MAX_EVENTS,
+		   (unsigned long)FMCDAC_AWG_SCHED_TICK_HZ,
+		   (unsigned long)FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS);
+	xil_printf("[AWG-UART] Ready. Commands: INFO STATUS LOADBIN <count> RUN ABORT DUMP EXIT\n\r");
+
+	while (1) {
+		if (fmcdac_read_line(line, sizeof(line)) < 0)
+			continue;
+
+		if (strcmp(line, "INFO") == 0) {
+			fmcdac_awg_sched_console_emit_info(dev);
+			continue;
+		}
+
+		if (strcmp(line, "STATUS") == 0) {
+			(void)fmcdac_awg_sched_console_status();
+			continue;
+		}
+
+		if (strncmp(line, "LOADBIN ", strlen("LOADBIN ")) == 0) {
+			(void)fmcdac_awg_sched_console_loadbin(dev, line);
+			continue;
+		}
+
+		if (strcmp(line, "RUN") == 0) {
+			(void)fmcdac_awg_sched_console_run(dev);
+			continue;
+		}
+
+		if (strcmp(line, "ABORT") == 0) {
+			(void)fmcdac_awg_sched_console_abort();
+			continue;
+		}
+
+		if (strcmp(line, "DUMP") == 0) {
+			(void)fmcdac_awg_sched_console_dump_status();
+			continue;
+		}
+
+		if (strcmp(line, "EXIT") == 0) {
+			xil_printf("[AWG-UART] Bye.\n\r");
+			break;
+		}
+
+		xil_printf("[AWG-UART] ERROR reason=unknown_command command=%s\n\r", line);
+	}
+}
+
 /**
  * @brief Force a known-good DDS tone for scope/spectrum analyzer validation.
  * @param dev - The device structure.
@@ -3779,12 +4230,16 @@ skip_stpl_zero:
 	fmcdac_latency_readback(dev);
 	fmcdac_phy_prbs_test(dev);
 
-	xil_printf("[SCHED-DET] Running scheduler path before benchmark prompts.\n\r");
-	status = fmcdac_run_scheduler_deterministic_path(dev);
-	if (status != 0)
-		xil_printf("[SCHED-DET] Deterministic scheduler path failed: %d\n\r", status);
+	if (FMCDAC_ENABLE_SCHED_DET_SMOKETEST) {
+		xil_printf("[SCHED-DET] Running scheduler path before benchmark prompts.\n\r");
+		status = fmcdac_run_scheduler_deterministic_path(dev);
+		if (status != 0)
+			xil_printf("[SCHED-DET] Deterministic scheduler path failed: %d\n\r", status);
+	}
 
-	if (g_fmcdac_enable_benchmark_prompts)
+	if (FMCDAC_ENABLE_AWG_SCHED_CONSOLE)
+		fmcdac_run_awg_sched_console(dev);
+	else if (g_fmcdac_enable_benchmark_prompts)
 		fmcdac_run_benchmark_prompt_flow(dev);
 	else
 		xil_printf("[BENCH] FMCDAC_ENABLE_BENCHMARK_PROMPTS=0; benchmark prompts disabled.\n\r");

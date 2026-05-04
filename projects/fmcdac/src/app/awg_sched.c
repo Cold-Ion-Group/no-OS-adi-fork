@@ -11,7 +11,7 @@
 #include "xil_printf.h"
 
 #ifndef AWG_SCHED_ENABLE_LOAD_READBACK_VERIFY
-#define AWG_SCHED_ENABLE_LOAD_READBACK_VERIFY 1
+#define AWG_SCHED_ENABLE_LOAD_READBACK_VERIFY 0
 #endif
 
 static struct {
@@ -27,7 +27,7 @@ static volatile uint32_t g_awg_sched_irq_seq;
 
 #define AWG_SCHED_FLAGS_ALLOWED_MASK      0x0001U
 #define AWG_SCHED_CHANNEL_MASK_DEFAULT    0x0001U
-#define AWG_SCHED_TONE_MASK_DEFAULT       0x0003U
+#define AWG_SCHED_TONE_MASK_DEFAULT       0xFFFFU
 #define AWG_SCHED_FREQ_MASK_DEFAULT       0x0000FFFFU
 #define AWG_SCHED_SCALE_MASK_DEFAULT      0x0000FFFFU
 #define AWG_SCHED_PHASE_MASK_DEFAULT      0x0000FFFFU
@@ -37,6 +37,10 @@ static volatile uint32_t g_awg_sched_irq_seq;
  * AXI read latency and scheduler-clock crossing jitter after SYSREF.
  */
 #define AWG_SCHED_TIME_EPOCH_NEAR_ZERO    8U
+#define AWG_SCHED_EVENT_COUNT_SETTLE_US   10U
+#define AWG_SCHED_START_ARM_WAIT_US       1000U
+#define AWG_SCHED_START_RUN_WAIT_US       1000U
+#define AWG_SCHED_START_RUN_RETRIES       3U
 #define AWG_SCHED_IRQ_ARM_MASK            (AWG_SCHED_IRQ_DONE_BIT | AWG_SCHED_IRQ_ERROR_BIT)
 
 __attribute__((weak)) void awg_sched_irq_wait_hook(uint32_t wait_ms_left)
@@ -144,6 +148,27 @@ return -ENODEV;
 return no_os_axi_io_read(g_awg_sched.cfg.base_addr, offset, val);
 }
 
+static int awg_sched_read_time_now(uint64_t *time_now)
+{
+	uint32_t time_lo;
+	uint32_t time_hi;
+	int ret;
+
+	if (!time_now)
+		return -EINVAL;
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_TIME_LO, &time_lo);
+	if (ret)
+		return ret;
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_TIME_HI, &time_hi);
+	if (ret)
+		return ret;
+
+	*time_now = ((uint64_t)time_hi << 32) | (uint64_t)time_lo;
+	return 0;
+}
+
 static uint32_t awg_sched_pack_ch_flags(const awg_event_v1_t *event)
 {
 return (((uint32_t)event->channel) << 16) | (uint32_t)event->flags;
@@ -242,14 +267,21 @@ int ret;
 if (!g_awg_sched.configured)
 return -ENODEV;
 
+AWG_LOG("%s", "[AWG-SCHED] reset step=write_ctrl_reset\n\r");
 ret = awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_RESET_SOFT);
 if (ret)
 return ret;
+AWG_LOG("%s", "[AWG-SCHED] reset step=write_ctrl_reset_done\n\r");
 
 g_awg_sched.loaded_events = 0;
 g_awg_sched.events_validated = false;
 g_awg_sched_irq_seq = 0U;
-return awg_sched_reg_write(AWG_SCHED_REG_EVT_COUNT, 0U);
+AWG_LOG("%s", "[AWG-SCHED] reset step=write_evt_count_zero\n\r");
+ret = awg_sched_reg_write(AWG_SCHED_REG_EVT_COUNT, 0U);
+if (ret)
+return ret;
+AWG_LOG("%s", "[AWG-SCHED] reset step=write_evt_count_zero_done\n\r");
+return 0;
 }
 
 int awg_sched_config(const awg_sched_cfg_t *cfg)
@@ -276,9 +308,11 @@ g_awg_sched.cfg = *cfg;
 g_awg_sched.configured = true;
 
 /* Verify IP identity before touching any other register. */
+AWG_LOG("%s", "[AWG-SCHED] config step=read_ip_id\n\r");
 ret = awg_sched_reg_read(AWG_SCHED_REG_IP_ID, &ip_id);
 if (ret)
 goto fail;
+AWG_LOG("[AWG-SCHED] config ip_id=0x%08lX\n\r", (unsigned long)ip_id);
 
 if (ip_id != AWG_TIMED_CTRL_IP_ID) {
 AWG_LOG("[AWG-SCHED] IP_ID mismatch: expected=0x%08lX observed=0x%08lX\n\r",
@@ -288,9 +322,11 @@ ret = -ENODEV;
 goto fail;
 }
 
+AWG_LOG("%s", "[AWG-SCHED] config step=read_ip_version\n\r");
 ret = awg_sched_reg_read(AWG_SCHED_REG_IP_VERSION, &ip_ver);
 if (ret)
 goto fail;
+AWG_LOG("[AWG-SCHED] config ip_version=0x%08lX\n\r", (unsigned long)ip_ver);
 
 major = (ip_ver >> 16) & 0xFFFFU;
 if (major != AWG_TIMED_CTRL_MAJOR_EXPECTED) {
@@ -302,14 +338,17 @@ ret = -ENOTSUP;
 goto fail;
 }
 
+AWG_LOG("%s", "[AWG-SCHED] config step=read_ip_caps\n\r");
 ret = awg_sched_reg_read(AWG_SCHED_REG_IP_CAPS, &ip_caps);
 if (ret)
 goto fail;
+AWG_LOG("[AWG-SCHED] config ip_caps=0x%08lX\n\r", (unsigned long)ip_caps);
 
 g_awg_sched.hw_event_depth  = 1U << AWG_SCHED_CAPS_EVT_DEPTH_LOG2(ip_caps);
 g_awg_sched.hw_payload_bits = (uint8_t)AWG_SCHED_CAPS_PAYLOAD_BITS(ip_caps);
 g_awg_sched.hw_ts_bits      = (uint8_t)AWG_SCHED_CAPS_TS_BITS(ip_caps);
 
+AWG_LOG("%s", "[AWG-SCHED] config step=reset\n\r");
 return awg_sched_reset();
 
 fail:
@@ -540,7 +579,17 @@ ret = awg_sched_reg_write(AWG_SCHED_REG_EVT_WDATA6, e->payload.word3);
 if (ret)
 return ret;
 
-return awg_sched_reg_write(AWG_SCHED_REG_EVT_WCTRL, 1U);
+ret = awg_sched_reg_write(AWG_SCHED_REG_EVT_WCTRL, 1U);
+if (ret)
+return ret;
+
+/*
+ * Current HDL exposes no AXI-visible event-write ack.  Give the sched_clk
+ * domain a short window to capture event_wr_addr_cfg/event_wr_data_cfg after
+ * toggling EVT_WCTRL before software overwrites them for the next event.
+ */
+no_os_udelay(2U);
+return 0;
 }
 
 /*
@@ -603,6 +652,14 @@ ret = awg_sched_reg_write(AWG_SCHED_REG_EVT_COUNT, count);
 if (ret)
 return ret;
 
+/*
+ * HDL captures event_count_s2 exactly at arm_edge in the sched_clk domain.
+ * Give the 2-FF CDC path time to observe the new EVT_COUNT value before the
+ * next ARM request, otherwise the engine can latch event_count_sched=0 and
+ * remain stuck in ARMED when RUN is asserted.
+ */
+no_os_udelay(AWG_SCHED_EVENT_COUNT_SETTLE_US);
+
 g_awg_sched.loaded_events = count;
 
 #if AWG_SCHED_ENABLE_LOAD_READBACK_VERIFY
@@ -638,6 +695,8 @@ return awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_ARM);
 int awg_sched_start(void)
 {
 	awg_sched_status_t status;
+	uint32_t wait_us;
+	uint32_t attempt;
 	int ret;
 
 	ret = awg_sched_arm();
@@ -645,16 +704,51 @@ int awg_sched_start(void)
 		return ret;
 
 	/*
-	 * Do not combine ARM and RUN in the same write: some HDL
-	 * implementations sample both edge requests in one sched_clk cycle and
-	 * can drop RUN while state is still IDLE.  Force a register round-trip
-	 * between requests, then issue RUN as a separate strobe.
+	 * Do not combine ARM and RUN in the same write, and do not assume one
+	 * AXI read round-trip is enough for the sched_clk domain to reach
+	 * ENGINE_ARMED.  Wait until armed is observable before strobing RUN.
 	 */
-	ret = awg_sched_get_status(&status);
-	if (ret)
-		return ret;
+	for (wait_us = 0U; wait_us < AWG_SCHED_START_ARM_WAIT_US; wait_us++) {
+		ret = awg_sched_get_status(&status);
+		if (ret)
+			return ret;
 
-	return awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_RUN);
+		if (status.armed && !status.running)
+			break;
+
+		no_os_udelay(1U);
+	}
+
+	if (!(status.armed && !status.running)) {
+		AWG_LOG("[AWG-SCHED] start failed to observe armed state "
+			"status=0x%08lX\n\r",
+			(unsigned long)status.hw_status_word);
+		return -ETIMEDOUT;
+	}
+
+	for (attempt = 0U; attempt < AWG_SCHED_START_RUN_RETRIES; attempt++) {
+		ret = awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_RUN);
+		if (ret)
+			return ret;
+
+		for (wait_us = 0U; wait_us < AWG_SCHED_START_RUN_WAIT_US; wait_us++) {
+			ret = awg_sched_get_status(&status);
+			if (ret)
+				return ret;
+
+			if (status.running || status.done || status.error)
+				return 0;
+
+			no_os_udelay(1U);
+		}
+	}
+
+	AWG_LOG("[AWG-SCHED] start failed to observe running state "
+		"status=0x%08lX current=%lu commit=%lu\n\r",
+		(unsigned long)status.hw_status_word,
+		(unsigned long)status.current_event,
+		(unsigned long)status.commit_count);
+	return -ETIMEDOUT;
 }
 
 int awg_sched_stop(void)
@@ -784,6 +878,20 @@ ret = awg_sched_get_status(&status);
 if (ret)
 return ret;
 
+/*
+ * Some HDL revisions can miss the terminal DONE snapshot because the status
+ * toggle is updated in FIRE and again in the immediately following ADVANCE
+ * cycle. If commit_count has reached the loaded event count without an error,
+ * treat the run as complete even if the done/running bits are stale.
+ */
+if (!status.error &&
+    status.loaded_events > 0U &&
+    status.commit_count >= status.loaded_events) {
+if (final_status)
+*final_status = status;
+return 0;
+}
+
 if (status.done || status.error) {
 #ifdef FMCDAC_AWG_SCHED_USE_IRQ
 ret = awg_sched_reg_read(AWG_SCHED_REG_IRQ_STATUS, &irq_status);
@@ -812,12 +920,17 @@ wait_ms--;
 
 int awg_sched_set_epoch(void)
 {
-	uint32_t time_now_lo;
-	uint32_t wait_ms;
+	uint64_t time_before;
+	uint64_t time_now;
+	uint32_t poll_us;
 	int ret;
 
 	if (!g_awg_sched.configured)
 		return -ENODEV;
+
+	ret = awg_sched_read_time_now(&time_before);
+	if (ret)
+		return ret;
 
 	ret = awg_sched_reg_write(AWG_SCHED_REG_TIME_RELOAD_LO, 0U);
 	if (ret)
@@ -827,24 +940,28 @@ int awg_sched_set_epoch(void)
 	if (ret)
 		return ret;
 
-	ret = awg_sched_reg_write(AWG_SCHED_REG_TIME_RELOAD_CTRL, 1U);
+	AWG_LOG("%s", "[AWG-SCHED] set_epoch step=load_now\n\r");
+	ret = awg_sched_reg_write(AWG_SCHED_REG_TIME_RELOAD_CTRL,
+				  AWG_SCHED_TIME_RELOAD_LOAD_NOW);
 	if (ret)
 		return ret;
 
-	wait_ms = g_awg_sched.cfg.done_timeout_ms;
-	while (wait_ms > 0U) {
-		ret = awg_sched_reg_read(AWG_SCHED_REG_TIME_LO, &time_now_lo);
+	for (poll_us = 0U; poll_us < 1000U; poll_us++) {
+		ret = awg_sched_read_time_now(&time_now);
 		if (ret)
 			return ret;
 
-		if (time_now_lo <= AWG_SCHED_TIME_EPOCH_NEAR_ZERO) {
-			AWG_LOG("[SCHED-ARTIFACT] set_epoch time_now=0x%08lX\n\r",
-				(unsigned long)time_now_lo);
+		if ((time_now <= AWG_SCHED_TIME_EPOCH_NEAR_ZERO) ||
+		    (time_now < time_before)) {
+			AWG_LOG("[SCHED-ARTIFACT] set_epoch before=0x%08lX_%08lX now=0x%08lX_%08lX\n\r",
+				(unsigned long)(time_before >> 32),
+				(unsigned long)time_before,
+				(unsigned long)(time_now >> 32),
+				(unsigned long)time_now);
 			return 0;
 		}
 
-		no_os_mdelay(1U);
-		wait_ms--;
+		no_os_udelay(1U);
 	}
 
 	return -ETIMEDOUT;

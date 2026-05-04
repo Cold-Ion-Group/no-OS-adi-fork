@@ -129,12 +129,18 @@
 #define AWG_SCHED_REG_IRQ_ENABLE        0x0064U
 /** IP_SCRATCH — firmware/software scratch register (RW) */
 #define AWG_SCHED_REG_IP_SCRATCH        0x0068U
-/** TIME_RELOAD_LO — next SYSREF epoch reload low word (W) */
+/** TIME_RELOAD_LO — pending scheduler epoch reload low word (RW) */
 #define AWG_SCHED_REG_TIME_RELOAD_LO    0x006CU
-/** TIME_RELOAD_HI — next SYSREF epoch reload high word (W) */
+/** TIME_RELOAD_HI — pending scheduler epoch reload high word (RW) */
 #define AWG_SCHED_REG_TIME_RELOAD_HI    0x0070U
-/** TIME_RELOAD_CTRL — write 1 to reload TIME_NOW on next SYSREF (W) */
+/**
+ * TIME_RELOAD_CTRL — epoch reload control (RW/pulse)
+ *   [0] arm reload on next SYSREF
+ *   [1] load immediately (write-1 pulse)
+ */
 #define AWG_SCHED_REG_TIME_RELOAD_CTRL  0x0074U
+#define AWG_SCHED_TIME_RELOAD_ARM_ON_SYSREF  (1U << 0)
+#define AWG_SCHED_TIME_RELOAD_LOAD_NOW       (1U << 1)
 
 /* -----------------------------------------------------------------------
  * CTRL register bit fields

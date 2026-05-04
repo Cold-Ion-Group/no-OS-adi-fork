@@ -52,13 +52,18 @@ def _extract_level(metrics: dict) -> Tuple[float, str, Optional[float]]:
     )
 
 
-def load_dds_band_series(summary_path: Path, label: Optional[str] = None) -> DdsBandSeries:
+def load_dds_band_series(
+    summary_path: Path,
+    label: Optional[str] = None,
+    groups: Optional[Sequence[str]] = None,
+) -> DdsBandSeries:
     summary_path = Path(summary_path)
     data = json.loads(summary_path.read_text(encoding="utf-8"))
     points: List[DdsBandPoint] = []
+    accepted_groups = set(groups or ("dds_band",))
 
     for step in data.get("steps", []):
-        if step.get("group") != "dds_band":
+        if step.get("group") not in accepted_groups:
             continue
         expected = step.get("expected_freq_hz") or []
         metrics = step.get("metrics") or {}

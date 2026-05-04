@@ -3,6 +3,7 @@
 # Usage:
 #   make -C projects/fmcdac/tests
 #   make -C projects/fmcdac/tests run
+#   make -C projects/fmcdac/tests run-host
 #   make -C projects/fmcdac/tests clean
 
 CC      := gcc
@@ -26,7 +27,10 @@ $(TEST_BIN): $(SRCS)
 run: $(TEST_BIN)
 	./$(TEST_BIN)
 
+run-host:
+	python awg_sched_host_test.py
+
 clean:
 	rm -f $(TEST_BIN)
 
-.PHONY: all run clean
+.PHONY: all run run-host clean

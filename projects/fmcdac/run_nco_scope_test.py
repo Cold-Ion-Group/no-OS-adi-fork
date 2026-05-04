@@ -31,6 +31,19 @@ from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from dds_band_plot import load_dds_band_series, write_dds_band_csv, write_dds_band_svg
+from awg_sched_host import (
+    AWG_CONSOLE_ERROR_MARKER,
+    AWG_CONSOLE_LOAD_OK_MARKER,
+    AWG_CONSOLE_LOAD_READY_MARKER,
+    AWG_CONSOLE_LOAD_RX_BEGIN_MARKER,
+    AWG_CONSOLE_READY_MARKER,
+    AWG_CONSOLE_RUN_DONE_MARKER,
+    build_awg_sweep_events,
+    build_uniform_freq_list,
+    pack_events,
+    parse_info_line,
+    parse_last_artifact_block,
+)
 
 try:
     import serial
@@ -62,6 +75,9 @@ UART_RTT_READY_MARKER = "[UART-RTT] Ready. Send 'PING <token>' and wait for 'PON
 UART_RTT_DONE_MARKER = "[UART-RTT] Done."
 DDS_SWEEP_START_MARKER = "[DDS] AXI DAC core:"
 AWG_SWEEP_START_PROMPT = "[AWG-SWEEP] Run AWG scheduler DDS sweep? [y/N]:"
+AWG_CONSOLE_INFO_PREFIX = "[AWG-UART] INFO "
+AWG_CONSOLE_BYE_MARKER = "[AWG-UART] Bye."
+AWG_SET_EPOCH_ARTIFACT_PREFIX = "[SCHED-ARTIFACT] set_epoch before="
 TRACE_MODE_TOKENS = {
     "write": "WRIT",
     "average": "AVER",
@@ -81,6 +97,13 @@ DEFAULT_SFDR_MIN_SEARCH_HZ = 5_000_000.0
 DEFAULT_SFDR_MAX_SEARCH_HZ = 1_000_000_000.0
 DEFAULT_DYNAMIC_INTENDED_MARGIN_HZ = 2_000_000.0
 DEFAULT_BULK_PROMPT_DISABLE_STEP_THRESHOLD = 1000
+AWG_SWEEP_ANALYZER_DEFAULT_DWELL_US = 2_000_000
+AWG_SWEEP_ANALYZER_MIN_DWELL_US = 250_000
+AWG_SWEEP_ANALYZER_SETTLE_FRACTION = 0.05
+AWG_SWEEP_ANALYZER_MIN_SETTLE_S = 0.005
+AWG_SWEEP_ANALYZER_MAX_SETTLE_S = 0.050
+AWG_SWEEP_MEASURE_MIN_SPAN_HZ = 500_000.0
+AWG_SWEEP_MEASURE_MAX_SPAN_HZ = 1_000_000.0
 LEGACY_DDS_BAND_FREQS_HZ = [
     10_000_000.0,
     100_000_000.0,
@@ -382,6 +405,41 @@ def build_single_tone_step_specs(
         )
     return specs
 
+
+def build_awg_scheduler_step_specs(freqs_hz: Sequence[float]) -> List[StepSpec]:
+    specs = build_single_tone_step_specs(
+        group="awg_scheduler",
+        tag="AWG-SCHED",
+        freqs_hz=freqs_hz,
+        description_prefix="AWG scheduler DDS tone",
+    )
+    if len(freqs_hz) < 2:
+        return specs
+
+    sorted_freqs = sorted(float(item) for item in freqs_hz)
+    min_spacing_hz = min(
+        sorted_freqs[index + 1] - sorted_freqs[index]
+        for index in range(len(sorted_freqs) - 1)
+    )
+    narrow_span_hz = max(
+        AWG_SWEEP_MEASURE_MIN_SPAN_HZ,
+        min(AWG_SWEEP_MEASURE_MAX_SPAN_HZ, min_spacing_hz * 0.5),
+    )
+
+    return [
+        StepSpec(
+            group=item.group,
+            index=item.index,
+            name=item.name,
+            marker=item.marker,
+            description=item.description,
+            expected_freq_hz=item.expected_freq_hz,
+            span_hz=narrow_span_hz,
+            search_margin_hz=narrow_span_hz / 2.0,
+        )
+        for item in specs
+    ]
+
 DYNAMIC_RETUNE_STEP_SPECS = [
     DynamicRetuneSpec(
         index=1,
@@ -499,6 +557,10 @@ class UartCoordinator:
         self.ser.write(payload)
         self.ser.flush()
 
+    def send_bytes(self, payload: bytes) -> None:
+        self.ser.write(payload)
+        self.ser.flush()
+
     def send_line(self, text: str = "") -> None:
         self.send(text + "\r")
 
@@ -547,6 +609,43 @@ class UartCoordinator:
         end = found[0] + len(found[1])
         self._buffer = self._buffer[end:]
         return found[1]
+
+    def wait_for_line_containing(self, needle: str, timeout_s: float) -> str:
+        line, _ = self.wait_for_line_containing_timed(needle, timeout_s)
+        return line
+
+    def wait_for_line_containing_timed(self, needle: str, timeout_s: float) -> Tuple[str, float]:
+        deadline = time.monotonic() + timeout_s
+
+        while time.monotonic() < deadline:
+            matched = self._consume_line_containing(needle)
+            if matched is not None:
+                return matched, time.monotonic()
+
+            if not self.pump():
+                time.sleep(0.05)
+
+        raise TimeoutError(f"Timed out waiting for UART line containing: {needle!r}")
+
+    def _consume_line_containing(self, needle: str) -> Optional[str]:
+        pos = self._buffer.find(needle)
+        if pos < 0:
+            return None
+
+        line_start = max(self._buffer.rfind("\n", 0, pos), self._buffer.rfind("\r", 0, pos))
+        if line_start < 0:
+            line_start = 0
+        else:
+            line_start += 1
+
+        line_end_candidates = [idx for idx in (self._buffer.find("\n", pos), self._buffer.find("\r", pos)) if idx >= 0]
+        if not line_end_candidates:
+            return None
+
+        line_end = min(line_end_candidates)
+        line = self._buffer[line_start:line_end]
+        self._buffer = self._buffer[line_end + 1 :]
+        return line.strip()
 
 
 class RohdeSchwarzFSH:
@@ -1024,6 +1123,77 @@ class RohdeSchwarzFSH:
         )
         return trace_freqs_hz, trace_levels_dbm, metrics
 
+    def capture_known_tone(
+        self,
+        step: StepSpec,
+        settings: AnalyzerSettings,
+    ) -> Tuple[List[float], List[float], SpectrumMetrics]:
+        expected_hz = step.expected_freq_hz[0]
+        center_hz = expected_hz
+        span_hz = step.span_hz
+        search_left_hz = center_hz - (span_hz / 2.0)
+        search_right_hz = center_hz + (span_hz / 2.0)
+
+        self._configure_spectrum_measurement(center_hz, span_hz, settings)
+        self._write(f"CALC:MARK1:X {expected_hz}")
+        marker_power_dbm = self._query_float("CALC:MARK1:Y?")
+        try:
+            marker_freq_hz = self._query_float("CALC:MARK1:X?")
+        except Exception:
+            marker_freq_hz = expected_hz
+
+        self._write("CALC:MARK1:MAX")
+        peak_power_dbm = self._query_float("CALC:MARK1:Y?")
+        peak_freq_hz = self._query_float("CALC:MARK1:X?")
+
+        trace_capture_degraded = False
+        trace_capture_error = None
+        if settings.capture_trace:
+            try:
+                trace_freqs_hz, trace_levels_dbm = self._capture_trace_data(center_hz, span_hz)
+            except Exception as exc:
+                trace_capture_degraded = True
+                trace_capture_error = str(exc)
+                print(f"[HOST] Analyzer trace fallback after '{self.last_io}': {exc}")
+                trace_freqs_hz = [peak_freq_hz]
+                trace_levels_dbm = [peak_power_dbm]
+        else:
+            trace_freqs_hz = [peak_freq_hz]
+            trace_levels_dbm = [peak_power_dbm]
+
+        peak_index = max(range(len(trace_levels_dbm)), key=lambda idx: trace_levels_dbm[idx])
+        trace_peak_power_dbm = trace_levels_dbm[peak_index]
+        trace_peak_freq_hz = trace_freqs_hz[peak_index]
+
+        metrics = SpectrumMetrics(
+            trace_points=len(trace_levels_dbm),
+            center_hz=center_hz,
+            span_hz=span_hz,
+            search_left_hz=search_left_hz,
+            search_right_hz=search_right_hz,
+            rbw_hz=settings.rbw_hz,
+            vbw_hz=settings.vbw_hz,
+            sweep_count=settings.sweep_count,
+            trace_mode=settings.trace_mode,
+            detector=settings.detector,
+            reference_level_dbm=settings.reference_level_dbm,
+            display_range_db=settings.display_range_db,
+            attenuation_auto=settings.attenuation_auto,
+            preamp_on=settings.preamp_on,
+            impedance_ohms=settings.impedance_ohms,
+            power_dbm=peak_power_dbm,
+            power_freq_hz=peak_freq_hz,
+            marker_power_dbm=marker_power_dbm,
+            marker_freq_hz=marker_freq_hz,
+            trace_peak_power_dbm=trace_peak_power_dbm,
+            trace_peak_freq_hz=trace_peak_freq_hz,
+            nearest_expected_hz=expected_hz,
+            nearest_error_hz=peak_freq_hz - expected_hz,
+            trace_capture_degraded=trace_capture_degraded,
+            trace_capture_error=trace_capture_error,
+        )
+        return trace_freqs_hz, trace_levels_dbm, metrics
+
     def capture_sfdr(
         self,
         step: StepSpec,
@@ -1224,6 +1394,40 @@ def capture_trace_step(
     return summary
 
 
+def capture_known_tone_step(
+    analyzer: RohdeSchwarzFSH,
+    output_dir: Path,
+    step: StepSpec,
+    settings: AnalyzerSettings,
+    dump_analyzer_state: bool = False,
+    write_json: bool = True,
+) -> StepCaptureSummary:
+    trace_freqs_hz, trace_levels_dbm, metrics = analyzer.capture_known_tone(step, settings)
+
+    csv_path = output_dir / f"step{step.index:02d}_{step.name}.csv"
+    json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
+    save_trace_csv(csv_path, trace_freqs_hz, trace_levels_dbm)
+    if write_json:
+        write_step_json(
+            json_path,
+            analyzer.idn,
+            step,
+            metrics,
+            extra=build_step_extra(analyzer, dump_analyzer_state),
+        )
+
+    return StepCaptureSummary(
+        group=step.group,
+        step_index=step.index,
+        name=step.name,
+        marker=step.marker,
+        description=step.description,
+        expected_freq_hz=step.expected_freq_hz,
+        csv_path=str(csv_path.resolve()),
+        metrics=metrics,
+    )
+
+
 def write_step_json(
     path: Path,
     analyzer_idn: str,
@@ -1258,6 +1462,42 @@ def build_step_extra(
     if dump_analyzer_state:
         payload["analyzer_state"] = analyzer.readback_state()
     return payload
+
+
+def build_awg_scheduler_analyzer_settings(base: AnalyzerSettings) -> AnalyzerSettings:
+    if base.capture_trace:
+        return base
+
+    return AnalyzerSettings(
+        rbw_hz=base.rbw_hz,
+        vbw_hz=base.vbw_hz,
+        sweep_count=1,
+        trace_mode="write",
+        detector=base.detector,
+        reference_level_dbm=base.reference_level_dbm,
+        display_range_db=base.display_range_db,
+        attenuation_auto=base.attenuation_auto,
+        preamp_on=base.preamp_on,
+        impedance_ohms=base.impedance_ohms,
+        capture_trace=False,
+    )
+
+
+def resolve_awg_sweep_dwell_us(args: argparse.Namespace, *, analyzer_enabled: bool) -> int:
+    if args.awg_sweep_dwell_us is not None:
+        dwell_us = args.awg_sweep_dwell_us
+    elif analyzer_enabled:
+        dwell_us = AWG_SWEEP_ANALYZER_DEFAULT_DWELL_US
+    else:
+        dwell_us = 1000
+
+    if analyzer_enabled and dwell_us < AWG_SWEEP_ANALYZER_MIN_DWELL_US:
+        raise RuntimeError(
+            "AWG sweep analyzer validation requires a longer dwell window. "
+            f"Use --awg-sweep-dwell-us >= {AWG_SWEEP_ANALYZER_MIN_DWELL_US}."
+        )
+
+    return dwell_us
 
 
 def parse_args() -> argparse.Namespace:
@@ -1408,7 +1648,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-awg-sweep",
         action="store_true",
-        help="Trigger the AWG scheduler DDS sweep prompt before DDS-band.",
+        help="Run the dedicated AWG scheduler UART console path with host-uploaded events.",
+    )
+    parser.add_argument(
+        "--run-full-integration",
+        action="store_true",
+        help="Run the uploaded AWG scheduler pass first, then rerun the normal analyzer benchmark suite as a second pass.",
     )
     parser.add_argument(
         "--awg-sweep-start-hz",
@@ -1444,7 +1689,7 @@ def parse_args() -> argparse.Namespace:
         "--awg-sweep-start-ticks",
         type=int,
         default=None,
-        help="AWG sweep start tick offset (scheduler ticks).",
+        help="AWG sweep start tick offset (scheduler ticks). Defaults to a safe host-computed startup margin.",
     )
     parser.add_argument(
         "--awg-sweep-tone",
@@ -1743,6 +1988,8 @@ def parse_optional_sweep_range(
 
 
 def ensure_args(args: argparse.Namespace) -> None:
+    awg_console_mode = awg_scheduler_console_requested(args)
+
     if args.list_visa:
         resources = RohdeSchwarzFSH.list_resources(args.visa_backend)
         if resources:
@@ -1752,8 +1999,13 @@ def ensure_args(args: argparse.Namespace) -> None:
             print("No VISA resources found.")
         raise SystemExit(0)
 
-    if not args.visa_resource:
+    if not awg_console_mode and not args.visa_resource:
         raise SystemExit("--visa-resource is required unless --list-visa is used")
+    if args.run_full_integration:
+        if not args.run_awg_sweep:
+            raise SystemExit("--run-full-integration requires --run-awg-sweep")
+        if not args.visa_resource:
+            raise SystemExit("--run-full-integration requires --visa-resource")
     if not args.serial_port:
         raise SystemExit("--serial-port is required for coordinated UART + analyzer operation")
     if args.sweep_count < 1:
@@ -1953,6 +2205,451 @@ def build_sweep_override_cflags(
     if not defines:
         return ""
     return " ".join(defines)
+
+
+def awg_scheduler_console_requested(args: argparse.Namespace) -> bool:
+    return bool(
+        args.run_awg_sweep
+        and args.awg_sweep_start_hz is not None
+        and args.awg_sweep_stop_hz is not None
+        and args.awg_sweep_step_hz is not None
+    )
+
+
+def rewrite_self_invocation_args(
+    argv: Sequence[str],
+    *,
+    output_dir: Path,
+    keep_run_awg_sweep: bool,
+) -> List[str]:
+    rewritten: List[str] = []
+    skip_next = False
+
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+
+        if arg == "--run-full-integration":
+            continue
+
+        if arg == "--output-dir":
+            skip_next = True
+            continue
+
+        if not keep_run_awg_sweep and arg == "--run-awg-sweep":
+            continue
+
+        rewritten.append(arg)
+
+    rewritten.extend(["--output-dir", str(output_dir)])
+    return rewritten
+
+
+def run_full_integration_mode(args: argparse.Namespace) -> int:
+    script_path = Path(__file__).resolve()
+    script_dir = script_path.parent
+    parent_output_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else script_dir / "capture_runs" / utc_timestamp()
+    )
+    parent_output_dir.mkdir(parents=True, exist_ok=True)
+
+    awg_output_dir = parent_output_dir / "awg_scheduler_pass"
+    suite_output_dir = parent_output_dir / "full_suite_pass"
+
+    awg_cmd = [
+        sys.executable,
+        str(script_path),
+        *rewrite_self_invocation_args(
+            sys.argv[1:],
+            output_dir=awg_output_dir,
+            keep_run_awg_sweep=True,
+        ),
+    ]
+    print("[HOST] Full integration pass 1/2: uploaded AWG scheduler sweep")
+    print(f"[HOST] Output dir: {awg_output_dir}")
+    awg_result = subprocess.run(awg_cmd, cwd=str(script_dir))
+    if awg_result.returncode != 0:
+        print(f"[HOST] AWG scheduler pass failed with exit code {awg_result.returncode}")
+        return awg_result.returncode
+
+    suite_cmd = [
+        sys.executable,
+        str(script_path),
+        *rewrite_self_invocation_args(
+            sys.argv[1:],
+            output_dir=suite_output_dir,
+            keep_run_awg_sweep=False,
+        ),
+    ]
+    print("[HOST] Full integration pass 2/2: analyzer benchmark suite")
+    print(f"[HOST] Output dir: {suite_output_dir}")
+    suite_result = subprocess.run(suite_cmd, cwd=str(script_dir))
+    if suite_result.returncode != 0:
+        print(f"[HOST] Analyzer suite pass failed with exit code {suite_result.returncode}")
+        return suite_result.returncode
+
+    composite_summary = {
+        "mode": "full_integration",
+        "awg_scheduler_output_dir": str(awg_output_dir.resolve()),
+        "analyzer_suite_output_dir": str(suite_output_dir.resolve()),
+        "awg_scheduler_summary": str((awg_output_dir / "awg_scheduler_run.json").resolve()),
+        "analyzer_suite_summary": str((suite_output_dir / "summary.json").resolve()),
+        "awg_scheduler_exit_code": awg_result.returncode,
+        "analyzer_suite_exit_code": suite_result.returncode,
+    }
+    summary_path = parent_output_dir / "full_integration_summary.json"
+    summary_path.write_text(json.dumps(composite_summary, indent=2) + "\n", encoding="utf-8")
+    print(f"[HOST] Full integration summary written to {summary_path}")
+    return 0
+
+
+def build_awg_scheduler_console_cflags(args: argparse.Namespace) -> str:
+    defines: List[str] = [
+        "-DFMCDAC_ENABLE_AWG_SCHED_CONSOLE=1",
+        "-DFMCDAC_ENABLE_BENCHMARK_PROMPTS=0",
+        "-DFMCDAC_ENABLE_SCHED_DET_SMOKETEST=0",
+    ]
+    if args.awg_sched_baseaddr is not None:
+        defines.append(f"-DFMCDAC_AWG_SCHED_BASEADDR=0x{args.awg_sched_baseaddr:X}U")
+    if args.awg_sched_max_events is not None:
+        defines.append(f"-DFMCDAC_AWG_SCHED_MAX_EVENTS={args.awg_sched_max_events}U")
+    if args.awg_sched_tick_hz is not None:
+        defines.append(f"-DFMCDAC_AWG_SCHED_TICK_HZ={args.awg_sched_tick_hz}U")
+    if args.awg_sched_timeout_ms is not None:
+        defines.append(f"-DFMCDAC_AWG_SCHED_DONE_TIMEOUT_MS={args.awg_sched_timeout_ms}U")
+    return " ".join(defines)
+
+
+def execute_awg_scheduler_uploaded_sweep(
+    uart: "UartCoordinator",
+    console_log: "ConsoleLog",
+    args: argparse.Namespace,
+    output_dir: Path,
+    analyzer: Optional["RohdeSchwarzFSH"] = None,
+    analyzer_settings: Optional[AnalyzerSettings] = None,
+    dump_analyzer_state: bool = False,
+) -> dict:
+    matched = uart.wait_for(
+        AWG_CONSOLE_READY_MARKER,
+        args.uart_timeout,
+        extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+    )
+    if matched == AWG_CONSOLE_ERROR_MARKER:
+        raise RuntimeError("Scheduler console reported an error before ready.")
+    uart.send_line("INFO")
+    info_line = uart.wait_for_line_containing(AWG_CONSOLE_INFO_PREFIX, args.uart_timeout)
+    info = parse_info_line(info_line)
+
+    if info.base_addr == 0:
+        raise RuntimeError("Scheduler console is enabled, but FMCDAC_AWG_SCHED_BASEADDR is 0.")
+
+    freqs_hz = build_uniform_freq_list(
+        float(args.awg_sweep_start_hz),
+        float(args.awg_sweep_stop_hz),
+        float(args.awg_sweep_step_hz),
+    )
+    if len(freqs_hz) > info.max_events:
+        raise RuntimeError(
+            f"Requested {len(freqs_hz)} AWG scheduler events, but firmware reports max_events={info.max_events}."
+        )
+
+    dwell_us = resolve_awg_sweep_dwell_us(args, analyzer_enabled=analyzer is not None)
+
+    events = build_awg_sweep_events(
+        freqs_hz,
+        tick_hz=info.tick_hz,
+        dds_clock_hz=info.dds_clock_hz,
+        dds_phase_dw=info.dds_phase_dw,
+        tone=args.awg_sweep_tone if args.awg_sweep_tone is not None else 0,
+        scale_u=args.awg_sweep_scale_u if args.awg_sweep_scale_u is not None else 700000,
+        start_ticks=args.awg_sweep_start_ticks if args.awg_sweep_start_ticks is not None else 0,
+        dwell_us=dwell_us,
+    )
+    payload = pack_events(events)
+    payload_hex = payload.hex()
+
+    uart.send_line(f"LOADBIN {len(events)}")
+    matched = uart.wait_for(
+        AWG_CONSOLE_LOAD_READY_MARKER,
+        args.uart_timeout,
+        extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+    )
+    if matched == AWG_CONSOLE_ERROR_MARKER:
+        raise RuntimeError("Scheduler console reported an error before accepting LOADBIN payload.")
+    matched = uart.wait_for(
+        AWG_CONSOLE_LOAD_RX_BEGIN_MARKER,
+        args.uart_timeout,
+        extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+    )
+    if matched == AWG_CONSOLE_ERROR_MARKER:
+        raise RuntimeError("Scheduler console reported an error before entering LOADBIN receive mode.")
+    for offset in range(0, len(payload_hex), 64):
+        uart.send(payload_hex[offset:offset + 64])
+        time.sleep(0.002)
+    uart.send_line()
+    matched = uart.wait_for(
+        AWG_CONSOLE_LOAD_OK_MARKER,
+        args.uart_timeout,
+        extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+    )
+    if matched == AWG_CONSOLE_ERROR_MARKER:
+        raise RuntimeError("Scheduler console reported an error during LOADBIN.")
+
+    awg_step_specs = build_awg_scheduler_step_specs(freqs_hz)
+
+    uart.send_line("RUN")
+    scheduler_epoch_line = None
+    scheduler_epoch_monotonic_s = None
+    if analyzer is not None:
+        scheduler_epoch_line, scheduler_epoch_monotonic_s = uart.wait_for_line_containing_timed(
+            AWG_SET_EPOCH_ARTIFACT_PREFIX,
+            args.uart_timeout,
+        )
+
+    measurement_steps: List[StepCaptureSummary] = []
+    measurement_windows: List[dict] = []
+    if analyzer is not None:
+        if analyzer_settings is None:
+            raise RuntimeError("Analyzer settings were not provided for AWG sweep validation.")
+        if scheduler_epoch_monotonic_s is None:
+            raise RuntimeError("Missing scheduler epoch anchor for AWG sweep validation.")
+
+        reference_power_dbm: Optional[float] = None
+        reference_step_name: Optional[str] = None
+
+        for index, (step, event) in enumerate(zip(awg_step_specs, events), start=1):
+            event_start_s = scheduler_epoch_monotonic_s + (
+                float(event.timestamp_ticks) / float(info.tick_hz)
+            )
+            if index < len(events):
+                next_event_start_s = scheduler_epoch_monotonic_s + (
+                    float(events[index].timestamp_ticks) / float(info.tick_hz)
+                )
+            else:
+                next_event_start_s = event_start_s + (dwell_us / 1_000_000.0)
+
+            dwell_s = max(next_event_start_s - event_start_s, dwell_us / 1_000_000.0)
+            settle_s = min(
+                AWG_SWEEP_ANALYZER_MAX_SETTLE_S,
+                max(AWG_SWEEP_ANALYZER_MIN_SETTLE_S, dwell_s * AWG_SWEEP_ANALYZER_SETTLE_FRACTION),
+            )
+            capture_target_s = event_start_s + settle_s
+
+            now_s = time.monotonic()
+            if now_s < capture_target_s:
+                time.sleep(capture_target_s - now_s)
+
+            capture_start_s = time.monotonic()
+            if index < len(events) and capture_start_s >= next_event_start_s:
+                raise RuntimeError(
+                    f"Missed AWG sweep measurement window for step {index}/{len(events)} at "
+                    f"{step.expected_freq_hz[0] / 1e6:.6f} MHz. Increase --awg-sweep-dwell-us."
+                )
+
+            summary = capture_known_tone_step(
+                analyzer=analyzer,
+                output_dir=output_dir,
+                step=step,
+                settings=analyzer_settings,
+                dump_analyzer_state=dump_analyzer_state,
+                write_json=False,
+            )
+            capture_end_s = time.monotonic()
+
+            if index < len(events) and capture_end_s >= next_event_start_s:
+                raise RuntimeError(
+                    f"Analyzer capture overran AWG sweep step {index}/{len(events)} at "
+                    f"{step.expected_freq_hz[0] / 1e6:.6f} MHz. Increase --awg-sweep-dwell-us."
+                )
+
+            metrics = summary.metrics
+            if reference_power_dbm is None:
+                reference_power_dbm = metrics.power_dbm
+                reference_step_name = step.name
+            metrics.reference_power_dbm = reference_power_dbm
+            metrics.reference_step_name = reference_step_name
+            metrics.power_delta_db = metrics.power_dbm - reference_power_dbm
+
+            json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
+            write_step_json(
+                json_path,
+                analyzer.idn,
+                step,
+                metrics,
+                extra=build_step_extra(
+                    analyzer,
+                    dump_analyzer_state,
+                    {
+                        "scheduler_event_index": index - 1,
+                        "scheduler_timestamp_ticks": event.timestamp_ticks,
+                        "capture_window": {
+                            "event_start_s_from_epoch": event_start_s - scheduler_epoch_monotonic_s,
+                            "event_end_s_from_epoch": next_event_start_s - scheduler_epoch_monotonic_s,
+                            "capture_target_s_from_epoch": capture_target_s - scheduler_epoch_monotonic_s,
+                            "capture_start_s_from_epoch": capture_start_s - scheduler_epoch_monotonic_s,
+                            "capture_end_s_from_epoch": capture_end_s - scheduler_epoch_monotonic_s,
+                        },
+                    },
+                ),
+            )
+
+            measurement_steps.append(summary)
+            measurement_windows.append(
+                {
+                    "step_index": step.index,
+                    "event_index": index - 1,
+                    "expected_freq_hz": step.expected_freq_hz[0],
+                    "scheduler_timestamp_ticks": event.timestamp_ticks,
+                    "event_start_s_from_epoch": event_start_s - scheduler_epoch_monotonic_s,
+                    "event_end_s_from_epoch": next_event_start_s - scheduler_epoch_monotonic_s,
+                    "capture_target_s_from_epoch": capture_target_s - scheduler_epoch_monotonic_s,
+                    "capture_start_s_from_epoch": capture_start_s - scheduler_epoch_monotonic_s,
+                    "capture_end_s_from_epoch": capture_end_s - scheduler_epoch_monotonic_s,
+                }
+            )
+            print_step_summary(step, metrics)
+
+    matched = uart.wait_for(
+        AWG_CONSOLE_RUN_DONE_MARKER,
+        args.uart_timeout,
+        extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+    )
+    if matched == AWG_CONSOLE_ERROR_MARKER:
+        raise RuntimeError("Scheduler console reported an error during RUN.")
+    uart.send_line("EXIT")
+    matched = uart.wait_for(
+        AWG_CONSOLE_BYE_MARKER,
+        args.uart_timeout,
+        extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+    )
+    if matched == AWG_CONSOLE_ERROR_MARKER:
+        raise RuntimeError("Scheduler console reported an error during EXIT.")
+
+    artifact = parse_last_artifact_block(console_log.file_path.read_text(encoding="utf-8"))
+    summary = {
+        "mode": "awg_scheduler_console",
+        "console_info_initial": asdict(info),
+        "info": asdict(info),
+        "final_status": asdict(artifact.status),
+        "completed_successfully": bool(
+            artifact.status.error == 0 and artifact.status.commit_count >= len(events)
+        ),
+        "analyzer_validated": analyzer is not None,
+        "analyzer_idn": None if analyzer is None else analyzer.idn,
+        "dwell_us": dwell_us,
+        "scheduler_epoch_anchor_line": scheduler_epoch_line,
+        "event_count": len(events),
+        "event_payload_bytes": len(payload),
+        "event_payload_hex_chars": len(payload_hex),
+        "freqs_hz": freqs_hz,
+        "events": [asdict(event) for event in events],
+        "steps": [asdict(step) for step in measurement_steps],
+        "measurement_windows": measurement_windows,
+        "artifact": asdict(artifact),
+        "uart_log": str(console_log.file_path),
+    }
+    summary_path = output_dir / "awg_scheduler_run.json"
+    summary_path.write_text(json.dumps(summary, indent=2, default=json_default) + "\n", encoding="utf-8")
+    if measurement_steps:
+        write_single_tone_band_artifacts(
+            summary_path,
+            output_dir,
+            output_dir.name,
+            groups=("awg_scheduler",),
+            title="AWG Scheduler Sweep Level Delta vs Frequency",
+            stem="awg_sweep_plot",
+        )
+    print(f"[HOST] AWG scheduler run summary written to {summary_path}")
+    return summary
+
+
+def run_awg_scheduler_console_mode(args: argparse.Namespace) -> int:
+    script_dir = Path(__file__).resolve().parent
+    output_dir = Path(args.output_dir) if args.output_dir else script_dir / "capture_runs" / utc_timestamp()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    console_log = ConsoleLog(output_dir / "uart.log")
+    uart = None
+    analyzer = None
+    try:
+        analyzer_settings = None
+        if getattr(args, "visa_resource", None):
+            analyzer = RohdeSchwarzFSH(args.visa_resource, args.visa_backend, args.analyzer_timeout)
+            print(f"[HOST] Analyzer connected: {analyzer.idn}")
+            if args.analyzer_preset != "off":
+                print(f"[HOST] Applying analyzer preset: {args.analyzer_preset}")
+                analyzer.apply_preset(args.analyzer_preset)
+                print("[HOST] Analyzer preset complete.")
+            analyzer_settings = build_awg_scheduler_analyzer_settings(build_analyzer_settings(args))
+            if analyzer.legacy_firmware and analyzer_settings.capture_trace:
+                raise RuntimeError(
+                    f"{analyzer.trace_capture_unsupported_message()} Requested option: --capture-trace."
+                )
+
+        uart = UartCoordinator(
+            port=args.serial_port,
+            baudrate=args.baudrate,
+            timeout_s=args.uart_timeout,
+            log=console_log,
+            dtr=tristate_arg(args.serial_dtr),
+            rts=tristate_arg(args.serial_rts),
+        )
+        print(f"[HOST] UART connected: {args.serial_port} @ {args.baudrate}")
+
+        settings_files = resolve_xilinx_settings(args)
+        extra_cflags = build_awg_scheduler_console_cflags(args)
+        make_env = {"NEW_CFLAGS": extra_cflags}
+        make_args = combine_make_args(args.make_args)
+
+        if not args.skip_make_run:
+            rx_before = uart.rx_count
+            for item in settings_files:
+                print(f"[HOST] Using Xilinx settings: {item}")
+            print("[HOST] Launching 'make run' for AWG scheduler console...")
+            run_make_run(
+                project_dir=script_dir,
+                uart=uart,
+                timeout_s=args.make_timeout,
+                settings_files=settings_files,
+                make_args=make_args,
+                extra_env=make_env,
+                update_first=True,
+                clean_first=True,
+            )
+            print("[HOST] 'make run' completed.")
+
+            if uart.rx_count == rx_before:
+                print(f"[HOST] Reopening UART {args.serial_port} after programming...")
+                uart.reopen()
+
+        execute_awg_scheduler_uploaded_sweep(
+            uart=uart,
+            console_log=console_log,
+            args=args,
+            output_dir=output_dir,
+            analyzer=analyzer,
+            analyzer_settings=analyzer_settings,
+            dump_analyzer_state=getattr(args, "dump_analyzer_state", False),
+        )
+        return 0
+    except Exception as exc:
+        print(f"[HOST] AWG scheduler console error: {exc}")
+        return 1
+    finally:
+        if uart is not None:
+            try:
+                uart.close()
+            except Exception:
+                pass
+        if analyzer is not None:
+            try:
+                analyzer.close()
+            except Exception:
+                pass
+        console_log.close()
 
 
 def build_phase_noise_settings(
@@ -2844,20 +3541,35 @@ def run_uart_rtt_benchmark(
 
 
 def write_dds_band_artifacts(summary_path: Path, output_dir: Path, label: str) -> None:
+    write_single_tone_band_artifacts(
+        summary_path,
+        output_dir,
+        label,
+        groups=("dds_band",),
+        title="DDS Band Level Delta vs Frequency",
+        stem="dds_band_plot",
+    )
+
+
+def write_single_tone_band_artifacts(
+    summary_path: Path,
+    output_dir: Path,
+    label: str,
+    *,
+    groups: Sequence[str],
+    title: str,
+    stem: str,
+) -> None:
     try:
-        series = load_dds_band_series(summary_path, label)
+        series = load_dds_band_series(summary_path, label, groups=groups)
     except Exception:
         return
 
     if not series.points:
         return
 
-    write_dds_band_csv([series], output_dir / "dds_band_plot.csv")
-    write_dds_band_svg(
-        [series],
-        output_dir / "dds_band_plot.svg",
-        "DDS Band Level Delta vs Frequency",
-    )
+    write_dds_band_csv([series], output_dir / f"{stem}.csv")
+    write_dds_band_svg([series], output_dir / f"{stem}.svg", title)
 
 
 def write_sfdr_results_csv(steps: Sequence[StepCaptureSummary], output_path: Path) -> None:
@@ -2997,6 +3709,11 @@ def require_prompt(
 def main() -> int:
     args = parse_args()
     ensure_args(args)
+    if args.run_full_integration:
+        return run_full_integration_mode(args)
+    if awg_scheduler_console_requested(args):
+        return run_awg_scheduler_console_mode(args)
+
     script_dir = Path(__file__).resolve().parent
     project_dir = script_dir
     output_dir = Path(args.output_dir) if args.output_dir else script_dir / "capture_runs" / utc_timestamp()

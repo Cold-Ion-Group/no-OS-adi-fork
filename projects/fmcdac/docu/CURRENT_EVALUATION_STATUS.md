@@ -248,14 +248,17 @@ Implemented in host tooling:
 
 1. direct `make run` orchestration from `projects/fmcdac`
 2. UART prompt handling for DDS-band, SFDR, dynamic retune, throughput, and RTT
-3. FSH8 DDS-band measurement
-4. FSH8 SFDR measurement using segmented spur sweeps
-5. close-in carrier trace capture during selected SFDR steps
-6. dynamic retune burst capture with intended-tone windows plus guarded spur search
-7. boot-repeatability capture via
+3. uploaded AWG scheduler console flow with measured per-step FSH8 validation
+4. two-pass full-integration wrapper: measured AWG scheduler pass plus legacy suite rerun
+5. FSH8 DDS-band measurement
+6. FSH8 SFDR measurement using segmented spur sweeps
+7. close-in carrier trace capture during selected SFDR steps
+8. dynamic retune burst capture with intended-tone windows plus guarded spur search
+9. boot-repeatability capture via
    [`capture_boot_repeatability.py`](../capture_boot_repeatability.py)
-8. artifact generation:
+10. artifact generation:
    - `summary.json`
+   - `awg_scheduler_run.json`
    - per-step CSV/JSON
    - `sfdr_results.csv`
    - `phase_noise_results.csv`

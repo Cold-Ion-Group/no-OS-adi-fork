@@ -11,6 +11,7 @@ The current primary workflow is DDS-focused:
 4. `DYNAMIC-SFDR` retune-burst benchmarking
 5. `THROUGHPUT` firmware update-rate baselines
 6. `UART-RTT` host latency baselines
+7. optional uploaded `AWG-SCHED` measured sweep pass
 
 `NCO-TEST` still exists in the firmware, but it is now optional and skipped by
 default.
@@ -39,7 +40,35 @@ Optional step:
 1. `NCO-TEST`
    - only if `--run-nco-test` is given
 
+Separate scheduler path:
+
+1. uploaded `AWG-SCHED`
+   - host-built event table
+   - dedicated scheduler UART console
+   - optional per-step analyzer validation
+
 ## Measurement Policy
+
+### Uploaded AWG scheduler sweep
+
+The uploaded AWG path is separate from the legacy paused benchmark prompts.
+
+The host:
+
+1. enters the dedicated AWG scheduler UART console
+2. uploads an `awg_event_v1_t[]` table as ASCII hex
+3. issues `RUN`
+4. anchors timing to the UART `set_epoch` artifact line
+5. optionally measures each scheduled tone during its dwell window
+6. writes `awg_scheduler_run.json`, per-step CSV/JSON, and `awg_sweep_plot.*`
+
+Current limitations:
+
+1. the current KCU116 image reports `max_events=64`
+2. dense one-shot sweeps such as `200-300 MHz` in `10 kHz` steps do not fit in
+   one scheduler load
+3. those dense sweeps therefore require batching across multiple runs or a
+   larger event RAM in HDL
 
 ### DDS-band
 
@@ -145,6 +174,23 @@ batch files explicitly with repeated `--xilinx-settings` arguments.
 
 ## Example Run
 
+Measured uploaded AWG sweep only:
+
+```powershell
+python .\awg_sweep_test.py `
+  --serial-port COM4 `
+  --visa-resource "TCPIP::192.168.100.142::INSTR" `
+  --visa-backend "@py" `
+  --xilinx-settings "C:\Xilinx\Vivado\2021.2\settings64.bat" `
+  --xilinx-settings "C:\Xilinx\Vitis_HLS\2021.2\settings64.bat" `
+  --xilinx-settings "C:\Xilinx\Vitis\2021.2\settings64.bat" `
+  --awg-sched-baseaddr 0x44AA0000 `
+  --awg-sweep-start-hz 200000000 `
+  --awg-sweep-stop-hz 210000000 `
+  --awg-sweep-step-hz 1000000 `
+  --output-dir .\capture_runs\awg_sched_measured
+```
+
 Normal DDS/SFDR benchmark run:
 
 ```powershell
@@ -157,6 +203,34 @@ python .\run_nco_scope_test.py `
   --xilinx-settings "C:\Xilinx\Vitis\2021.2\settings64.bat" `
   --analyzer-timeout 30
 ```
+
+Two-pass full integration wrapper:
+
+```powershell
+python .\run_nco_scope_test.py `
+  --serial-port COM4 `
+  --visa-resource "TCPIP::192.168.100.142::INSTR" `
+  --visa-backend "@py" `
+  --xilinx-settings "C:\Xilinx\Vivado\2021.2\settings64.bat" `
+  --xilinx-settings "C:\Xilinx\Vitis_HLS\2021.2\settings64.bat" `
+  --xilinx-settings "C:\Xilinx\Vitis\2021.2\settings64.bat" `
+  --run-awg-sweep `
+  --run-full-integration `
+  --run-nco-test `
+  --awg-sched-baseaddr 0x44AA0000 `
+  --awg-sweep-start-hz 200000000 `
+  --awg-sweep-stop-hz 210000000 `
+  --awg-sweep-step-hz 1000000 `
+  --output-dir .\capture_runs\full_integration_pass
+```
+
+Important:
+
+1. pass 1 is the uploaded AWG scheduler sweep
+2. pass 2 is still the legacy paused DDS-band / SFDR / dynamic / throughput /
+   UART-RTT suite
+3. this wrapper is not yet a scheduler-native replacement for the full
+   benchmark engine
 
 If you want to include the legacy NCO diagnostic too:
 
@@ -226,6 +300,7 @@ Skip selected firmware prompts:
 ```powershell
 --skip-dds-band-test
 --skip-sfdr-test
+--skip-dynamic-sfdr-test
 --skip-throughput-test
 --skip-uart-rtt
 ```
@@ -300,6 +375,14 @@ Typical outputs:
 10. `uart_rtt.json`
 11. per-step CSV/JSON files
 
+Measured uploaded AWG outputs:
+
+1. `awg_scheduler_run.json`
+2. `awg_sweep_plot.csv`
+3. `awg_sweep_plot.svg`
+4. per-step `stepNN_awg_scheduler_*.csv`
+5. per-step `stepNN_awg_scheduler_*.json`
+
 For SFDR steps, the per-step CSV contains the carrier, left-spur, right-spur,
 and worst-spur marker summary.
 
@@ -309,6 +392,19 @@ and worst-spur marker summary.
 2. Use direct coax and `50 ohm` input.
 3. Start with the conservative analyzer settings listed above.
 4. Keep attenuation and reference level documented for each run.
+
+## Current Architectural Gap
+
+The uploaded scheduler path is now suitable for deterministic coarse stepped
+RF validation, but it is not yet the benchmark engine for the whole suite.
+
+If the goal is scheduler-native dense sweeps, switching-latency work, or
+minimum pulse-width characterization, the next work is:
+
+1. a scheduler-native benchmark suite with no paused legacy prompt flow
+2. host-side batching or larger HDL event depth for dense `10 kHz` stepping
+3. a scope-driven scheduler latency / pulse-width workflow separate from the
+   FSH sweep workflow
 
 ## TODOs
 

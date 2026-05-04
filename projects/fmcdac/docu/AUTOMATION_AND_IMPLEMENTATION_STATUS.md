@@ -85,14 +85,19 @@ Implemented:
 1. optional `make run` launch from `projects/fmcdac`
 2. optional Xilinx environment setup via `--xilinx-settings`
 3. UART coordination for paused firmware prompts
-4. FSH8 measurement flow for:
+4. uploaded AWG scheduler UART console flow with host-built event tables
+5. optional per-step FSH8 validation during uploaded AWG scheduler runs
+6. FSH8 measurement flow for:
    - DDS-band
    - SFDR
    - close-in carrier traces during selected SFDR steps
    - dynamic retune bursts
    - throughput collection
    - UART RTT collection
-5. artifact generation into `capture_runs/<timestamp>/`
+7. two-pass `--run-full-integration` wrapper:
+   - pass 1: measured uploaded AWG scheduler sweep
+   - pass 2: legacy paused DDS-band / SFDR / dynamic / throughput / UART-RTT suite
+8. artifact generation into `capture_runs/<timestamp>/`
 
 ### Current role of `capture_boot_repeatability.py`
 
@@ -131,11 +136,22 @@ Current decision-driving path:
 4. treat the raw-trace phase-noise method as blocked on the FSH8 trace-export
    path, but use the marker-only offset sweep for close-in offset evidence on
    the current bench
-5. spend remaining bench time on:
+5. treat uploaded AWG scheduler validation as a separate deterministic
+   control-plane + RF-validation path, not yet as a replacement for the whole
+   legacy benchmark suite
+6. spend remaining bench time on:
    - root-cause interpretation of the still-negative clean-init result only if
      that claim remains required
    - one more dynamic retune rerun with a wider intended guard if the `10 ms`
      case still needs settling
+
+Current scheduler limitation:
+
+1. the current KCU116 image reports `max_events=64`
+2. dense one-shot sweeps such as `200-300 MHz` in `10 kHz` steps do not fit in
+   one uploaded schedule
+3. those benches therefore require host-side batching, larger event RAM, or a
+   streamed scheduler architecture
 
 ### Current measurement strategy
 

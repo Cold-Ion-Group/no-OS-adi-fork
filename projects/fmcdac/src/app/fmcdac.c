@@ -165,6 +165,14 @@ static enum fmcdac_clock_mode g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
 #define FMCDAC_SFDR_SWEEP_STEP_HZ 0U
 #endif
 
+#ifndef FMCDAC_SKIP_SYSREF_TUNE
+#define FMCDAC_SKIP_SYSREF_TUNE 0
+#endif
+
+#ifndef FMCDAC_SYSREF_TUNE_DEBUG
+#define FMCDAC_SYSREF_TUNE_DEBUG 1
+#endif
+
 #if (FMCDAC_DDS_BAND_SWEEP_STEP_HZ > 0U) && \
 	(FMCDAC_DDS_BAND_SWEEP_STOP_HZ < FMCDAC_DDS_BAND_SWEEP_START_HZ)
 #error "FMCDAC_DDS_BAND_SWEEP_STOP_HZ must be >= FMCDAC_DDS_BAND_SWEEP_START_HZ"
@@ -1648,6 +1656,11 @@ static int fmcdac_sysref_tune(struct fmcdac_dev *dev)
 	xil_printf("[SYSREF-TUNE] Original SYSREF_ACTRL0=0x%02X (edge=%s)\n\r",
 		   orig_actrl0, (orig_actrl0 & SYSREF_RISE) ? "rising" : "falling");
 
+#if FMCDAC_SKIP_SYSREF_TUNE
+	xil_printf("[SYSREF-TUNE] SKIPPED by FMCDAC_SKIP_SYSREF_TUNE=1\n\r");
+	return 0;
+#endif
+
 	/*
 	 * Trial helper: clear SYSREF status (W1C), wait for re-capture, check.
 	 * Returns 1 if alignment error is cleared.
@@ -1662,8 +1675,15 @@ static int fmcdac_sysref_tune(struct fmcdac_dev *dev)
 	/* --- Phase 1: Try opposite edge, offset=0 --- */
 	{
 		uint8_t try_edge = orig_actrl0 ^ SYSREF_RISE; /* toggle edge */
+#if FMCDAC_SYSREF_TUNE_DEBUG
+		xil_printf("[SYSREF-TUNE] Phase1 begin: try_edge=%s offset=0\n\r",
+			   (try_edge & SYSREF_RISE) ? "rising" : "falling");
+#endif
 		ad9144_spi_write(dev->ad9144_device, REG_SYSREF_ACTRL0, try_edge);
 		Xil_Out32(TX_JESD_BASEADDR + 0x104, 0); /* offset=0 */
+#if FMCDAC_SYSREF_TUNE_DEBUG
+		xil_printf("[SYSREF-TUNE] Phase1 trial: clearing status and waiting for recapture\n\r");
+#endif
 		if (SYSREF_TRIAL_OK()) {
 			xil_printf("[SYSREF-TUNE] FIXED: edge=%s offset=0 (status=0x%08lX)\n\r",
 				   (try_edge & SYSREF_RISE) ? "rising" : "falling",
@@ -1671,12 +1691,22 @@ static int fmcdac_sysref_tune(struct fmcdac_dev *dev)
 			found = 1;
 			goto done;
 		}
+#if FMCDAC_SYSREF_TUNE_DEBUG
+		xil_printf("[SYSREF-TUNE] Phase1 no-fix: status=0x%08lX\n\r",
+			   (unsigned long)sysref_status);
+#endif
 		/* Restore original edge */
 		ad9144_spi_write(dev->ad9144_device, REG_SYSREF_ACTRL0, orig_actrl0);
 	}
 
 	/* --- Phase 2: Sweep LMFC offset with original edge --- */
 	for (offset = 0; offset < K; offset++) {
+#if FMCDAC_SYSREF_TUNE_DEBUG
+		if (offset < 3U || ((offset + 1U) == K) || (((offset + 1U) % 8U) == 0U))
+			xil_printf("[SYSREF-TUNE] Phase2 trial: edge=%s offset=%lu\n\r",
+				   (orig_actrl0 & SYSREF_RISE) ? "rising" : "falling",
+				   (unsigned long)offset);
+#endif
 		Xil_Out32(TX_JESD_BASEADDR + 0x104, offset);
 		if (SYSREF_TRIAL_OK()) {
 			xil_printf("[SYSREF-TUNE] FIXED: edge=%s offset=%lu (status=0x%08lX)\n\r",
@@ -1686,13 +1716,30 @@ static int fmcdac_sysref_tune(struct fmcdac_dev *dev)
 			found = 1;
 			goto done;
 		}
+#if FMCDAC_SYSREF_TUNE_DEBUG
+		if (offset < 3U || ((offset + 1U) == K) || (((offset + 1U) % 8U) == 0U))
+			xil_printf("[SYSREF-TUNE] Phase2 no-fix: offset=%lu status=0x%08lX\n\r",
+				   (unsigned long)offset,
+				   (unsigned long)sysref_status);
+#endif
 	}
 
 	/* --- Phase 3: Sweep LMFC offset with opposite edge --- */
 	{
 		uint8_t try_edge = orig_actrl0 ^ SYSREF_RISE;
+#if FMCDAC_SYSREF_TUNE_DEBUG
+		xil_printf("[SYSREF-TUNE] Phase3 begin: try_edge=%s offset sweep 1..%lu\n\r",
+			   (try_edge & SYSREF_RISE) ? "rising" : "falling",
+			   (unsigned long)(K - 1U));
+#endif
 		ad9144_spi_write(dev->ad9144_device, REG_SYSREF_ACTRL0, try_edge);
 		for (offset = 1; offset < K; offset++) { /* offset=0 already tried in phase 1 */
+#if FMCDAC_SYSREF_TUNE_DEBUG
+			if (offset < 4U || ((offset + 1U) == K) || ((offset % 8U) == 0U))
+				xil_printf("[SYSREF-TUNE] Phase3 trial: edge=%s offset=%lu\n\r",
+					   (try_edge & SYSREF_RISE) ? "rising" : "falling",
+					   (unsigned long)offset);
+#endif
 			Xil_Out32(TX_JESD_BASEADDR + 0x104, offset);
 			if (SYSREF_TRIAL_OK()) {
 				xil_printf("[SYSREF-TUNE] FIXED: edge=%s offset=%lu (status=0x%08lX)\n\r",
@@ -1702,6 +1749,12 @@ static int fmcdac_sysref_tune(struct fmcdac_dev *dev)
 				found = 1;
 				goto done;
 			}
+#if FMCDAC_SYSREF_TUNE_DEBUG
+			if (offset < 4U || ((offset + 1U) == K) || ((offset % 8U) == 0U))
+				xil_printf("[SYSREF-TUNE] Phase3 no-fix: offset=%lu status=0x%08lX\n\r",
+					   (unsigned long)offset,
+					   (unsigned long)sysref_status);
+#endif
 		}
 		/* Restore if nothing worked */
 		ad9144_spi_write(dev->ad9144_device, REG_SYSREF_ACTRL0, orig_actrl0);
@@ -2826,7 +2879,8 @@ static int fmcdac_dds_band_diagnostic_test(struct fmcdac_dev *dev)
 				return ret;
 			}
 
-			if (fmcdac_should_log_custom_sweep(i, custom_count)) {
+			if (g_fmcdac_enable_benchmark_prompts ||
+			    fmcdac_should_log_custom_sweep(i, custom_count)) {
 				fmcdac_format_freq_label(freq_hz, freq_label, sizeof(freq_label));
 				xil_printf("[%s] Step %lu/%lu: %s DDS tone.\n\r",
 					   tag,
@@ -2925,7 +2979,8 @@ static int fmcdac_sfdr_test(struct fmcdac_dev *dev)
 				return ret;
 			}
 
-			if (fmcdac_should_log_custom_sweep(i, custom_count)) {
+			if (g_fmcdac_enable_benchmark_prompts ||
+			    fmcdac_should_log_custom_sweep(i, custom_count)) {
 				fmcdac_format_freq_label(freq_hz, freq_label, sizeof(freq_label));
 				xil_printf("[%s] Step %lu/%lu: %s DDS tone.\n\r",
 					   tag,

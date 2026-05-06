@@ -4,7 +4,7 @@ Coordinate the FMCDAC UART diagnostics with R&S FSH8 spectrum-analyzer captures.
 
 The primary workflow is now DDS-centric:
 1. Open the DUT UART.
-2. Optionally launch `make run` from `projects/fmcdac`.
+2. Optionally launch the existing FMCDAC ELF through XSDB.
 3. Wait for the paused DDS-band, SFDR, throughput, and UART RTT prompts.
 4. Advance each paused diagnostic step.
 5. For every DDS/SFDR pause, configure the FSH8, capture the needed data, and
@@ -19,7 +19,6 @@ import argparse
 import csv
 import json
 import math
-import os
 import re
 import struct
 import subprocess
@@ -96,7 +95,6 @@ DEFAULT_SFDR_GUARD_HZ = 2_000_000.0
 DEFAULT_SFDR_MIN_SEARCH_HZ = 5_000_000.0
 DEFAULT_SFDR_MAX_SEARCH_HZ = 1_000_000_000.0
 DEFAULT_DYNAMIC_INTENDED_MARGIN_HZ = 2_000_000.0
-DEFAULT_BULK_PROMPT_DISABLE_STEP_THRESHOLD = 1000
 AWG_SWEEP_ANALYZER_DEFAULT_DWELL_US = 2_000_000
 AWG_SWEEP_ANALYZER_MIN_DWELL_US = 250_000
 AWG_SWEEP_ANALYZER_SETTLE_FRACTION = 0.05
@@ -104,6 +102,10 @@ AWG_SWEEP_ANALYZER_MIN_SETTLE_S = 0.005
 AWG_SWEEP_ANALYZER_MAX_SETTLE_S = 0.050
 AWG_SWEEP_MEASURE_MIN_SPAN_HZ = 500_000.0
 AWG_SWEEP_MEASURE_MAX_SPAN_HZ = 1_000_000.0
+DEFAULT_FREQ_SETTLE_TIMEOUT_S = 5.0
+DEFAULT_FREQ_SETTLE_ERROR_HZ = 500_000.0
+HOST_POLL_SLEEP_S = 0.01
+BOOT_REPLY_PACING_S = 0.05
 LEGACY_DDS_BAND_FREQS_HZ = [
     10_000_000.0,
     100_000_000.0,
@@ -325,6 +327,14 @@ class StepCaptureSummary:
     metrics: Any
 
 
+@dataclass(frozen=True)
+class SchedulerBatchSpec:
+    batch_index: int
+    total_batches: int
+    start_index: int
+    freqs_hz: List[float]
+
+
 NCO_STEP_SPECS = [
     StepSpec(
         group="nco",
@@ -406,6 +416,59 @@ def build_single_tone_step_specs(
     return specs
 
 
+def chunk_sequence(values: Sequence[float], chunk_size: int) -> List[List[float]]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than 0")
+    return [list(values[idx : idx + chunk_size]) for idx in range(0, len(values), chunk_size)]
+
+
+def build_scheduler_batch_specs(freqs_hz: Sequence[float], max_events: int) -> List[SchedulerBatchSpec]:
+    chunks = chunk_sequence(freqs_hz, max_events)
+    specs: List[SchedulerBatchSpec] = []
+    start_index = 0
+    for batch_index, chunk in enumerate(chunks, start=1):
+        specs.append(
+            SchedulerBatchSpec(
+                batch_index=batch_index,
+                total_batches=len(chunks),
+                start_index=start_index,
+                freqs_hz=list(chunk),
+            )
+        )
+        start_index += len(chunk)
+    return specs
+
+
+def build_scheduler_dense_step_specs(
+    freqs_hz: Sequence[float],
+    *,
+    step_index_offset: int = 0,
+    group: str = "scheduler_dense",
+    description_prefix: str = "Scheduler dense sweep tone",
+) -> List[StepSpec]:
+    specs: List[StepSpec] = []
+    for local_index, freq_hz in enumerate(freqs_hz, start=1):
+        global_index = step_index_offset + local_index
+        freq_label = format_step_freq_label(freq_hz)
+        freq_slug = format_step_freq_slug(freq_hz)
+        specs.append(
+            StepSpec(
+                group=group,
+                index=global_index,
+                name=f"{group}_{freq_slug}",
+                marker="",
+                description=f"{description_prefix} at {freq_label}",
+                expected_freq_hz=[freq_hz],
+                span_hz=min(
+                    AWG_SWEEP_MEASURE_MAX_SPAN_HZ,
+                    max(AWG_SWEEP_MEASURE_MIN_SPAN_HZ, abs(freq_hz) * 0.0 + 1_000_000.0),
+                ),
+                search_margin_hz=max(AWG_SWEEP_MEASURE_MIN_SPAN_HZ / 2.0, 250_000.0),
+            )
+        )
+    return specs
+
+
 def build_awg_scheduler_step_specs(freqs_hz: Sequence[float]) -> List[StepSpec]:
     specs = build_single_tone_step_specs(
         group="awg_scheduler",
@@ -464,6 +527,8 @@ DYNAMIC_RETUNE_STEP_SPECS = [
         intended_margin_hz=DEFAULT_DYNAMIC_INTENDED_MARGIN_HZ,
     ),
 ]
+
+MAX_DYNAMIC_CASES = 8
 
 
 def require_dependency(module, package_name: str) -> None:
@@ -592,7 +657,7 @@ class UartCoordinator:
                 return matched
 
             if not self.pump():
-                time.sleep(0.05)
+                time.sleep(HOST_POLL_SLEEP_S)
 
         raise TimeoutError(f"Timed out waiting for UART text: {needle!r}")
 
@@ -623,7 +688,7 @@ class UartCoordinator:
                 return matched, time.monotonic()
 
             if not self.pump():
-                time.sleep(0.05)
+                time.sleep(HOST_POLL_SLEEP_S)
 
         raise TimeoutError(f"Timed out waiting for UART line containing: {needle!r}")
 
@@ -1127,6 +1192,8 @@ class RohdeSchwarzFSH:
         self,
         step: StepSpec,
         settings: AnalyzerSettings,
+        *,
+        lock_to_expected: bool = False,
     ) -> Tuple[List[float], List[float], SpectrumMetrics]:
         expected_hz = step.expected_freq_hz[0]
         center_hz = expected_hz
@@ -1142,9 +1209,13 @@ class RohdeSchwarzFSH:
         except Exception:
             marker_freq_hz = expected_hz
 
-        self._write("CALC:MARK1:MAX")
-        peak_power_dbm = self._query_float("CALC:MARK1:Y?")
-        peak_freq_hz = self._query_float("CALC:MARK1:X?")
+        if lock_to_expected:
+            peak_power_dbm = marker_power_dbm
+            peak_freq_hz = marker_freq_hz
+        else:
+            self._write("CALC:MARK1:MAX")
+            peak_power_dbm = self._query_float("CALC:MARK1:Y?")
+            peak_freq_hz = self._query_float("CALC:MARK1:X?")
 
         trace_capture_degraded = False
         trace_capture_error = None
@@ -1181,14 +1252,14 @@ class RohdeSchwarzFSH:
             attenuation_auto=settings.attenuation_auto,
             preamp_on=settings.preamp_on,
             impedance_ohms=settings.impedance_ohms,
-            power_dbm=peak_power_dbm,
-            power_freq_hz=peak_freq_hz,
+            power_dbm=marker_power_dbm if lock_to_expected else peak_power_dbm,
+            power_freq_hz=marker_freq_hz if lock_to_expected else peak_freq_hz,
             marker_power_dbm=marker_power_dbm,
             marker_freq_hz=marker_freq_hz,
             trace_peak_power_dbm=trace_peak_power_dbm,
             trace_peak_freq_hz=trace_peak_freq_hz,
             nearest_expected_hz=expected_hz,
-            nearest_error_hz=peak_freq_hz - expected_hz,
+            nearest_error_hz=(marker_freq_hz if lock_to_expected else peak_freq_hz) - expected_hz,
             trace_capture_degraded=trace_capture_degraded,
             trace_capture_error=trace_capture_error,
         )
@@ -1359,19 +1430,76 @@ def format_frequency_label_hz(freq_hz: float) -> str:
     return f"{rounded_hz}hz"
 
 
+def capture_with_frequency_settle(
+    capture_fn: Any,
+    step: StepSpec,
+    *,
+    timeout_s: float,
+    error_hz: float,
+) -> Tuple[List[float], List[float], SpectrumMetrics]:
+    trace_freqs_hz, trace_levels_dbm, metrics = capture_fn()
+    best_trace_freqs_hz = trace_freqs_hz
+    best_trace_levels_dbm = trace_levels_dbm
+    best_metrics = metrics
+    best_error_hz = abs(metrics.nearest_error_hz) if metrics.nearest_error_hz is not None else None
+
+    if timeout_s <= 0.0 or error_hz <= 0.0 or metrics.nearest_error_hz is None:
+        return best_trace_freqs_hz, best_trace_levels_dbm, best_metrics
+
+    deadline = time.monotonic() + timeout_s
+    attempts = 1
+    while abs(best_metrics.nearest_error_hz) > error_hz and time.monotonic() < deadline:
+        trace_freqs_hz, trace_levels_dbm, metrics = capture_fn()
+        attempts += 1
+        current_error_hz = abs(metrics.nearest_error_hz) if metrics.nearest_error_hz is not None else None
+        if current_error_hz is not None and (
+            best_error_hz is None or current_error_hz < best_error_hz
+        ):
+            best_trace_freqs_hz = trace_freqs_hz
+            best_trace_levels_dbm = trace_levels_dbm
+            best_metrics = metrics
+            best_error_hz = current_error_hz
+
+    if attempts > 1:
+        if best_metrics.nearest_error_hz is not None and abs(best_metrics.nearest_error_hz) <= error_hz:
+            print(
+                f"[HOST] {step.name}: settled after {attempts} capture(s), "
+                f"best error {best_metrics.nearest_error_hz / 1e6:+.6f} MHz"
+            )
+        else:
+            error_text = "n/a"
+            if best_metrics.nearest_error_hz is not None:
+                error_text = f"{best_metrics.nearest_error_hz / 1e6:+.6f} MHz"
+            print(
+                f"[HOST] {step.name}: settle timeout after {attempts} capture(s); "
+                f"best error {error_text}"
+            )
+
+    return best_trace_freqs_hz, best_trace_levels_dbm, best_metrics
+
+
 def capture_trace_step(
     analyzer: RohdeSchwarzFSH,
     output_dir: Path,
     step: StepSpec,
     settings: AnalyzerSettings,
     dump_analyzer_state: bool = False,
+    write_csv: bool = False,
     write_json: bool = True,
+    settle_timeout_s: float = 0.0,
+    settle_error_hz: float = 0.0,
 ) -> StepCaptureSummary:
-    trace_freqs_hz, trace_levels_dbm, metrics = analyzer.capture_trace(step, settings)
+    trace_freqs_hz, trace_levels_dbm, metrics = capture_with_frequency_settle(
+        lambda: analyzer.capture_trace(step, settings),
+        step,
+        timeout_s=settle_timeout_s,
+        error_hz=settle_error_hz,
+    )
 
     csv_path = output_dir / f"step{step.index:02d}_{step.name}.csv"
     json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
-    save_trace_csv(csv_path, trace_freqs_hz, trace_levels_dbm)
+    if write_csv:
+        save_trace_csv(csv_path, trace_freqs_hz, trace_levels_dbm)
     if write_json:
         write_step_json(
             json_path,
@@ -1388,7 +1516,7 @@ def capture_trace_step(
         marker=step.marker,
         description=step.description,
         expected_freq_hz=step.expected_freq_hz,
-        csv_path=str(csv_path.resolve()),
+        csv_path=str(csv_path.resolve()) if write_csv else "",
         metrics=metrics,
     )
     return summary
@@ -1400,13 +1528,27 @@ def capture_known_tone_step(
     step: StepSpec,
     settings: AnalyzerSettings,
     dump_analyzer_state: bool = False,
+    write_csv: bool = False,
     write_json: bool = True,
+    settle_timeout_s: float = 0.0,
+    settle_error_hz: float = 0.0,
+    lock_to_expected: bool = False,
 ) -> StepCaptureSummary:
-    trace_freqs_hz, trace_levels_dbm, metrics = analyzer.capture_known_tone(step, settings)
+    trace_freqs_hz, trace_levels_dbm, metrics = capture_with_frequency_settle(
+        lambda: analyzer.capture_known_tone(
+            step,
+            settings,
+            lock_to_expected=lock_to_expected,
+        ),
+        step,
+        timeout_s=settle_timeout_s,
+        error_hz=settle_error_hz,
+    )
 
     csv_path = output_dir / f"step{step.index:02d}_{step.name}.csv"
     json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
-    save_trace_csv(csv_path, trace_freqs_hz, trace_levels_dbm)
+    if write_csv:
+        save_trace_csv(csv_path, trace_freqs_hz, trace_levels_dbm)
     if write_json:
         write_step_json(
             json_path,
@@ -1423,7 +1565,7 @@ def capture_known_tone_step(
         marker=step.marker,
         description=step.description,
         expected_freq_hz=step.expected_freq_hz,
-        csv_path=str(csv_path.resolve()),
+        csv_path=str(csv_path.resolve()) if write_csv else "",
         metrics=metrics,
     )
 
@@ -1500,6 +1642,179 @@ def resolve_awg_sweep_dwell_us(args: argparse.Namespace, *, analyzer_enabled: bo
     return dwell_us
 
 
+def load_awg_scheduler_events_into_console(
+    uart: "UartCoordinator",
+    args: argparse.Namespace,
+    events: Sequence["AwgSchedEvent"],
+) -> dict:
+    payload = pack_events(events)
+    payload_hex = payload.hex()
+
+    uart.send_line(f"LOADBIN {len(events)}")
+    matched = uart.wait_for(
+        AWG_CONSOLE_LOAD_READY_MARKER,
+        args.uart_timeout,
+        extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+    )
+    if matched == AWG_CONSOLE_ERROR_MARKER:
+        raise RuntimeError("Scheduler console reported an error before accepting LOADBIN payload.")
+
+    matched = uart.wait_for(
+        AWG_CONSOLE_LOAD_RX_BEGIN_MARKER,
+        args.uart_timeout,
+        extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+    )
+    if matched == AWG_CONSOLE_ERROR_MARKER:
+        raise RuntimeError("Scheduler console reported an error before entering LOADBIN receive mode.")
+
+    for offset in range(0, len(payload_hex), 64):
+        uart.send(payload_hex[offset : offset + 64])
+        time.sleep(0.002)
+    uart.send_line()
+
+    matched = uart.wait_for(
+        AWG_CONSOLE_LOAD_OK_MARKER,
+        args.uart_timeout,
+        extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+    )
+    if matched == AWG_CONSOLE_ERROR_MARKER:
+        raise RuntimeError("Scheduler console reported an error during LOADBIN.")
+
+    return {
+        "event_count": len(events),
+        "event_payload_bytes": len(payload),
+        "event_payload_hex_chars": len(payload_hex),
+    }
+
+
+def build_scheduler_benchmark_catalog() -> dict:
+    return {
+        "scheduler_console_transport": {
+            "mode": "uart_ascii_hex",
+            "commands": ["INFO", "STATUS", "LOADBIN <count>", "RUN", "ABORT", "DUMP", "EXIT"],
+            "batch_reuse_supported": True,
+        },
+        "known_hardware_limits": {
+            "event_ram_is_finite": True,
+            "current_firmware_reports_max_events_at_runtime": True,
+            "dense_sweeps_may_require_batching": True,
+        },
+        "fsh_capabilities": [
+            {
+                "id": "scheduler_dense_sweep",
+                "kind": "implemented",
+                "measures": [
+                    "carrier frequency tracking",
+                    "power flatness",
+                    "step-by-step deterministic execution",
+                    "batch-over-batch continuity summary",
+                ],
+            },
+            {
+                "id": "scheduler_sfdr_spot_set",
+                "kind": "implemented",
+                "measures": [
+                    "steady-state carrier power",
+                    "strongest spur within configured search band",
+                    "SFDR at scheduler-held tones",
+                ],
+            },
+            {
+                "id": "scheduler_phase_noise_offsets",
+                "kind": "planned",
+                "measures": [
+                    "marker-only sideband offsets during scheduler-held tones",
+                ],
+            },
+        ],
+        "mso22_capabilities": [
+            {
+                "id": "epoch_to_first_event_latency",
+                "kind": "planned",
+                "measures": ["time from scheduler epoch reload to first observable output edge"],
+            },
+            {
+                "id": "event_to_event_switch_latency",
+                "kind": "planned",
+                "measures": ["hop latency between adjacent programmed scheduler events"],
+            },
+            {
+                "id": "minimum_stable_dwell",
+                "kind": "planned",
+                "measures": ["minimum dwell/pulse width that still yields stable output"],
+            },
+            {
+                "id": "pulse_width_and_spacing_accuracy",
+                "kind": "planned",
+                "measures": ["actual high/low width and inter-pulse spacing versus programmed ticks"],
+            },
+            {
+                "id": "batch_boundary_gap",
+                "kind": "planned",
+                "measures": ["dead time inserted by host-side batching across 64-event boundaries"],
+            },
+            {
+                "id": "run_to_observable_output_latency",
+                "kind": "planned",
+                "measures": ["time from RUN command acceptance to first observable analog/digital effect"],
+            },
+        ],
+    }
+
+
+def build_scheduler_scope_plan(args: argparse.Namespace) -> dict:
+    return {
+        "instrument": "Tektronix MSO22",
+        "execution_status": "planned_not_executed_by_host",
+        "why": (
+            "The scheduler-native suite now emits a concrete MSO22 benchmark plan, but this repo "
+            "does not yet contain a validated MSO22 SCPI driver path for the FMCDAC bench."
+        ),
+        "recommended_channel_map": {
+            "CH1": "RF envelope detector, mixer IF, or representative digital timing marker",
+            "CH2": "scheduler-related strobe, external trigger, or reference timing edge",
+        },
+        "benchmarks": [
+            {
+                "name": "epoch_to_first_event_latency",
+                "goal": "measure delay from scheduler epoch anchor to first observable output change",
+                "requires": ["repeatable trigger source", "observable event edge"],
+            },
+            {
+                "name": "event_to_event_switch_latency",
+                "goal": "measure retune latency between adjacent scheduled carrier events",
+                "requires": ["two-tone or frequency-hop sequence", "observable edge metric"],
+            },
+            {
+                "name": "minimum_stable_dwell_sweep",
+                "goal": "sweep programmed dwell width downward until output becomes unreliable",
+                "requires": ["scheduler batch runner", "stable trigger path"],
+            },
+            {
+                "name": "pulse_width_and_spacing_accuracy",
+                "goal": "compare actual pulse widths/spacing to programmed scheduler tick intervals",
+                "requires": ["observable pulse waveform or routed timing marker"],
+            },
+            {
+                "name": "batch_boundary_gap",
+                "goal": "measure overhead inserted by host-side batching when event_count exceeds max_events",
+                "requires": ["dense multi-batch schedule", "marker around batch transitions"],
+            },
+            {
+                "name": "reinit_vs_no_reinit_visibility",
+                "goal": "compare first-event phase-reinitialized behavior to continuous phase steps",
+                "requires": ["phase-sensitive observable or IQ-derived timing metric"],
+            },
+        ],
+        "requested_run_args": {
+            "awg_sweep_start_hz": args.awg_sweep_start_hz,
+            "awg_sweep_stop_hz": args.awg_sweep_stop_hz,
+            "awg_sweep_step_hz": args.awg_sweep_step_hz,
+            "awg_sweep_dwell_us": args.awg_sweep_dwell_us,
+        },
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Drive FMCDAC UART diagnostics and capture R&S FSH8 analyzer traces."
@@ -1530,18 +1845,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-make-run",
         action="store_true",
-        help="Assume the board is already running and do not launch 'make run' first.",
+        help="Assume the board is already running and do not launch the XSDB reset/download/start sequence first.",
     )
     parser.add_argument(
         "--make-args",
         default="",
-        help="Optional extra arguments appended to 'make run'.",
+        help="Legacy no-op kept for CLI compatibility now that the host no longer invokes make.",
     )
     parser.add_argument(
         "--xilinx-settings",
         action="append",
         default=[],
-        help="Optional settings64.bat path(s) to call before 'make run'. Repeat as needed.",
+        help="Optional settings64.bat path(s) to call before launching XSDB. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--xsdb-exe",
+        default="xsdb",
+        help="XSDB executable used to reset/download/start the already-built ELF.",
+    )
+    parser.add_argument(
+        "--xsdb-hw-url",
+        default="tcp:127.0.0.1:3121",
+        help="hw_server URL for XSDB connect -url.",
+    )
+    parser.add_argument(
+        "--xsdb-target-filter",
+        default='name =~ "*microblaze*#0" && bscan=="USER2"',
+        help="XSDB targets -set -filter expression for the processor target.",
+    )
+    parser.add_argument(
+        "--xsdb-elf",
+        default="",
+        help="Optional ELF to download with XSDB. Defaults to projects/fmcdac/build/fmcdac.elf.",
+    )
+    parser.add_argument(
+        "--xsdb-xsa",
+        default="",
+        help="Optional XSA to load with XSDB. Defaults to projects/fmcdac/build/tmp/system_top.xsa.",
+    )
+    parser.add_argument(
+        "--xsdb-reset-delay-ms",
+        type=int,
+        default=3000,
+        help="Delay after XSDB system reset before dow/con.",
+    )
+    parser.add_argument(
+        "--xsdb-skip-loadhw",
+        action="store_true",
+        help="Skip XSDB loadhw -hw <xsa> -regs before reset/download/start.",
     )
     parser.add_argument(
         "--visa-resource",
@@ -1575,10 +1926,27 @@ def parse_args() -> argparse.Namespace:
         help="Attach analyzer readback state and error queue snapshots to per-step JSON artifacts.",
     )
     parser.add_argument(
+        "--write-step-csv",
+        action="store_true",
+        help="Write per-step CSV artifacts in addition to the run-level aggregate CSV outputs.",
+    )
+    parser.add_argument(
+        "--freq-settle-timeout-s",
+        type=float,
+        default=DEFAULT_FREQ_SETTLE_TIMEOUT_S,
+        help="For DDS-band and SFDR steps, keep re-measuring until the frequency error is within tolerance or this timeout expires. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--freq-settle-error-hz",
+        type=float,
+        default=DEFAULT_FREQ_SETTLE_ERROR_HZ,
+        help="Maximum acceptable absolute frequency error before a DDS-band or SFDR measurement is considered settled.",
+    )
+    parser.add_argument(
         "--make-timeout",
         type=float,
         default=300.0,
-        help="Timeout for 'make run' in seconds",
+        help="Timeout for the XSDB reset/download/start sequence in seconds",
     )
     parser.add_argument(
         "--rbw-hz",
@@ -1654,6 +2022,28 @@ def parse_args() -> argparse.Namespace:
         "--run-full-integration",
         action="store_true",
         help="Run the uploaded AWG scheduler pass first, then rerun the normal analyzer benchmark suite as a second pass.",
+    )
+    parser.add_argument(
+        "--run-scheduler-benchmark-suite",
+        action="store_true",
+        help="Run the scheduler-native benchmark suite instead of the legacy prompt-driven analyzer flow.",
+    )
+    parser.add_argument(
+        "--scheduler-suite-profile",
+        choices=["dense", "sfdr", "fsh", "scope-plan", "all"],
+        default="all",
+        help=(
+            "Choose which scheduler-native benchmark families to run. "
+            "'dense' runs chunked stepped-tone FSH validation, 'sfdr' runs scheduler-held SFDR spots, "
+            "'fsh' runs both FSH families, 'scope-plan' only emits the MSO22 benchmark plan, "
+            "and 'all' runs the FSH families plus writes the scope plan."
+        ),
+    )
+    parser.add_argument(
+        "--scheduler-suite-sfdr-dwell-us",
+        type=int,
+        default=3_000_000,
+        help="Hold time per scheduler SFDR spot in microseconds.",
     )
     parser.add_argument(
         "--awg-sweep-start-hz",
@@ -1893,6 +2283,33 @@ def parse_args() -> argparse.Namespace:
         help="Half-width search margin around each intended dynamic retune frequency.",
     )
     parser.add_argument(
+        "--dynamic-start-mhz",
+        action="append",
+        type=float,
+        default=[],
+        help="Dynamic retune start carrier in MHz. Repeat with matching --dynamic-stop-mhz values.",
+    )
+    parser.add_argument(
+        "--dynamic-stop-mhz",
+        action="append",
+        type=float,
+        default=[],
+        help="Dynamic retune stop carrier in MHz. Repeat with matching --dynamic-start-mhz values.",
+    )
+    parser.add_argument(
+        "--dynamic-dwell-ms",
+        action="append",
+        type=int,
+        default=[],
+        help="Dynamic retune dwell in ms for each programmed tone. Repeat to request multiple dwell cases.",
+    )
+    parser.add_argument(
+        "--dynamic-active-ms",
+        type=int,
+        default=12_000,
+        help="Approximate total active burst duration used to derive dynamic retune transition counts.",
+    )
+    parser.add_argument(
         "--uart-rtt-samples",
         type=int,
         default=16,
@@ -1989,6 +2406,7 @@ def parse_optional_sweep_range(
 
 def ensure_args(args: argparse.Namespace) -> None:
     awg_console_mode = awg_scheduler_console_requested(args)
+    scheduler_suite_mode = scheduler_benchmark_suite_requested(args)
 
     if args.list_visa:
         resources = RohdeSchwarzFSH.list_resources(args.visa_backend)
@@ -1999,14 +2417,19 @@ def ensure_args(args: argparse.Namespace) -> None:
             print("No VISA resources found.")
         raise SystemExit(0)
 
-    if not awg_console_mode and not args.visa_resource:
+    if not awg_console_mode and not scheduler_suite_mode and not args.visa_resource:
         raise SystemExit("--visa-resource is required unless --list-visa is used")
     if args.run_full_integration:
         if not args.run_awg_sweep:
             raise SystemExit("--run-full-integration requires --run-awg-sweep")
         if not args.visa_resource:
             raise SystemExit("--run-full-integration requires --visa-resource")
-    if not args.serial_port:
+    if scheduler_suite_mode:
+        if args.run_full_integration:
+            raise SystemExit("--run-scheduler-benchmark-suite cannot be combined with --run-full-integration")
+        if args.scheduler_suite_profile != "scope-plan" and not args.visa_resource:
+            raise SystemExit("--run-scheduler-benchmark-suite requires --visa-resource unless --scheduler-suite-profile=scope-plan")
+    if not args.serial_port and not (scheduler_suite_mode and args.scheduler_suite_profile == "scope-plan"):
         raise SystemExit("--serial-port is required for coordinated UART + analyzer operation")
     if args.sweep_count < 1:
         raise SystemExit("--sweep-count must be at least 1")
@@ -2028,6 +2451,8 @@ def ensure_args(args: argparse.Namespace) -> None:
         args.awg_sweep_step_hz,
         "AWG-sweep",
     )
+    if args.scheduler_suite_sfdr_dwell_us < 1:
+        raise SystemExit("--scheduler-suite-sfdr-dwell-us must be at least 1")
     if args.sfdr_stop_hz <= args.sfdr_start_hz:
         raise SystemExit("--sfdr-stop-hz must be greater than --sfdr-start-hz")
     if args.sfdr_guard_hz <= 0:
@@ -2046,6 +2471,14 @@ def ensure_args(args: argparse.Namespace) -> None:
         raise SystemExit("--dynamic-sweep-count must be at least 1")
     if args.dynamic_intended_margin_hz <= 0:
         raise SystemExit("--dynamic-intended-margin-hz must be greater than 0")
+    if any(item <= 0 for item in args.dynamic_start_mhz):
+        raise SystemExit("--dynamic-start-mhz values must be greater than 0")
+    if any(item <= 0 for item in args.dynamic_stop_mhz):
+        raise SystemExit("--dynamic-stop-mhz values must be greater than 0")
+    if any(item <= 0 for item in args.dynamic_dwell_ms):
+        raise SystemExit("--dynamic-dwell-ms values must be greater than 0")
+    if args.dynamic_active_ms <= 0:
+        raise SystemExit("--dynamic-active-ms must be greater than 0")
     if args.phase_noise_span_hz or args.phase_noise_offset_hz:
         if args.skip_sfdr_test:
             raise SystemExit("Phase-noise capture requires the SFDR prompt to run")
@@ -2066,6 +2499,10 @@ def ensure_args(args: argparse.Namespace) -> None:
         )
     if args.uart_rtt_samples < 1:
         raise SystemExit("--uart-rtt-samples must be at least 1")
+    if args.freq_settle_timeout_s < 0:
+        raise SystemExit("--freq-settle-timeout-s must be >= 0")
+    if args.freq_settle_error_hz <= 0:
+        raise SystemExit("--freq-settle-error-hz must be greater than 0")
     if args.awg_sched_baseaddr is not None and args.awg_sched_baseaddr < 0:
         raise SystemExit("--awg-sched-baseaddr must be non-negative")
 
@@ -2134,10 +2571,7 @@ def build_sfdr_step_specs(args: argparse.Namespace) -> List[StepSpec]:
     )
 
 
-def build_sweep_override_cflags(
-    args: argparse.Namespace,
-    benchmark_prompts_disabled: bool = False,
-) -> str:
+def build_sweep_override_cflags(args: argparse.Namespace) -> str:
     defines: List[str] = []
     dds_band = parse_optional_sweep_range(
         args.dds_band_sweep_start_hz,
@@ -2157,6 +2591,7 @@ def build_sweep_override_cflags(
         args.awg_sweep_step_hz,
         "AWG-sweep",
     )
+    dynamic_cases = build_dynamic_case_matrix(args)
     if dds_band:
         defines.extend(
             [
@@ -2200,8 +2635,17 @@ def build_sweep_override_cflags(
         defines.append(f"-DFMCDAC_AWG_SCHED_DONE_TIMEOUT_MS={args.awg_sched_timeout_ms}U")
     if args.run_awg_sweep:
         defines.append("-DFMCDAC_ENABLE_AWG_SWEEP_PROMPT=1")
-    if benchmark_prompts_disabled:
-        defines.append("-DFMCDAC_ENABLE_BENCHMARK_PROMPTS=0")
+    if dynamic_cases:
+        defines.append(f"-DFMCDAC_DYNAMIC_CASE_COUNT={len(dynamic_cases)}U")
+        for index, (start_hz, stop_hz, dwell_ms, transitions) in enumerate(dynamic_cases, start=1):
+            defines.extend(
+                [
+                    f"-DFMCDAC_DYNAMIC_CASE{index}_START_HZ={int(round(start_hz))}U",
+                    f"-DFMCDAC_DYNAMIC_CASE{index}_STOP_HZ={int(round(stop_hz))}U",
+                    f"-DFMCDAC_DYNAMIC_CASE{index}_DWELL_MS={int(dwell_ms)}U",
+                    f"-DFMCDAC_DYNAMIC_CASE{index}_TRANSITIONS={int(transitions)}U",
+                ]
+            )
     if not defines:
         return ""
     return " ".join(defines)
@@ -2214,6 +2658,10 @@ def awg_scheduler_console_requested(args: argparse.Namespace) -> bool:
         and args.awg_sweep_stop_hz is not None
         and args.awg_sweep_step_hz is not None
     )
+
+
+def scheduler_benchmark_suite_requested(args: argparse.Namespace) -> bool:
+    return bool(args.run_scheduler_benchmark_suite)
 
 
 def rewrite_self_invocation_args(
@@ -2368,35 +2816,7 @@ def execute_awg_scheduler_uploaded_sweep(
         start_ticks=args.awg_sweep_start_ticks if args.awg_sweep_start_ticks is not None else 0,
         dwell_us=dwell_us,
     )
-    payload = pack_events(events)
-    payload_hex = payload.hex()
-
-    uart.send_line(f"LOADBIN {len(events)}")
-    matched = uart.wait_for(
-        AWG_CONSOLE_LOAD_READY_MARKER,
-        args.uart_timeout,
-        extra_needles=[AWG_CONSOLE_ERROR_MARKER],
-    )
-    if matched == AWG_CONSOLE_ERROR_MARKER:
-        raise RuntimeError("Scheduler console reported an error before accepting LOADBIN payload.")
-    matched = uart.wait_for(
-        AWG_CONSOLE_LOAD_RX_BEGIN_MARKER,
-        args.uart_timeout,
-        extra_needles=[AWG_CONSOLE_ERROR_MARKER],
-    )
-    if matched == AWG_CONSOLE_ERROR_MARKER:
-        raise RuntimeError("Scheduler console reported an error before entering LOADBIN receive mode.")
-    for offset in range(0, len(payload_hex), 64):
-        uart.send(payload_hex[offset:offset + 64])
-        time.sleep(0.002)
-    uart.send_line()
-    matched = uart.wait_for(
-        AWG_CONSOLE_LOAD_OK_MARKER,
-        args.uart_timeout,
-        extra_needles=[AWG_CONSOLE_ERROR_MARKER],
-    )
-    if matched == AWG_CONSOLE_ERROR_MARKER:
-        raise RuntimeError("Scheduler console reported an error during LOADBIN.")
+    load_summary = load_awg_scheduler_events_into_console(uart, args, events)
 
     awg_step_specs = build_awg_scheduler_step_specs(freqs_hz)
 
@@ -2455,6 +2875,7 @@ def execute_awg_scheduler_uploaded_sweep(
                 step=step,
                 settings=analyzer_settings,
                 dump_analyzer_state=dump_analyzer_state,
+                write_csv=getattr(args, "write_step_csv", False),
                 write_json=False,
             )
             capture_end_s = time.monotonic()
@@ -2473,28 +2894,29 @@ def execute_awg_scheduler_uploaded_sweep(
             metrics.reference_step_name = reference_step_name
             metrics.power_delta_db = metrics.power_dbm - reference_power_dbm
 
-            json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
-            write_step_json(
-                json_path,
-                analyzer.idn,
-                step,
-                metrics,
-                extra=build_step_extra(
-                    analyzer,
-                    dump_analyzer_state,
-                    {
-                        "scheduler_event_index": index - 1,
-                        "scheduler_timestamp_ticks": event.timestamp_ticks,
-                        "capture_window": {
-                            "event_start_s_from_epoch": event_start_s - scheduler_epoch_monotonic_s,
-                            "event_end_s_from_epoch": next_event_start_s - scheduler_epoch_monotonic_s,
-                            "capture_target_s_from_epoch": capture_target_s - scheduler_epoch_monotonic_s,
-                            "capture_start_s_from_epoch": capture_start_s - scheduler_epoch_monotonic_s,
-                            "capture_end_s_from_epoch": capture_end_s - scheduler_epoch_monotonic_s,
+            if dump_analyzer_state:
+                json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
+                write_step_json(
+                    json_path,
+                    analyzer.idn,
+                    step,
+                    metrics,
+                    extra=build_step_extra(
+                        analyzer,
+                        dump_analyzer_state,
+                        {
+                            "scheduler_event_index": index - 1,
+                            "scheduler_timestamp_ticks": event.timestamp_ticks,
+                            "capture_window": {
+                                "event_start_s_from_epoch": event_start_s - scheduler_epoch_monotonic_s,
+                                "event_end_s_from_epoch": next_event_start_s - scheduler_epoch_monotonic_s,
+                                "capture_target_s_from_epoch": capture_target_s - scheduler_epoch_monotonic_s,
+                                "capture_start_s_from_epoch": capture_start_s - scheduler_epoch_monotonic_s,
+                                "capture_end_s_from_epoch": capture_end_s - scheduler_epoch_monotonic_s,
+                            },
                         },
-                    },
-                ),
-            )
+                    ),
+                )
 
             measurement_steps.append(summary)
             measurement_windows.append(
@@ -2542,8 +2964,8 @@ def execute_awg_scheduler_uploaded_sweep(
         "dwell_us": dwell_us,
         "scheduler_epoch_anchor_line": scheduler_epoch_line,
         "event_count": len(events),
-        "event_payload_bytes": len(payload),
-        "event_payload_hex_chars": len(payload_hex),
+        "event_payload_bytes": load_summary["event_payload_bytes"],
+        "event_payload_hex_chars": load_summary["event_payload_hex_chars"],
         "freqs_hz": freqs_hz,
         "events": [asdict(event) for event in events],
         "steps": [asdict(step) for step in measurement_steps],
@@ -2564,6 +2986,480 @@ def execute_awg_scheduler_uploaded_sweep(
         )
     print(f"[HOST] AWG scheduler run summary written to {summary_path}")
     return summary
+
+
+def execute_scheduler_dense_fsh_suite(
+    uart: "UartCoordinator",
+    console_log: "ConsoleLog",
+    args: argparse.Namespace,
+    output_dir: Path,
+    info: AwgSchedInfo,
+    analyzer: "RohdeSchwarzFSH",
+    analyzer_settings: AnalyzerSettings,
+) -> dict:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sweep = parse_optional_sweep_range(
+        args.awg_sweep_start_hz,
+        args.awg_sweep_stop_hz,
+        args.awg_sweep_step_hz,
+        "Scheduler benchmark dense sweep",
+    )
+    if sweep is None:
+        raise RuntimeError(
+            "Scheduler benchmark dense sweep requires --awg-sweep-start-hz, "
+            "--awg-sweep-stop-hz, and --awg-sweep-step-hz."
+        )
+
+    all_freqs_hz = build_uniform_freq_list(sweep.start_hz, sweep.stop_hz, sweep.step_hz)
+    dwell_us = resolve_awg_sweep_dwell_us(args, analyzer_enabled=True)
+    batch_specs = build_scheduler_batch_specs(all_freqs_hz, info.max_events)
+    measurement_steps: List[StepCaptureSummary] = []
+    measurement_windows: List[dict] = []
+    batch_summaries: List[dict] = []
+
+    reference_power_dbm: Optional[float] = None
+    reference_step_name: Optional[str] = None
+
+    for batch in batch_specs:
+        batch_output_dir = output_dir / f"batch_{batch.batch_index:03d}"
+        batch_output_dir.mkdir(parents=True, exist_ok=True)
+        batch_freqs_hz = [int(round(item)) for item in batch.freqs_hz]
+        events = build_awg_sweep_events(
+            batch_freqs_hz,
+            tick_hz=info.tick_hz,
+            dds_clock_hz=info.dds_clock_hz,
+            dds_phase_dw=info.dds_phase_dw,
+            tone=args.awg_sweep_tone if args.awg_sweep_tone is not None else 0,
+            scale_u=args.awg_sweep_scale_u if args.awg_sweep_scale_u is not None else 700000,
+            start_ticks=args.awg_sweep_start_ticks if args.awg_sweep_start_ticks is not None else 0,
+            dwell_us=dwell_us,
+        )
+        load_summary = load_awg_scheduler_events_into_console(uart, args, events)
+        step_specs = build_scheduler_dense_step_specs(
+            batch.freqs_hz,
+            step_index_offset=batch.start_index,
+        )
+
+        uart.send_line("RUN")
+        scheduler_epoch_line, scheduler_epoch_monotonic_s = uart.wait_for_line_containing_timed(
+            AWG_SET_EPOCH_ARTIFACT_PREFIX,
+            args.uart_timeout,
+        )
+
+        for index, (step, event) in enumerate(zip(step_specs, events), start=1):
+            event_start_s = scheduler_epoch_monotonic_s + (
+                float(event.timestamp_ticks) / float(info.tick_hz)
+            )
+            if index < len(events):
+                next_event_start_s = scheduler_epoch_monotonic_s + (
+                    float(events[index].timestamp_ticks) / float(info.tick_hz)
+                )
+            else:
+                next_event_start_s = event_start_s + (dwell_us / 1_000_000.0)
+
+            dwell_s = max(next_event_start_s - event_start_s, dwell_us / 1_000_000.0)
+            settle_s = min(
+                AWG_SWEEP_ANALYZER_MAX_SETTLE_S,
+                max(AWG_SWEEP_ANALYZER_MIN_SETTLE_S, dwell_s * AWG_SWEEP_ANALYZER_SETTLE_FRACTION),
+            )
+            capture_target_s = event_start_s + settle_s
+
+            now_s = time.monotonic()
+            if now_s < capture_target_s:
+                time.sleep(capture_target_s - now_s)
+
+            capture_start_s = time.monotonic()
+            if index < len(events) and capture_start_s >= next_event_start_s:
+                raise RuntimeError(
+                    f"Missed scheduler dense measurement window for batch {batch.batch_index}/{batch.total_batches}, "
+                    f"step {index}/{len(events)} at {step.expected_freq_hz[0] / 1e6:.6f} MHz. "
+                    "Increase --awg-sweep-dwell-us."
+                )
+
+            summary = capture_known_tone_step(
+                analyzer=analyzer,
+                output_dir=batch_output_dir,
+                step=step,
+                settings=analyzer_settings,
+                dump_analyzer_state=getattr(args, "dump_analyzer_state", False),
+                write_csv=getattr(args, "write_step_csv", False),
+                write_json=False,
+            )
+            capture_end_s = time.monotonic()
+            if index < len(events) and capture_end_s >= next_event_start_s:
+                raise RuntimeError(
+                    f"Analyzer capture overran scheduler dense step {step.index} "
+                    f"at {step.expected_freq_hz[0] / 1e6:.6f} MHz. Increase --awg-sweep-dwell-us."
+                )
+
+            metrics = summary.metrics
+            if reference_power_dbm is None:
+                reference_power_dbm = metrics.power_dbm
+                reference_step_name = step.name
+            metrics.reference_power_dbm = reference_power_dbm
+            metrics.reference_step_name = reference_step_name
+            metrics.power_delta_db = metrics.power_dbm - reference_power_dbm
+
+            if getattr(args, "dump_analyzer_state", False):
+                json_path = batch_output_dir / f"step{step.index:05d}_{step.name}.json"
+                write_step_json(
+                    json_path,
+                    analyzer.idn,
+                    step,
+                    metrics,
+                    extra=build_step_extra(
+                        analyzer,
+                        getattr(args, "dump_analyzer_state", False),
+                        {
+                            "scheduler_batch_index": batch.batch_index,
+                            "scheduler_total_batches": batch.total_batches,
+                            "scheduler_event_index_within_batch": index - 1,
+                            "scheduler_global_event_index": batch.start_index + index - 1,
+                            "scheduler_timestamp_ticks": event.timestamp_ticks,
+                            "capture_window": {
+                                "event_start_s_from_epoch": event_start_s - scheduler_epoch_monotonic_s,
+                                "event_end_s_from_epoch": next_event_start_s - scheduler_epoch_monotonic_s,
+                                "capture_target_s_from_epoch": capture_target_s - scheduler_epoch_monotonic_s,
+                                "capture_start_s_from_epoch": capture_start_s - scheduler_epoch_monotonic_s,
+                                "capture_end_s_from_epoch": capture_end_s - scheduler_epoch_monotonic_s,
+                            },
+                        },
+                    ),
+                )
+
+            measurement_steps.append(summary)
+            measurement_windows.append(
+                {
+                    "batch_index": batch.batch_index,
+                    "batch_total": batch.total_batches,
+                    "global_step_index": step.index,
+                    "event_index_within_batch": index - 1,
+                    "expected_freq_hz": step.expected_freq_hz[0],
+                    "scheduler_timestamp_ticks": event.timestamp_ticks,
+                    "event_start_s_from_epoch": event_start_s - scheduler_epoch_monotonic_s,
+                    "event_end_s_from_epoch": next_event_start_s - scheduler_epoch_monotonic_s,
+                    "capture_target_s_from_epoch": capture_target_s - scheduler_epoch_monotonic_s,
+                    "capture_start_s_from_epoch": capture_start_s - scheduler_epoch_monotonic_s,
+                    "capture_end_s_from_epoch": capture_end_s - scheduler_epoch_monotonic_s,
+                }
+            )
+            print_step_summary(step, metrics)
+
+        matched = uart.wait_for(
+            AWG_CONSOLE_RUN_DONE_MARKER,
+            args.uart_timeout,
+            extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+        )
+        if matched == AWG_CONSOLE_ERROR_MARKER:
+            raise RuntimeError("Scheduler console reported an error during dense benchmark RUN.")
+
+        artifact = parse_last_artifact_block(console_log.file_path.read_text(encoding="utf-8"))
+        batch_summaries.append(
+            {
+                "batch_index": batch.batch_index,
+                "total_batches": batch.total_batches,
+                "start_index": batch.start_index,
+                "freqs_hz": batch.freqs_hz,
+                "load_summary": load_summary,
+                "scheduler_epoch_anchor_line": scheduler_epoch_line,
+                "artifact": asdict(artifact),
+            }
+        )
+
+    dense_summary = {
+        "kind": "scheduler_dense_sweep",
+        "freq_count": len(all_freqs_hz),
+        "batch_count": len(batch_specs),
+        "max_events_per_batch": info.max_events,
+        "dwell_us": dwell_us,
+        "steps": [asdict(step) for step in measurement_steps],
+        "measurement_windows": measurement_windows,
+        "batches": batch_summaries,
+    }
+
+    dense_summary_path = output_dir / "scheduler_dense_sweep.json"
+    dense_summary_path.write_text(
+        json.dumps(dense_summary, indent=2, default=json_default) + "\n",
+        encoding="utf-8",
+    )
+    if measurement_steps:
+        write_single_tone_band_artifacts(
+            dense_summary_path,
+            output_dir,
+            output_dir.name,
+            groups=("scheduler_dense",),
+            title="Scheduler Dense Sweep Level Delta vs Frequency",
+            stem="scheduler_dense_sweep_plot",
+        )
+    return dense_summary
+
+
+def execute_scheduler_sfdr_spot_suite(
+    uart: "UartCoordinator",
+    console_log: "ConsoleLog",
+    args: argparse.Namespace,
+    output_dir: Path,
+    info: AwgSchedInfo,
+    analyzer: "RohdeSchwarzFSH",
+    analyzer_settings: AnalyzerSettings,
+    sfdr_settings: SfdrSettings,
+) -> dict:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    custom = parse_optional_sweep_range(
+        args.sfdr_sweep_start_hz,
+        args.sfdr_sweep_stop_hz,
+        args.sfdr_sweep_step_hz,
+        "Scheduler benchmark SFDR",
+    )
+    freqs_hz = (
+        build_uniform_freq_list(custom.start_hz, custom.stop_hz, custom.step_hz)
+        if custom
+        else LEGACY_SFDR_FREQS_HZ
+    )
+    dwell_us = max(
+        args.scheduler_suite_sfdr_dwell_us,
+        AWG_SWEEP_ANALYZER_MIN_DWELL_US,
+    )
+    step_specs = build_single_tone_step_specs(
+        group="scheduler_sfdr",
+        tag="SCHED-SFDR",
+        freqs_hz=freqs_hz,
+        description_prefix="Scheduler-held SFDR carrier",
+    )
+    summaries: List[StepCaptureSummary] = []
+    batch_summaries: List[dict] = []
+
+    for step in step_specs:
+        freq_hz = int(round(step.expected_freq_hz[0]))
+        event = build_awg_sweep_events(
+            [freq_hz],
+            tick_hz=info.tick_hz,
+            dds_clock_hz=info.dds_clock_hz,
+            dds_phase_dw=info.dds_phase_dw,
+            tone=args.awg_sweep_tone if args.awg_sweep_tone is not None else 0,
+            scale_u=args.awg_sweep_scale_u if args.awg_sweep_scale_u is not None else 700000,
+            start_ticks=args.awg_sweep_start_ticks if args.awg_sweep_start_ticks is not None else 0,
+            dwell_us=dwell_us,
+        )
+        load_summary = load_awg_scheduler_events_into_console(uart, args, event)
+        uart.send_line("RUN")
+        scheduler_epoch_line, scheduler_epoch_monotonic_s = uart.wait_for_line_containing_timed(
+            AWG_SET_EPOCH_ARTIFACT_PREFIX,
+            args.uart_timeout,
+        )
+
+        event_start_s = scheduler_epoch_monotonic_s + (float(event[0].timestamp_ticks) / float(info.tick_hz))
+        capture_target_s = event_start_s + min(
+            AWG_SWEEP_ANALYZER_MAX_SETTLE_S,
+            max(AWG_SWEEP_ANALYZER_MIN_SETTLE_S, (dwell_us / 1_000_000.0) * AWG_SWEEP_ANALYZER_SETTLE_FRACTION),
+        )
+        now_s = time.monotonic()
+        if now_s < capture_target_s:
+            time.sleep(capture_target_s - now_s)
+
+        metrics = analyzer.capture_sfdr(step, analyzer_settings, sfdr_settings)
+        csv_path = output_dir / f"step{step.index:03d}_{step.name}.csv"
+        if getattr(args, "write_step_csv", False):
+            save_trace_csv(
+                csv_path,
+                [metrics.power_freq_hz, metrics.spur_freq_hz or metrics.power_freq_hz],
+                [metrics.power_dbm, metrics.spur_power_dbm or metrics.power_dbm],
+            )
+        if getattr(args, "dump_analyzer_state", False):
+            json_path = output_dir / f"step{step.index:03d}_{step.name}.json"
+            write_step_json(
+                json_path,
+                analyzer.idn,
+                step,
+                metrics,
+                extra=build_step_extra(
+                    analyzer,
+                    getattr(args, "dump_analyzer_state", False),
+                    {
+                        "scheduler_epoch_anchor_line": scheduler_epoch_line,
+                        "scheduler_timestamp_ticks": event[0].timestamp_ticks,
+                        "scheduler_dwell_us": dwell_us,
+                    },
+                ),
+            )
+        summary = StepCaptureSummary(
+            group=step.group,
+            step_index=step.index,
+            name=step.name,
+            marker=step.marker,
+            description=step.description,
+            expected_freq_hz=step.expected_freq_hz,
+            csv_path=str(csv_path.resolve()) if getattr(args, "write_step_csv", False) else "",
+            metrics=metrics,
+        )
+        summaries.append(summary)
+        print_step_summary(step, metrics)
+
+        matched = uart.wait_for(
+            AWG_CONSOLE_RUN_DONE_MARKER,
+            args.uart_timeout,
+            extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+        )
+        if matched == AWG_CONSOLE_ERROR_MARKER:
+            raise RuntimeError("Scheduler console reported an error during scheduler SFDR RUN.")
+        artifact = parse_last_artifact_block(console_log.file_path.read_text(encoding="utf-8"))
+        batch_summaries.append(
+            {
+                "step_index": step.index,
+                "freq_hz": step.expected_freq_hz[0],
+                "load_summary": load_summary,
+                "artifact": asdict(artifact),
+            }
+        )
+
+    summary = {
+        "kind": "scheduler_sfdr_spot_set",
+        "dwell_us": dwell_us,
+        "steps": [asdict(step) for step in summaries],
+        "batches": batch_summaries,
+    }
+    summary_path = output_dir / "scheduler_sfdr_spot_set.json"
+    summary_path.write_text(json.dumps(summary, indent=2, default=json_default) + "\n", encoding="utf-8")
+    write_sfdr_results_csv(summaries, output_dir / "scheduler_sfdr_spot_set.csv")
+    return summary
+
+
+def run_scheduler_benchmark_suite_mode(args: argparse.Namespace) -> int:
+    script_dir = Path(__file__).resolve().parent
+    output_dir = Path(args.output_dir) if args.output_dir else script_dir / "capture_runs" / utc_timestamp()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    catalog = build_scheduler_benchmark_catalog()
+    scope_plan = build_scheduler_scope_plan(args)
+    (output_dir / "scheduler_benchmark_catalog.json").write_text(
+        json.dumps(catalog, indent=2, default=json_default) + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "scheduler_scope_plan.json").write_text(
+        json.dumps(scope_plan, indent=2, default=json_default) + "\n",
+        encoding="utf-8",
+    )
+
+    if args.scheduler_suite_profile == "scope-plan":
+        print(f"[HOST] Scheduler scope plan written to {output_dir / 'scheduler_scope_plan.json'}")
+        return 0
+
+    console_log = ConsoleLog(output_dir / "uart.log")
+    uart = None
+    analyzer = None
+    try:
+        analyzer = RohdeSchwarzFSH(args.visa_resource, args.visa_backend, args.analyzer_timeout)
+        print(f"[HOST] Analyzer connected: {analyzer.idn}")
+        if args.analyzer_preset != "off":
+            print(f"[HOST] Applying analyzer preset: {args.analyzer_preset}")
+            analyzer.apply_preset(args.analyzer_preset)
+            print("[HOST] Analyzer preset complete.")
+
+        analyzer_settings = build_awg_scheduler_analyzer_settings(build_analyzer_settings(args))
+        sfdr_settings = build_sfdr_settings(args)
+        uart = UartCoordinator(
+            port=args.serial_port,
+            baudrate=args.baudrate,
+            timeout_s=args.uart_timeout,
+            log=console_log,
+            dtr=tristate_arg(args.serial_dtr),
+            rts=tristate_arg(args.serial_rts),
+        )
+        print(f"[HOST] UART connected: {args.serial_port} @ {args.baudrate}")
+
+        settings_files = resolve_xilinx_settings(args)
+        extra_cflags = build_awg_scheduler_console_cflags(args)
+        if extra_cflags:
+            print(
+                "[HOST] WARNING: generated firmware override CFLAGS are not applied by XSDB launch; "
+                "ensure the selected ELF was built with the expected scheduler console options."
+            )
+        if not args.skip_make_run:
+            rx_before = uart.rx_count
+            for item in settings_files:
+                print(f"[HOST] Using Xilinx settings: {item}")
+            print("[HOST] Launching XSDB reset/download/start for scheduler benchmark suite...")
+            run_xsdb_launch(
+                project_dir=script_dir,
+                output_dir=output_dir,
+                uart=uart,
+                timeout_s=args.make_timeout,
+                settings_files=settings_files,
+                args=args,
+            )
+            print("[HOST] XSDB launch completed.")
+            if uart.rx_count == rx_before:
+                uart.reopen()
+
+        matched = uart.wait_for(
+            AWG_CONSOLE_READY_MARKER,
+            args.uart_timeout,
+            extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+        )
+        if matched == AWG_CONSOLE_ERROR_MARKER:
+            raise RuntimeError("Scheduler console reported an error before ready.")
+        uart.send_line("INFO")
+        info_line = uart.wait_for_line_containing(AWG_CONSOLE_INFO_PREFIX, args.uart_timeout)
+        info = parse_info_line(info_line)
+
+        suite_summary = {
+            "mode": "scheduler_benchmark_suite",
+            "profile": args.scheduler_suite_profile,
+            "catalog_path": str((output_dir / "scheduler_benchmark_catalog.json").resolve()),
+            "scope_plan_path": str((output_dir / "scheduler_scope_plan.json").resolve()),
+            "console_info_initial": asdict(info),
+            "dense_sweep": None,
+            "sfdr_spot_set": None,
+        }
+
+        if args.scheduler_suite_profile in ("dense", "fsh", "all"):
+            suite_summary["dense_sweep"] = execute_scheduler_dense_fsh_suite(
+                uart=uart,
+                console_log=console_log,
+                args=args,
+                output_dir=output_dir / "dense_sweep",
+                info=info,
+                analyzer=analyzer,
+                analyzer_settings=analyzer_settings,
+            )
+
+        if args.scheduler_suite_profile in ("sfdr", "fsh", "all"):
+            suite_summary["sfdr_spot_set"] = execute_scheduler_sfdr_spot_suite(
+                uart=uart,
+                console_log=console_log,
+                args=args,
+                output_dir=output_dir / "sfdr_spots",
+                info=info,
+                analyzer=analyzer,
+                analyzer_settings=analyzer_settings,
+                sfdr_settings=sfdr_settings,
+            )
+
+        uart.send_line("EXIT")
+        uart.wait_for(AWG_CONSOLE_BYE_MARKER, args.uart_timeout, extra_needles=[AWG_CONSOLE_ERROR_MARKER])
+
+        summary_path = output_dir / "scheduler_benchmark_suite.json"
+        summary_path.write_text(
+            json.dumps(suite_summary, indent=2, default=json_default) + "\n",
+            encoding="utf-8",
+        )
+        print(f"[HOST] Scheduler benchmark suite summary written to {summary_path}")
+        return 0
+    except Exception as exc:
+        print(f"[HOST] Scheduler benchmark suite error: {exc}")
+        return 1
+    finally:
+        if uart is not None:
+            try:
+                uart.close()
+            except Exception:
+                pass
+        if analyzer is not None:
+            try:
+                analyzer.close()
+            except Exception:
+                pass
+        console_log.close()
 
 
 def run_awg_scheduler_console_mode(args: argparse.Namespace) -> int:
@@ -2601,25 +3497,26 @@ def run_awg_scheduler_console_mode(args: argparse.Namespace) -> int:
 
         settings_files = resolve_xilinx_settings(args)
         extra_cflags = build_awg_scheduler_console_cflags(args)
-        make_env = {"NEW_CFLAGS": extra_cflags}
-        make_args = combine_make_args(args.make_args)
+        if extra_cflags:
+            print(
+                "[HOST] WARNING: generated firmware override CFLAGS are not applied by XSDB launch; "
+                "ensure the selected ELF was built with the expected scheduler console options."
+            )
 
         if not args.skip_make_run:
             rx_before = uart.rx_count
             for item in settings_files:
                 print(f"[HOST] Using Xilinx settings: {item}")
-            print("[HOST] Launching 'make run' for AWG scheduler console...")
-            run_make_run(
+            print("[HOST] Launching XSDB reset/download/start for AWG scheduler console...")
+            run_xsdb_launch(
                 project_dir=script_dir,
+                output_dir=output_dir,
                 uart=uart,
                 timeout_s=args.make_timeout,
                 settings_files=settings_files,
-                make_args=make_args,
-                extra_env=make_env,
-                update_first=True,
-                clean_first=True,
+                args=args,
             )
-            print("[HOST] 'make run' completed.")
+            print("[HOST] XSDB launch completed.")
 
             if uart.rx_count == rx_before:
                 print(f"[HOST] Reopening UART {args.serial_port} after programming...")
@@ -2788,7 +3685,56 @@ def build_phase_noise_offset_requests(
     return requests
 
 
+def build_dynamic_case_matrix(args: argparse.Namespace) -> List[Tuple[float, float, int, int]]:
+    if not args.dynamic_start_mhz and not args.dynamic_stop_mhz and not args.dynamic_dwell_ms:
+        return []
+    if len(args.dynamic_start_mhz) != len(args.dynamic_stop_mhz):
+        raise SystemExit("--dynamic-start-mhz and --dynamic-stop-mhz must be provided the same number of times")
+    if not args.dynamic_start_mhz:
+        raise SystemExit("Custom dynamic retune configuration requires at least one --dynamic-start-mhz/--dynamic-stop-mhz pair")
+    if not args.dynamic_dwell_ms:
+        raise SystemExit("Custom dynamic retune configuration requires at least one --dynamic-dwell-ms")
+    cases: List[Tuple[float, float, int, int]] = []
+    for start_mhz, stop_mhz in zip(args.dynamic_start_mhz, args.dynamic_stop_mhz):
+        for dwell_ms in args.dynamic_dwell_ms:
+            transitions = max(1, int(round(args.dynamic_active_ms / float(dwell_ms))))
+            cases.append((start_mhz * 1e6, stop_mhz * 1e6, dwell_ms, transitions))
+    if len(cases) > MAX_DYNAMIC_CASES:
+        raise SystemExit(
+            f"Custom dynamic retune configuration expands to {len(cases)} cases; "
+            f"the current firmware/host limit is {MAX_DYNAMIC_CASES}"
+        )
+    return cases
+
+
 def build_dynamic_specs(args: argparse.Namespace) -> List[DynamicRetuneSpec]:
+    custom_cases = build_dynamic_case_matrix(args)
+    if custom_cases:
+        specs: List[DynamicRetuneSpec] = []
+        total = len(custom_cases)
+        for index, (start_hz, stop_hz, dwell_ms, transitions) in enumerate(custom_cases, start=1):
+            start_label = str(int(round(start_hz / 1e6)))
+            stop_label = str(int(round(stop_hz / 1e6)))
+            step_name = f"dynamic_toggle_{start_label}_{stop_label}_{dwell_ms}ms"
+            marker_name = f"toggle_{start_label}_to_{stop_label}_{dwell_ms}ms"
+            specs.append(
+                DynamicRetuneSpec(
+                    index=index,
+                    name=step_name,
+                    marker=f"[DYNAMIC-SFDR] Step {index}/{total}: {marker_name}.",
+                    done_marker=f"[DYNAMIC-SFDR] Completed burst {index}/{total}.",
+                    description=(
+                        f"Rapid DDS retune burst toggling {start_hz / 1e6:g} MHz <-> "
+                        f"{stop_hz / 1e6:g} MHz with {dwell_ms} ms dwell"
+                    ),
+                    intended_freq_hz=[start_hz, stop_hz],
+                    dwell_ms=dwell_ms,
+                    transitions=transitions,
+                    intended_margin_hz=args.dynamic_intended_margin_hz,
+                )
+            )
+        return specs
+
     specs: List[DynamicRetuneSpec] = []
     for item in DYNAMIC_RETUNE_STEP_SPECS:
         specs.append(
@@ -2846,7 +3792,7 @@ def advance_boot_defaults_or_wait_for_nco(
             uart.send_line(rate_reply)
             return False
 
-        time.sleep(0.25)
+        time.sleep(BOOT_REPLY_PACING_S)
 
     raise TimeoutError(f"Timed out waiting for UART text: {NCO_START_PROMPT!r}")
 
@@ -2855,70 +3801,113 @@ def resolve_xilinx_settings(args: argparse.Namespace) -> List[Path]:
     return [Path(item) for item in args.xilinx_settings]
 
 
-def build_make_run_command(
+def resolve_xsdb_elf_path(project_dir: Path, args: argparse.Namespace) -> Path:
+    if args.xsdb_elf:
+        return Path(args.xsdb_elf)
+    return project_dir / "build" / "fmcdac.elf"
+
+
+def resolve_xsdb_xsa_path(project_dir: Path, args: argparse.Namespace) -> Path:
+    if args.xsdb_xsa:
+        return Path(args.xsdb_xsa)
+    return project_dir / "build" / "tmp" / "system_top.xsa"
+
+
+def tcl_quote_path(path: Path) -> str:
+    return str(path.resolve()).replace("\\", "/")
+
+
+def build_xsdb_script_text(
+    *,
+    hw_url: str,
+    target_filter: str,
+    elf_path: Path,
+    xsa_path: Optional[Path],
+    reset_delay_ms: int,
+) -> str:
+    lines = [
+        f"connect -url {hw_url}",
+        f"targets -set -nocase -filter {{{target_filter}}}",
+    ]
+    if xsa_path is not None:
+        lines.append(f"loadhw -hw {tcl_quote_path(xsa_path)} -regs")
+        lines.append("configparams mdm-detect-bscan-mask 2")
+        lines.append(f"targets -set -nocase -filter {{{target_filter}}}")
+    lines.extend(
+        [
+            "rst -system",
+            f"after {reset_delay_ms}",
+            f"targets -set -nocase -filter {{{target_filter}}}",
+            f"dow {tcl_quote_path(elf_path)}",
+            f"targets -set -nocase -filter {{{target_filter}}}",
+            "con",
+            "exit",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def build_xsdb_launch_command(
     settings_files: List[Path],
-    make_args: str,
-    update_first: bool = False,
-    clean_first: bool = False,
+    xsdb_exe: str,
+    script_path: Path,
 ) -> str:
     parts: List[str] = []
     for item in settings_files:
         if not item.is_file():
             raise RuntimeError(f"Xilinx settings file not found: {item}")
         parts.append(f'call "{item}"')
-
-    if update_first:
-        update_command = "make update"
-        if make_args.strip():
-            update_command += f" {make_args.strip()}"
-        parts.append(update_command)
-
-    if clean_first:
-        clean_command = "make clean"
-        if make_args.strip():
-            clean_command += f" {make_args.strip()}"
-        parts.append(clean_command)
-
-    make_command = "make run"
-    if make_args.strip():
-        make_command += f" {make_args.strip()}"
-    parts.append(make_command)
+    parts.append(f'"{xsdb_exe}" "{script_path.resolve()}"')
     return " && ".join(parts)
 
 
-def combine_make_args(*items: str) -> str:
-    return " ".join(item.strip() for item in items if item and item.strip())
-
-
-def run_make_run(
+def run_xsdb_launch(
     project_dir: Path,
+    output_dir: Path,
     uart: UartCoordinator,
     timeout_s: float,
     settings_files: List[Path],
-    make_args: str,
-    extra_env: Optional[dict[str, str]] = None,
-    update_first: bool = False,
-    clean_first: bool = False,
+    args: argparse.Namespace,
 ) -> None:
-    command = build_make_run_command(
+    elf_path = resolve_xsdb_elf_path(project_dir, args)
+    if not elf_path.is_file():
+        raise RuntimeError(f"XSDB ELF not found: {elf_path}")
+
+    xsa_path: Optional[Path] = None
+    if not args.xsdb_skip_loadhw:
+        xsa_path = resolve_xsdb_xsa_path(project_dir, args)
+        if not xsa_path.is_file():
+            raise RuntimeError(
+                f"XSDB XSA not found: {xsa_path}. Use --xsdb-xsa to point to the intended hardware export "
+                "or --xsdb-skip-loadhw to bypass loadhw."
+            )
+
+    script_path = output_dir / "launch_xsdb.tcl"
+    script_path.write_text(
+        build_xsdb_script_text(
+            hw_url=args.xsdb_hw_url,
+            target_filter=args.xsdb_target_filter,
+            elf_path=elf_path,
+            xsa_path=xsa_path,
+            reset_delay_ms=args.xsdb_reset_delay_ms,
+        ),
+        encoding="utf-8",
+    )
+
+    command = build_xsdb_launch_command(
         settings_files,
-        make_args,
-        update_first=update_first,
-        clean_first=clean_first,
+        args.xsdb_exe,
+        script_path,
     )
     escaped_command = command.replace('"', '""')
     command_line = f'cmd.exe /d /c "{escaped_command}"'
-    env = os.environ.copy()
-    if extra_env:
-        env.update(extra_env)
     try:
         proc = subprocess.Popen(
             command_line,
             cwd=str(project_dir),
-            env=env,
         )
     except FileNotFoundError as exc:  # pragma: no cover - Windows-specific
-        raise RuntimeError("Could not find 'cmd.exe' or 'make' in PATH") from exc
+        raise RuntimeError("Could not find 'cmd.exe' or the requested XSDB executable in PATH") from exc
 
     deadline = time.monotonic() + timeout_s
     while True:
@@ -2928,12 +3917,12 @@ def run_make_run(
             while uart.pump():
                 pass
             if ret != 0:
-                raise RuntimeError(f"'make run' failed with exit code {ret}")
+                raise RuntimeError(f"XSDB launch failed with exit code {ret}")
             return
         if time.monotonic() >= deadline:
             proc.kill()
-            raise TimeoutError(f"'make run' exceeded timeout of {timeout_s:.0f} seconds")
-        time.sleep(0.05)
+            raise TimeoutError(f"XSDB launch exceeded timeout of {timeout_s:.0f} seconds")
+        time.sleep(HOST_POLL_SLEEP_S)
 
 
 def capture_step_group(
@@ -2946,6 +3935,11 @@ def capture_step_group(
     settings: AnalyzerSettings,
     benchmark_prompts_enabled: bool,
     dump_analyzer_state: bool = False,
+    write_step_csv: bool = False,
+    settle_timeout_s: float = 0.0,
+    settle_error_hz: float = 0.0,
+    use_known_tone_capture: bool = False,
+    lock_to_expected: bool = False,
 ) -> List[StepCaptureSummary]:
     summaries: List[StepCaptureSummary] = []
     reference_power_dbm: Optional[float] = None
@@ -2956,14 +3950,31 @@ def capture_step_group(
         if benchmark_prompts_enabled:
             uart.wait_for(CONTINUE_PROMPT, timeout_s)
 
-        summary = capture_trace_step(
-            analyzer=analyzer,
-            output_dir=output_dir,
-            step=step,
-            settings=settings,
-            dump_analyzer_state=dump_analyzer_state,
-            write_json=dump_analyzer_state,
-        )
+        if use_known_tone_capture:
+            summary = capture_known_tone_step(
+                analyzer=analyzer,
+                output_dir=output_dir,
+                step=step,
+                settings=settings,
+                dump_analyzer_state=dump_analyzer_state,
+                write_csv=write_step_csv,
+                write_json=dump_analyzer_state,
+                settle_timeout_s=settle_timeout_s,
+                settle_error_hz=settle_error_hz,
+                lock_to_expected=lock_to_expected,
+            )
+        else:
+            summary = capture_trace_step(
+                analyzer=analyzer,
+                output_dir=output_dir,
+                step=step,
+                settings=settings,
+                dump_analyzer_state=dump_analyzer_state,
+                write_csv=write_step_csv,
+                write_json=dump_analyzer_state,
+                settle_timeout_s=settle_timeout_s,
+                settle_error_hz=settle_error_hz,
+            )
         metrics = summary.metrics
 
         if reference_power_dbm is None:
@@ -2995,6 +4006,9 @@ def capture_sfdr_group(
     phase_noise_settings: AnalyzerSettings,
     benchmark_prompts_enabled: bool,
     dump_analyzer_state: bool = False,
+    write_step_csv: bool = False,
+    settle_timeout_s: float = 0.0,
+    settle_error_hz: float = 0.0,
 ) -> List[StepCaptureSummary]:
     summaries: List[StepCaptureSummary] = []
 
@@ -3003,17 +4017,23 @@ def capture_sfdr_group(
         if benchmark_prompts_enabled:
             uart.wait_for(CONTINUE_PROMPT, timeout_s)
 
-        metrics = analyzer.capture_sfdr(step, settings, sfdr_settings)
+        _, _, metrics = capture_with_frequency_settle(
+            lambda: ([0.0], [0.0], analyzer.capture_sfdr(step, settings, sfdr_settings)),
+            step,
+            timeout_s=settle_timeout_s,
+            error_hz=settle_error_hz,
+        )
         json_path = output_dir / f"step{step.index:02d}_{step.name}.json"
         csv_path = output_dir / f"step{step.index:02d}_{step.name}.csv"
-        csv_path.write_text(
-            "marker_type,frequency_hz,level_dbm\n"
-            f"carrier,{metrics.power_freq_hz:.6f},{metrics.power_dbm:.6f}\n"
-            f"left_spur,{'' if metrics.left_spur_freq_hz is None else f'{metrics.left_spur_freq_hz:.6f}'},{'' if metrics.left_spur_power_dbm is None else f'{metrics.left_spur_power_dbm:.6f}'}\n"
-            f"right_spur,{'' if metrics.right_spur_freq_hz is None else f'{metrics.right_spur_freq_hz:.6f}'},{'' if metrics.right_spur_power_dbm is None else f'{metrics.right_spur_power_dbm:.6f}'}\n"
-            f"worst_spur,{'' if metrics.spur_freq_hz is None else f'{metrics.spur_freq_hz:.6f}'},{'' if metrics.spur_power_dbm is None else f'{metrics.spur_power_dbm:.6f}'}\n",
-            encoding="utf-8",
-        )
+        if write_step_csv:
+            csv_path.write_text(
+                "marker_type,frequency_hz,level_dbm\n"
+                f"carrier,{metrics.power_freq_hz:.6f},{metrics.power_dbm:.6f}\n"
+                f"left_spur,{'' if metrics.left_spur_freq_hz is None else f'{metrics.left_spur_freq_hz:.6f}'},{'' if metrics.left_spur_power_dbm is None else f'{metrics.left_spur_power_dbm:.6f}'}\n"
+                f"right_spur,{'' if metrics.right_spur_freq_hz is None else f'{metrics.right_spur_freq_hz:.6f}'},{'' if metrics.right_spur_power_dbm is None else f'{metrics.right_spur_power_dbm:.6f}'}\n"
+                f"worst_spur,{'' if metrics.spur_freq_hz is None else f'{metrics.spur_freq_hz:.6f}'},{'' if metrics.spur_power_dbm is None else f'{metrics.spur_power_dbm:.6f}'}\n",
+                encoding="utf-8",
+            )
         if dump_analyzer_state:
             write_step_json(
                 json_path,
@@ -3034,7 +4054,7 @@ def capture_sfdr_group(
             marker=step.marker,
             description=step.description,
             expected_freq_hz=step.expected_freq_hz,
-            csv_path=str(csv_path.resolve()),
+            csv_path=str(csv_path.resolve()) if write_step_csv else "",
             metrics=metrics,
         )
         summaries.append(summary)
@@ -3052,6 +4072,7 @@ def capture_sfdr_group(
                 step=request.step_spec,
                 settings=phase_noise_settings,
                 dump_analyzer_state=dump_analyzer_state,
+                write_csv=write_step_csv,
                 write_json=dump_analyzer_state,
             )
             summaries.append(phase_summary)
@@ -3071,6 +4092,7 @@ def capture_sfdr_group(
                 carrier_power_dbm=metrics.power_dbm,
                 carrier_freq_hz=metrics.power_freq_hz,
                 dump_analyzer_state=dump_analyzer_state,
+                write_step_csv=write_step_csv,
             )
             summaries.append(phase_offset_summary)
             print_phase_noise_offset_summary(request, phase_offset_summary.metrics)
@@ -3160,6 +4182,7 @@ def capture_phase_noise_offset_step(
     carrier_power_dbm: float,
     carrier_freq_hz: float,
     dump_analyzer_state: bool = False,
+    write_step_csv: bool = False,
 ) -> StepCaptureSummary:
     metrics = capture_phase_noise_offset_metrics(
         analyzer=analyzer,
@@ -3181,15 +4204,16 @@ def capture_phase_noise_offset_step(
             f"{'' if sideband.freq_hz is None else f'{sideband.freq_hz:.6f}'},"
             f"{'' if sideband.power_dbm is None else f'{sideband.power_dbm:.6f}'}"
         )
-    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    write_step_json(
-        json_path,
-        analyzer.idn,
-        step,
-        metrics,
-        extra=build_step_extra(analyzer, dump_analyzer_state),
-    )
+    if write_step_csv:
+        csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if dump_analyzer_state:
+        write_step_json(
+            json_path,
+            analyzer.idn,
+            step,
+            metrics,
+            extra=build_step_extra(analyzer, dump_analyzer_state),
+        )
 
     return StepCaptureSummary(
         group="phase_noise_offset",
@@ -3198,7 +4222,7 @@ def capture_phase_noise_offset_step(
         marker=step.marker,
         description=step.description,
         expected_freq_hz=step.expected_freq_hz,
-        csv_path=str(csv_path.resolve()),
+        csv_path=str(csv_path.resolve()) if write_step_csv else "",
         metrics=metrics,
     )
 
@@ -3394,6 +4418,7 @@ def capture_dynamic_sfdr_group(
     sfdr_settings: SfdrSettings,
     benchmark_prompts_enabled: bool,
     dump_analyzer_state: bool = False,
+    write_step_csv: bool = False,
 ) -> List[StepCaptureSummary]:
     summaries: List[StepCaptureSummary] = []
 
@@ -3416,7 +4441,8 @@ def capture_dynamic_sfdr_group(
                 f"{'' if peak.freq_hz is None else f'{peak.freq_hz:.6f}'},"
                 f"{'' if peak.power_dbm is None else f'{peak.power_dbm:.6f}'}"
             )
-        csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if write_step_csv:
+            csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         if dump_analyzer_state:
             write_step_json(
                 json_path,
@@ -3446,7 +4472,7 @@ def capture_dynamic_sfdr_group(
             marker=step.marker,
             description=step.description,
             expected_freq_hz=list(step.intended_freq_hz),
-            csv_path=str(csv_path.resolve()),
+            csv_path=str(csv_path.resolve()) if write_step_csv else "",
             metrics=metrics,
         )
         summaries.append(summary)
@@ -3709,6 +4735,8 @@ def require_prompt(
 def main() -> int:
     args = parse_args()
     ensure_args(args)
+    if args.run_scheduler_benchmark_suite:
+        return run_scheduler_benchmark_suite_mode(args)
     if args.run_full_integration:
         return run_full_integration_mode(args)
     if awg_scheduler_console_requested(args):
@@ -3740,15 +4768,13 @@ def main() -> int:
         dynamic_specs = build_dynamic_specs(args)
         dds_band_step_specs = build_dds_band_step_specs(args)
         sfdr_step_specs = build_sfdr_step_specs(args)
-        benchmark_prompts_disabled = (
-            len(dds_band_step_specs) >= DEFAULT_BULK_PROMPT_DISABLE_STEP_THRESHOLD
-            or len(sfdr_step_specs) >= DEFAULT_BULK_PROMPT_DISABLE_STEP_THRESHOLD
-        )
-        extra_cflags = build_sweep_override_cflags(args, benchmark_prompts_disabled)
-        make_env = {"NEW_CFLAGS": extra_cflags} if extra_cflags else None
-        force_update_rebuild = bool(extra_cflags)
-        force_clean_rebuild = bool(extra_cflags)
-        make_args = combine_make_args(args.make_args)
+        benchmark_prompts_disabled = False
+        extra_cflags = build_sweep_override_cflags(args)
+        if extra_cflags:
+            print(
+                "[HOST] WARNING: generated firmware override CFLAGS are not applied by XSDB launch; "
+                "ensure the selected ELF was built with matching sweep/dynamic options."
+            )
 
         trace_capture_flags: List[str] = []
         if analyzer_settings.capture_trace:
@@ -3776,18 +4802,16 @@ def main() -> int:
             rx_before = uart.rx_count
             for item in settings_files:
                 print(f"[HOST] Using Xilinx settings: {item}")
-            print("[HOST] Launching 'make run'...")
-            run_make_run(
+            print("[HOST] Launching XSDB reset/download/start...")
+            run_xsdb_launch(
                 project_dir=project_dir,
+                output_dir=output_dir,
                 uart=uart,
                 timeout_s=args.make_timeout,
                 settings_files=settings_files,
-                make_args=make_args,
-                extra_env=make_env,
-                update_first=force_update_rebuild,
-                clean_first=force_clean_rebuild,
+                args=args,
             )
-            print("[HOST] 'make run' completed.")
+            print("[HOST] XSDB launch completed.")
 
             if uart.rx_count == rx_before:
                 print(f"[HOST] Reopening UART {args.serial_port} after programming...")
@@ -3829,6 +4853,11 @@ def main() -> int:
                     settings=analyzer_settings,
                         benchmark_prompts_enabled=not benchmark_prompts_disabled,
                     dump_analyzer_state=args.dump_analyzer_state,
+                    write_step_csv=args.write_step_csv,
+                    settle_timeout_s=0.0,
+                    settle_error_hz=0.0,
+                    use_known_tone_capture=False,
+                    lock_to_expected=False,
                 )
             )
 
@@ -3882,6 +4911,11 @@ def main() -> int:
                         settings=analyzer_settings,
                         benchmark_prompts_enabled=not benchmark_prompts_disabled,
                         dump_analyzer_state=args.dump_analyzer_state,
+                        write_step_csv=args.write_step_csv,
+                        settle_timeout_s=args.freq_settle_timeout_s,
+                        settle_error_hz=args.freq_settle_error_hz,
+                        use_known_tone_capture=True,
+                        lock_to_expected=True,
                     )
                 )
             next_prompt = wait_for_optional_prompt(
@@ -3918,6 +4952,9 @@ def main() -> int:
                         phase_noise_settings=phase_noise_settings,
                         benchmark_prompts_enabled=not benchmark_prompts_disabled,
                         dump_analyzer_state=args.dump_analyzer_state,
+                        write_step_csv=args.write_step_csv,
+                        settle_timeout_s=args.freq_settle_timeout_s,
+                        settle_error_hz=args.freq_settle_error_hz,
                     )
                 )
             next_prompt = wait_for_optional_prompt(
@@ -3957,6 +4994,7 @@ def main() -> int:
                         sfdr_settings=sfdr_settings,
                         benchmark_prompts_enabled=not benchmark_prompts_disabled,
                         dump_analyzer_state=args.dump_analyzer_state,
+                        write_step_csv=args.write_step_csv,
                     )
                 )
             next_prompt = wait_for_optional_prompt(

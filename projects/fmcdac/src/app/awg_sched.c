@@ -10,6 +10,10 @@
 #include "no_os_delay.h"
 #include "xil_printf.h"
 
+#if FMCDAC_AWG_SCHED_STREAM
+#include "parameters.h"
+#endif
+
 #ifndef AWG_SCHED_ENABLE_LOAD_READBACK_VERIFY
 #define AWG_SCHED_ENABLE_LOAD_READBACK_VERIFY 0
 #endif
@@ -25,7 +29,7 @@ uint8_t  hw_ts_bits;
 } g_awg_sched;
 static volatile uint32_t g_awg_sched_irq_seq;
 
-#define AWG_SCHED_FLAGS_ALLOWED_MASK      0x0001U
+#define AWG_SCHED_FLAGS_ALLOWED_MASK      (AWG_SCHED_FLAG_PHASE_REINIT | AWG_SCHED_FLAG_EOF)
 #define AWG_SCHED_CHANNEL_MASK_DEFAULT    0x0001U
 #define AWG_SCHED_TONE_MASK_DEFAULT       0xFFFFU
 #define AWG_SCHED_FREQ_MASK_DEFAULT       0x0000FFFFU
@@ -41,7 +45,22 @@ static volatile uint32_t g_awg_sched_irq_seq;
 #define AWG_SCHED_START_ARM_WAIT_US       1000U
 #define AWG_SCHED_START_RUN_WAIT_US       1000U
 #define AWG_SCHED_START_RUN_RETRIES       3U
-#define AWG_SCHED_IRQ_ARM_MASK            (AWG_SCHED_IRQ_DONE_BIT | AWG_SCHED_IRQ_ERROR_BIT)
+#define AWG_SCHED_IRQ_ARM_MASK            (AWG_SCHED_IRQ_DONE | AWG_SCHED_IRQ_ERROR)
+#define AWG_SCHED_STATUS_ERR_CODE_SHIFT   8U
+#define AWG_SCHED_STATUS_ERR_CODE_MASK    0xFFU
+
+/*
+ * The Phase A public header names the intended status bits.  Existing HDL
+ * snapshots still encode ARMED/RUNNING/DONE/ERROR in bits 0..3, so decode both
+ * encodings to preserve the legacy preload API across refreshed XSAs.
+ */
+#define AWG_SCHED_STATUS_ARMED_COMPAT     (AWG_SCHED_STATUS_ARMED | (1U << 0))
+#define AWG_SCHED_STATUS_RUNNING_COMPAT   (AWG_SCHED_STATUS_RUNNING | (1U << 1))
+#define AWG_SCHED_STATUS_DONE_COMPAT      (AWG_SCHED_STATUS_DONE | (1U << 2))
+#define AWG_SCHED_STATUS_ERROR_COMPAT     (AWG_SCHED_STATUS_ERROR | (1U << 3))
+#define AWG_SCHED_CAPS_EVT_DEPTH_LOG2(caps) (((caps) >> 24) & 0xFFU)
+#define AWG_SCHED_CAPS_PAYLOAD_BITS(caps)   (((caps) >> 16) & 0xFFU)
+#define AWG_SCHED_CAPS_TS_BITS(caps)        (((caps) >> 8) & 0xFFU)
 
 __attribute__((weak)) void awg_sched_irq_wait_hook(uint32_t wait_ms_left)
 {
@@ -157,11 +176,11 @@ static int awg_sched_read_time_now(uint64_t *time_now)
 	if (!time_now)
 		return -EINVAL;
 
-	ret = awg_sched_reg_read(AWG_SCHED_REG_TIME_LO, &time_lo);
+	ret = awg_sched_reg_read(AWG_SCHED_REG_TIME_NOW_LO, &time_lo);
 	if (ret)
 		return ret;
 
-	ret = awg_sched_reg_read(AWG_SCHED_REG_TIME_HI, &time_hi);
+	ret = awg_sched_reg_read(AWG_SCHED_REG_TIME_NOW_HI, &time_hi);
 	if (ret)
 		return ret;
 
@@ -277,7 +296,7 @@ g_awg_sched.loaded_events = 0;
 g_awg_sched.events_validated = false;
 g_awg_sched_irq_seq = 0U;
 AWG_LOG("%s", "[AWG-SCHED] reset step=write_evt_count_zero\n\r");
-ret = awg_sched_reg_write(AWG_SCHED_REG_EVT_COUNT, 0U);
+ret = awg_sched_reg_write(AWG_SCHED_REG_EVENT_COUNT, 0U);
 if (ret)
 return ret;
 AWG_LOG("%s", "[AWG-SCHED] reset step=write_evt_count_zero_done\n\r");
@@ -314,9 +333,9 @@ if (ret)
 goto fail;
 AWG_LOG("[AWG-SCHED] config ip_id=0x%08lX\n\r", (unsigned long)ip_id);
 
-if (ip_id != AWG_TIMED_CTRL_IP_ID) {
+if (ip_id != AWG_SCHED_IP_ID) {
 AWG_LOG("[AWG-SCHED] IP_ID mismatch: expected=0x%08lX observed=0x%08lX\n\r",
-(unsigned long)AWG_TIMED_CTRL_IP_ID,
+(unsigned long)AWG_SCHED_IP_ID,
 (unsigned long)ip_id);
 ret = -ENODEV;
 goto fail;
@@ -329,11 +348,11 @@ goto fail;
 AWG_LOG("[AWG-SCHED] config ip_version=0x%08lX\n\r", (unsigned long)ip_ver);
 
 major = (ip_ver >> 16) & 0xFFFFU;
-if (major != AWG_TIMED_CTRL_MAJOR_EXPECTED) {
-AWG_LOG("[AWG-SCHED] IP_VERSION major mismatch: expected=%lu observed=%lu (full=0x%08lX)\n\r",
-(unsigned long)AWG_TIMED_CTRL_MAJOR_EXPECTED,
-(unsigned long)major,
-(unsigned long)ip_ver);
+if (ip_ver != AWG_SCHED_IP_VERSION) {
+AWG_LOG("[AWG-SCHED] IP_VERSION mismatch: expected=0x%08lX observed=0x%08lX major=%lu\n\r",
+(unsigned long)AWG_SCHED_IP_VERSION,
+(unsigned long)ip_ver,
+(unsigned long)major);
 ret = -ENOTSUP;
 goto fail;
 }
@@ -543,13 +562,14 @@ report->reason, (unsigned long)report->observed,
 return -EINVAL;
 }
 
-static int awg_sched_write_event(uint32_t idx, const awg_event_v1_t *e)
+static int awg_sched_write_one_event(const awg_event_v1_t *e,
+				     bool check_stream_overflow)
 {
 int ret;
+uint32_t stream_ctrl;
 
-ret = awg_sched_reg_write(AWG_SCHED_REG_EVT_WADDR, idx);
-if (ret)
-return ret;
+if (!e)
+return -EINVAL;
 
 ret = awg_sched_reg_write(AWG_SCHED_REG_EVT_WDATA0, (uint32_t)(e->timestamp_ticks));
 if (ret)
@@ -579,9 +599,23 @@ ret = awg_sched_reg_write(AWG_SCHED_REG_EVT_WDATA6, e->payload.word3);
 if (ret)
 return ret;
 
-ret = awg_sched_reg_write(AWG_SCHED_REG_EVT_WCTRL, 1U);
+ret = awg_sched_reg_write(AWG_SCHED_REG_EVT_WCTRL, AWG_SCHED_EVT_WCTRL_PUSH);
 if (ret)
 return ret;
+
+#if FMCDAC_AWG_SCHED_STREAM
+if (check_stream_overflow) {
+ret = awg_sched_reg_read(AWG_SCHED_REG_STREAM_CTRL, &stream_ctrl);
+if (ret)
+return ret;
+
+if ((stream_ctrl & AWG_SCHED_STREAM_CTRL_OVERFLOW) != 0U)
+return -EAGAIN;
+}
+#else
+(void)check_stream_overflow;
+(void)stream_ctrl;
+#endif
 
 /*
  * Current HDL exposes no AXI-visible event-write ack.  Give the sched_clk
@@ -590,6 +624,17 @@ return ret;
  */
 no_os_udelay(2U);
 return 0;
+}
+
+static int awg_sched_write_event(uint32_t idx, const awg_event_v1_t *e)
+{
+int ret;
+
+ret = awg_sched_reg_write(AWG_SCHED_REG_EVT_WADDR, idx);
+if (ret)
+return ret;
+
+return awg_sched_write_one_event(e, false);
 }
 
 /*
@@ -607,7 +652,7 @@ ret = awg_sched_reg_read(AWG_SCHED_REG_STATUS, &raw);
 if (ret)
 return ret;
 
-if (!(raw & AWG_SCHED_STATUS_RUNNING))
+if (!(raw & AWG_SCHED_STATUS_RUNNING_COMPAT))
 return 0;
 
 if (ms_left == 0U)
@@ -648,7 +693,7 @@ if (ret)
 return ret;
 }
 
-ret = awg_sched_reg_write(AWG_SCHED_REG_EVT_COUNT, count);
+ret = awg_sched_reg_write(AWG_SCHED_REG_EVENT_COUNT, count);
 if (ret)
 return ret;
 
@@ -684,6 +729,10 @@ return -EINVAL;
 
 if (!g_awg_sched.events_validated)
 return -EINVAL;
+
+ret = awg_sched_reg_write(AWG_SCHED_REG_STREAM_CTRL, 0U);
+if (ret)
+return ret;
 
 ret = awg_sched_reg_write(AWG_SCHED_REG_IRQ_ENABLE, AWG_SCHED_IRQ_ARM_MASK);
 if (ret)
@@ -756,7 +805,7 @@ int awg_sched_stop(void)
 if (!g_awg_sched.configured)
 return -ENODEV;
 
-return awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_STOP_REQ);
+return awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_STOP);
 }
 
 int awg_sched_get_status(awg_sched_status_t *status)
@@ -783,15 +832,15 @@ ret = awg_sched_reg_read(AWG_SCHED_REG_STATUS, &raw_status);
 if (ret)
 return ret;
 
-ret = awg_sched_reg_read(AWG_SCHED_REG_CUR_EVT, &cur_event);
+ret = awg_sched_reg_read(AWG_SCHED_REG_CUR_EVENT, &cur_event);
 if (ret)
 return ret;
 
-ret = awg_sched_reg_read(AWG_SCHED_REG_TIME_LO, &time_lo);
+ret = awg_sched_reg_read(AWG_SCHED_REG_TIME_NOW_LO, &time_lo);
 if (ret)
 return ret;
 
-ret = awg_sched_reg_read(AWG_SCHED_REG_TIME_HI, &time_hi);
+ret = awg_sched_reg_read(AWG_SCHED_REG_TIME_NOW_HI, &time_hi);
 if (ret)
 return ret;
 
@@ -821,10 +870,10 @@ return ret;
 
 memset(status, 0, sizeof(*status));
 status->configured = true;
-status->armed   = (raw_status & AWG_SCHED_STATUS_ARMED)   != 0U;
-status->running = (raw_status & AWG_SCHED_STATUS_RUNNING) != 0U;
-status->done    = (raw_status & AWG_SCHED_STATUS_DONE)    != 0U;
-status->error   = (raw_status & AWG_SCHED_STATUS_ERROR)   != 0U;
+status->armed   = (raw_status & AWG_SCHED_STATUS_ARMED_COMPAT)   != 0U;
+status->running = (raw_status & AWG_SCHED_STATUS_RUNNING_COMPAT) != 0U;
+status->done    = (raw_status & AWG_SCHED_STATUS_DONE_COMPAT)    != 0U;
+status->error   = (raw_status & AWG_SCHED_STATUS_ERROR_COMPAT)   != 0U;
 status->err_code = (uint8_t)((raw_status >> AWG_SCHED_STATUS_ERR_CODE_SHIFT)
      & AWG_SCHED_STATUS_ERR_CODE_MASK);
 status->loaded_events        = g_awg_sched.loaded_events;
@@ -969,8 +1018,578 @@ int awg_sched_set_epoch(void)
 
 void awg_sched_irq_signal(void)
 {
+	uint32_t irq_status;
+
 	g_awg_sched_irq_seq++;
+
+#if FMCDAC_AWG_SCHED_STREAM
+	if (g_awg_sched.configured &&
+	    awg_sched_reg_read(AWG_SCHED_REG_IRQ_STATUS, &irq_status) == 0)
+		awg_sched_stream_irq_handler(irq_status);
+#else
+	(void)irq_status;
+#endif
 }
+
+#if FMCDAC_AWG_SCHED_STREAM
+
+#define AWG_STREAM_DEFAULT_POLL_INTERVAL_US 1000U
+#define AWG_STREAM_IRQ_ENABLE_MASK \
+	(AWG_SCHED_IRQ_DONE | AWG_SCHED_IRQ_ERROR | \
+	 AWG_SCHED_IRQ_SPACING_VIOLATION | AWG_SCHED_IRQ_UNDERRUN | \
+	 AWG_SCHED_IRQ_LOW_WATERMARK | AWG_SCHED_IRQ_EMPTY_STALL)
+#define AWG_STREAM_IRQ_HARD_ERROR_MASK \
+	(AWG_SCHED_IRQ_ERROR | AWG_SCHED_IRQ_SPACING_VIOLATION | AWG_SCHED_IRQ_UNDERRUN)
+
+static struct {
+	bool open;
+	bool producer_closed;
+	bool hard_error;
+	bool started;
+	bool has_last_event;
+	awg_event_v1_t *ring;
+	awg_event_v1_t last_event;
+	uint32_t capacity;
+	uint32_t read_idx;
+	uint32_t write_idx;
+	uint32_t count;
+	uint32_t stream_depth;
+	uint32_t low_wmark_events;
+	uint32_t refill_chunk_max;
+	uint32_t poll_interval_us;
+	volatile uint32_t refill_pending;
+	volatile uint32_t error_pending;
+	volatile uint32_t irq_latched;
+	awg_sched_stream_snapshot_t last_error;
+} g_awg_stream;
+
+static uint32_t awg_stream_min_u32(uint32_t a, uint32_t b)
+{
+	return (a < b) ? a : b;
+}
+
+static uint32_t awg_stream_ring_free(void)
+{
+	if (!g_awg_stream.open || g_awg_stream.capacity < g_awg_stream.count)
+		return 0U;
+
+	return g_awg_stream.capacity - g_awg_stream.count;
+}
+
+static uint32_t awg_stream_ring_prev(uint32_t idx)
+{
+	if (idx == 0U)
+		return g_awg_stream.capacity - 1U;
+
+	return idx - 1U;
+}
+
+static uint32_t awg_stream_ring_next(uint32_t idx)
+{
+	idx++;
+	if (idx >= g_awg_stream.capacity)
+		idx = 0U;
+
+	return idx;
+}
+
+static int awg_stream_snapshot(awg_sched_stream_snapshot_t *snapshot)
+{
+	int ret;
+
+	if (!snapshot)
+		return -EINVAL;
+
+	memset(snapshot, 0, sizeof(*snapshot));
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_STATUS, &snapshot->status);
+	if (ret)
+		return ret;
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_ERR_REG, &snapshot->err_reg);
+	if (ret)
+		return ret;
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_IRQ_STATUS, &snapshot->irq_status);
+	if (ret)
+		return ret;
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_OCCUPANCY, &snapshot->occupancy);
+	if (ret)
+		return ret;
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_FREE_SPACE, &snapshot->free_space);
+	if (ret)
+		return ret;
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_STREAM_CTRL, &snapshot->stream_ctrl);
+	if (ret)
+		return ret;
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_STREAM_PUSHES,
+				 &snapshot->stream_pushes);
+	if (ret)
+		return ret;
+
+	return awg_sched_reg_read(AWG_SCHED_REG_STREAM_STALLS,
+				  &snapshot->stream_stalls);
+}
+
+static int awg_stream_record_hard_error(int ret_code)
+{
+	int ret;
+
+	ret = awg_stream_snapshot(&g_awg_stream.last_error);
+	if (ret)
+		return ret;
+
+	g_awg_stream.hard_error = true;
+	(void)awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_STOP);
+	(void)awg_sched_reg_write(AWG_SCHED_REG_IRQ_STATUS, AWG_SCHED_IRQ_ALL);
+
+	if ((g_awg_stream.last_error.stream_ctrl &
+	     AWG_SCHED_STREAM_CTRL_OVERFLOW) != 0U) {
+		(void)awg_sched_reg_write(AWG_SCHED_REG_STREAM_CTRL,
+					  AWG_SCHED_STREAM_CTRL_MODE |
+					  AWG_SCHED_STREAM_CTRL_OVERFLOW);
+	}
+
+	return ret_code;
+}
+
+static int awg_stream_check_ip(uint32_t *stream_depth)
+{
+	uint32_t ip_id;
+	uint32_t ip_ver;
+	int ret;
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_IP_ID, &ip_id);
+	if (ret)
+		return ret;
+
+	if (ip_id != AWG_SCHED_IP_ID)
+		return -ENODEV;
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_IP_VERSION, &ip_ver);
+	if (ret)
+		return ret;
+
+	if (ip_ver != AWG_SCHED_IP_VERSION)
+		return -ENOTSUP;
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_STREAM_DEPTH, stream_depth);
+	if (ret)
+		return ret;
+
+	if (*stream_depth == 0U)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int awg_stream_start_if_needed(void)
+{
+	awg_sched_status_t status;
+	uint32_t wait_us;
+	int ret;
+
+	if (g_awg_stream.started)
+		return 0;
+
+	ret = awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_ARM);
+	if (ret)
+		return ret;
+
+	for (wait_us = 0U; wait_us < AWG_SCHED_START_ARM_WAIT_US; wait_us++) {
+		ret = awg_sched_get_status(&status);
+		if (ret)
+			return ret;
+
+		if (status.armed && !status.running)
+			break;
+
+		no_os_udelay(1U);
+	}
+
+	if (!(status.armed && !status.running))
+		return -ETIMEDOUT;
+
+	ret = awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_RUN);
+	if (ret)
+		return ret;
+
+	for (wait_us = 0U; wait_us < AWG_SCHED_START_RUN_WAIT_US; wait_us++) {
+		ret = awg_sched_get_status(&status);
+		if (ret)
+			return ret;
+
+		if (status.running || status.done || status.error) {
+			g_awg_stream.started = true;
+			return status.error ? -EIO : 0;
+		}
+
+		no_os_udelay(1U);
+	}
+
+	return -ETIMEDOUT;
+}
+
+int awg_sched_stream_open(const awg_sched_stream_cfg_t *cfg)
+{
+	awg_event_v1_t *ring;
+	uint32_t capacity;
+	uint32_t stream_depth;
+	uint32_t low_wmark;
+	uint32_t refill_chunk;
+	uint32_t poll_interval;
+	int ret;
+
+	if (!cfg)
+		return -EINVAL;
+
+	if (!g_awg_sched.configured)
+		return -ENODEV;
+
+	ret = awg_stream_check_ip(&stream_depth);
+	if (ret)
+		return ret;
+
+	if (cfg->staging_buffer) {
+		ring = (awg_event_v1_t *)cfg->staging_buffer;
+		capacity = cfg->staging_capacity;
+		if (capacity == 0U)
+			return -EINVAL;
+	} else {
+		ring = (awg_event_v1_t *)(uintptr_t)AWG_STREAM_DDR_BASEADDR;
+		capacity = AWG_STREAM_DDR_SIZE_BYTES / sizeof(awg_event_v1_t);
+	}
+
+	if (!ring || capacity < stream_depth)
+		return -EINVAL;
+
+	low_wmark = cfg->low_wmark_events;
+	if (low_wmark == 0U) {
+		low_wmark = stream_depth / 4U;
+		if (low_wmark == 0U)
+			low_wmark = 1U;
+	}
+	if (low_wmark > stream_depth)
+		low_wmark = stream_depth;
+
+	refill_chunk = cfg->refill_chunk_max;
+	if (refill_chunk == 0U) {
+		refill_chunk = awg_stream_min_u32(128U, stream_depth / 4U);
+		if (refill_chunk == 0U)
+			refill_chunk = 1U;
+	}
+	if (refill_chunk > stream_depth)
+		refill_chunk = stream_depth;
+
+	poll_interval = cfg->poll_interval_us;
+	if (poll_interval == 0U)
+		poll_interval = AWG_STREAM_DEFAULT_POLL_INTERVAL_US;
+
+	memset(&g_awg_stream, 0, sizeof(g_awg_stream));
+	g_awg_stream.open = true;
+	g_awg_stream.ring = ring;
+	g_awg_stream.capacity = capacity;
+	g_awg_stream.stream_depth = stream_depth;
+	g_awg_stream.low_wmark_events = low_wmark;
+	g_awg_stream.refill_chunk_max = refill_chunk;
+	g_awg_stream.poll_interval_us = poll_interval;
+
+	ret = awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_RESET_SOFT);
+	if (ret)
+		goto fail;
+
+	ret = awg_sched_reg_write(AWG_SCHED_REG_STREAM_CTRL,
+				  AWG_SCHED_STREAM_CTRL_MODE |
+				  AWG_SCHED_STREAM_CTRL_OVERFLOW);
+	if (ret)
+		goto fail;
+
+	ret = awg_sched_reg_write(AWG_SCHED_REG_LOW_WMARK, low_wmark);
+	if (ret)
+		goto fail;
+
+	ret = awg_sched_reg_write(AWG_SCHED_REG_IRQ_STATUS, AWG_SCHED_IRQ_ALL);
+	if (ret)
+		goto fail;
+
+	ret = awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_IRQ_ENABLE);
+	if (ret)
+		goto fail;
+
+	ret = awg_sched_reg_write(AWG_SCHED_REG_IRQ_ENABLE,
+				  AWG_STREAM_IRQ_ENABLE_MASK);
+	if (ret)
+		goto fail;
+
+	return 0;
+
+fail:
+	memset(&g_awg_stream, 0, sizeof(g_awg_stream));
+	return ret;
+}
+
+int awg_sched_stream_push(const awg_event_v1_t *ev, uint32_t n)
+{
+	uint32_t i;
+	int ret;
+
+	if (!g_awg_stream.open)
+		return -ENODEV;
+
+	if (g_awg_stream.producer_closed)
+		return -EPERM;
+
+	if (g_awg_stream.hard_error)
+		return -EIO;
+
+	if (n == 0U)
+		return awg_sched_stream_drain_step();
+
+	if (!ev)
+		return -EINVAL;
+
+	if (awg_stream_ring_free() < n) {
+		ret = awg_sched_stream_drain_step();
+		if (ret)
+			return ret;
+	}
+
+	if (awg_stream_ring_free() < n)
+		return -EAGAIN;
+
+	for (i = 0U; i < n; i++) {
+		g_awg_stream.ring[g_awg_stream.write_idx] = ev[i];
+		g_awg_stream.write_idx = awg_stream_ring_next(g_awg_stream.write_idx);
+		g_awg_stream.count++;
+	}
+
+	g_awg_stream.last_event = ev[n - 1U];
+	g_awg_stream.has_last_event = true;
+
+	return awg_sched_stream_drain_step();
+}
+
+int awg_sched_stream_drain_step(void)
+{
+	uint32_t raw_status;
+	uint32_t irq_status;
+	uint32_t stream_ctrl;
+	uint32_t free_space;
+	uint32_t to_move;
+	uint32_t i;
+	int ret;
+
+	if (!g_awg_stream.open)
+		return -ENODEV;
+
+	if (g_awg_stream.hard_error)
+		return -EIO;
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_STATUS, &raw_status);
+	if (ret)
+		return ret;
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_IRQ_STATUS, &irq_status);
+	if (ret)
+		return ret;
+
+	if (((raw_status & AWG_SCHED_STATUS_ERROR_COMPAT) != 0U) ||
+	    ((irq_status & AWG_STREAM_IRQ_HARD_ERROR_MASK) != 0U) ||
+	    g_awg_stream.error_pending) {
+		return awg_stream_record_hard_error(-EIO);
+	}
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_STREAM_CTRL, &stream_ctrl);
+	if (ret)
+		return ret;
+
+	if ((stream_ctrl & AWG_SCHED_STREAM_CTRL_OVERFLOW) != 0U)
+		return awg_stream_record_hard_error(-EAGAIN);
+
+	ret = awg_sched_reg_read(AWG_SCHED_REG_FREE_SPACE, &free_space);
+	if (ret)
+		return ret;
+
+	if (free_space == 0U || g_awg_stream.count == 0U) {
+		g_awg_stream.refill_pending = 0U;
+		return 0;
+	}
+
+	to_move = awg_stream_min_u32(free_space, g_awg_stream.count);
+	to_move = awg_stream_min_u32(to_move, g_awg_stream.refill_chunk_max);
+
+	for (i = 0U; i < to_move; i++) {
+		ret = awg_sched_write_one_event(&g_awg_stream.ring[g_awg_stream.read_idx],
+						true);
+		if (ret == -EAGAIN)
+			return awg_stream_record_hard_error(-EAGAIN);
+		if (ret)
+			return ret;
+
+		g_awg_stream.read_idx = awg_stream_ring_next(g_awg_stream.read_idx);
+		g_awg_stream.count--;
+	}
+
+	if (g_awg_stream.count == 0U || to_move >= free_space)
+		g_awg_stream.refill_pending = 0U;
+
+	if (to_move > 0U) {
+		ret = awg_stream_start_if_needed();
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+int awg_sched_stream_close(bool send_eof)
+{
+	awg_event_v1_t eof_event;
+	uint32_t idx;
+
+	if (!g_awg_stream.open)
+		return -ENODEV;
+
+	if (g_awg_stream.hard_error)
+		return -EIO;
+
+	g_awg_stream.producer_closed = true;
+
+	if (send_eof) {
+		if (g_awg_stream.count > 0U) {
+			uint32_t n;
+			uint32_t scan_idx = g_awg_stream.read_idx;
+
+			for (n = 0U; n < g_awg_stream.count; n++) {
+				g_awg_stream.ring[scan_idx].flags &= ~AWG_SCHED_FLAG_EOF;
+				scan_idx = awg_stream_ring_next(scan_idx);
+			}
+
+			idx = awg_stream_ring_prev(g_awg_stream.write_idx);
+			g_awg_stream.ring[idx].flags |= AWG_SCHED_FLAG_EOF;
+		} else {
+			if (awg_stream_ring_free() == 0U)
+				return -EAGAIN;
+
+			memset(&eof_event, 0, sizeof(eof_event));
+			if (g_awg_stream.has_last_event) {
+				eof_event.timestamp_ticks =
+					g_awg_stream.last_event.timestamp_ticks + 1U;
+				eof_event.channel = g_awg_stream.last_event.channel;
+			}
+			eof_event.flags = AWG_SCHED_FLAG_EOF;
+			g_awg_stream.ring[g_awg_stream.write_idx] = eof_event;
+			g_awg_stream.write_idx = awg_stream_ring_next(g_awg_stream.write_idx);
+			g_awg_stream.count++;
+		}
+	}
+
+	return awg_sched_stream_drain_step();
+}
+
+void awg_sched_stream_irq_handler(uint32_t irq_status)
+{
+	uint32_t relevant;
+	uint32_t ack_mask;
+
+	if (!g_awg_sched.configured || !g_awg_stream.open)
+		return;
+
+	relevant = irq_status & AWG_SCHED_IRQ_ALL;
+	if (relevant == 0U)
+		return;
+
+	g_awg_stream.irq_latched |= relevant;
+
+	if ((relevant & (AWG_SCHED_IRQ_LOW_WATERMARK |
+			AWG_SCHED_IRQ_EMPTY_STALL)) != 0U)
+		g_awg_stream.refill_pending = 1U;
+
+	if ((relevant & AWG_STREAM_IRQ_HARD_ERROR_MASK) != 0U)
+		g_awg_stream.error_pending = 1U;
+
+	ack_mask = relevant & ~AWG_STREAM_IRQ_HARD_ERROR_MASK;
+	if (ack_mask != 0U)
+		(void)awg_sched_reg_write(AWG_SCHED_REG_IRQ_STATUS, ack_mask);
+}
+
+uint32_t awg_sched_stream_ddr_free_events(void)
+{
+	return awg_stream_ring_free();
+}
+
+uint32_t awg_sched_stream_poll_interval_us(void)
+{
+	if (!g_awg_stream.open || g_awg_stream.poll_interval_us == 0U)
+		return AWG_STREAM_DEFAULT_POLL_INTERVAL_US;
+
+	return g_awg_stream.poll_interval_us;
+}
+
+int awg_sched_stream_get_error_snapshot(awg_sched_stream_snapshot_t *snapshot)
+{
+	if (!snapshot)
+		return -EINVAL;
+
+	if (!g_awg_stream.open)
+		return -ENODEV;
+
+	*snapshot = g_awg_stream.last_error;
+	return 0;
+}
+
+#else
+
+int awg_sched_stream_open(const awg_sched_stream_cfg_t *cfg)
+{
+	(void)cfg;
+	return -ENOTSUP;
+}
+
+int awg_sched_stream_push(const awg_event_v1_t *ev, uint32_t n)
+{
+	(void)ev;
+	(void)n;
+	return -ENOTSUP;
+}
+
+int awg_sched_stream_drain_step(void)
+{
+	return -ENOTSUP;
+}
+
+int awg_sched_stream_close(bool send_eof)
+{
+	(void)send_eof;
+	return -ENOTSUP;
+}
+
+void awg_sched_stream_irq_handler(uint32_t irq_status)
+{
+	(void)irq_status;
+}
+
+uint32_t awg_sched_stream_ddr_free_events(void)
+{
+	return 0U;
+}
+
+uint32_t awg_sched_stream_poll_interval_us(void)
+{
+	return 0U;
+}
+
+int awg_sched_stream_get_error_snapshot(awg_sched_stream_snapshot_t *snapshot)
+{
+	(void)snapshot;
+	return -ENOTSUP;
+}
+
+#endif
 
 void awg_sched_dump_artifacts(const awg_event_v1_t *events, uint32_t count,
       const awg_sched_status_t *status)

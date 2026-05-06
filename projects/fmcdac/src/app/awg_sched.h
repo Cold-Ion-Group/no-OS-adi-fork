@@ -6,8 +6,14 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "app_config.h"
+
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+#ifndef FMCDAC_AWG_SCHED_STREAM
+#define FMCDAC_AWG_SCHED_STREAM 0
 #endif
 
 /* Compiler-portable packed annotation for scheduler ABI structs. */
@@ -146,6 +152,7 @@ _Static_assert(offsetof(awg_event_v1_t, reserved) == 28U, "event.reserved offset
 
 /* Event flag bit definitions. */
 #define AWG_SCHED_FLAG_PHASE_REINIT 0x0001U
+#define AWG_SCHED_FLAG_EOF          0x0002U
 
 /*
  * Static scheduler configuration.
@@ -165,6 +172,25 @@ typedef struct {
 	uint32_t done_timeout_ms;
 	void (*log_fn)(const char *fmt, ...);
 } awg_sched_cfg_t;
+
+typedef struct {
+	void     *staging_buffer;
+	uint32_t  staging_capacity;
+	uint32_t  low_wmark_events;
+	uint32_t  refill_chunk_max;
+	uint32_t  poll_interval_us;
+} awg_sched_stream_cfg_t;
+
+typedef struct {
+	uint32_t status;
+	uint32_t err_reg;
+	uint32_t irq_status;
+	uint32_t occupancy;
+	uint32_t free_space;
+	uint32_t stream_ctrl;
+	uint32_t stream_pushes;
+	uint32_t stream_stalls;
+} awg_sched_stream_snapshot_t;
 
 /* Event validation mode for minimum timestamp delta handling. */
 typedef enum {
@@ -251,6 +277,15 @@ int awg_sched_set_epoch(void);
 void awg_sched_irq_signal(void);
 void awg_sched_dump_artifacts(const awg_event_v1_t *events, uint32_t count,
 			      const awg_sched_status_t *status);
+
+int awg_sched_stream_open(const awg_sched_stream_cfg_t *cfg);
+int awg_sched_stream_push(const awg_event_v1_t *ev, uint32_t n);
+int awg_sched_stream_drain_step(void);
+int awg_sched_stream_close(bool send_eof);
+void awg_sched_stream_irq_handler(uint32_t irq_status);
+uint32_t awg_sched_stream_ddr_free_events(void);
+uint32_t awg_sched_stream_poll_interval_us(void);
+int awg_sched_stream_get_error_snapshot(awg_sched_stream_snapshot_t *snapshot);
 
 #ifdef __cplusplus
 }

@@ -165,6 +165,114 @@ static enum fmcdac_clock_mode g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
 #define FMCDAC_SFDR_SWEEP_STEP_HZ 0U
 #endif
 
+#ifndef FMCDAC_DYNAMIC_CASE_COUNT
+#define FMCDAC_DYNAMIC_CASE_COUNT 0U
+#endif
+
+#ifndef FMCDAC_DYNAMIC_CASE1_START_HZ
+#define FMCDAC_DYNAMIC_CASE1_START_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE1_STOP_HZ
+#define FMCDAC_DYNAMIC_CASE1_STOP_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE1_DWELL_MS
+#define FMCDAC_DYNAMIC_CASE1_DWELL_MS 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE1_TRANSITIONS
+#define FMCDAC_DYNAMIC_CASE1_TRANSITIONS 0U
+#endif
+
+#ifndef FMCDAC_DYNAMIC_CASE2_START_HZ
+#define FMCDAC_DYNAMIC_CASE2_START_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE2_STOP_HZ
+#define FMCDAC_DYNAMIC_CASE2_STOP_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE2_DWELL_MS
+#define FMCDAC_DYNAMIC_CASE2_DWELL_MS 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE2_TRANSITIONS
+#define FMCDAC_DYNAMIC_CASE2_TRANSITIONS 0U
+#endif
+
+#ifndef FMCDAC_DYNAMIC_CASE3_START_HZ
+#define FMCDAC_DYNAMIC_CASE3_START_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE3_STOP_HZ
+#define FMCDAC_DYNAMIC_CASE3_STOP_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE3_DWELL_MS
+#define FMCDAC_DYNAMIC_CASE3_DWELL_MS 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE3_TRANSITIONS
+#define FMCDAC_DYNAMIC_CASE3_TRANSITIONS 0U
+#endif
+
+#ifndef FMCDAC_DYNAMIC_CASE4_START_HZ
+#define FMCDAC_DYNAMIC_CASE4_START_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE4_STOP_HZ
+#define FMCDAC_DYNAMIC_CASE4_STOP_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE4_DWELL_MS
+#define FMCDAC_DYNAMIC_CASE4_DWELL_MS 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE4_TRANSITIONS
+#define FMCDAC_DYNAMIC_CASE4_TRANSITIONS 0U
+#endif
+
+#ifndef FMCDAC_DYNAMIC_CASE5_START_HZ
+#define FMCDAC_DYNAMIC_CASE5_START_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE5_STOP_HZ
+#define FMCDAC_DYNAMIC_CASE5_STOP_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE5_DWELL_MS
+#define FMCDAC_DYNAMIC_CASE5_DWELL_MS 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE5_TRANSITIONS
+#define FMCDAC_DYNAMIC_CASE5_TRANSITIONS 0U
+#endif
+
+#ifndef FMCDAC_DYNAMIC_CASE6_START_HZ
+#define FMCDAC_DYNAMIC_CASE6_START_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE6_STOP_HZ
+#define FMCDAC_DYNAMIC_CASE6_STOP_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE6_DWELL_MS
+#define FMCDAC_DYNAMIC_CASE6_DWELL_MS 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE6_TRANSITIONS
+#define FMCDAC_DYNAMIC_CASE6_TRANSITIONS 0U
+#endif
+
+#ifndef FMCDAC_DYNAMIC_CASE7_START_HZ
+#define FMCDAC_DYNAMIC_CASE7_START_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE7_STOP_HZ
+#define FMCDAC_DYNAMIC_CASE7_STOP_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE7_DWELL_MS
+#define FMCDAC_DYNAMIC_CASE7_DWELL_MS 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE7_TRANSITIONS
+#define FMCDAC_DYNAMIC_CASE7_TRANSITIONS 0U
+#endif
+
+#ifndef FMCDAC_DYNAMIC_CASE8_START_HZ
+#define FMCDAC_DYNAMIC_CASE8_START_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE8_STOP_HZ
+#define FMCDAC_DYNAMIC_CASE8_STOP_HZ 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE8_DWELL_MS
+#define FMCDAC_DYNAMIC_CASE8_DWELL_MS 0U
+#endif
+#ifndef FMCDAC_DYNAMIC_CASE8_TRANSITIONS
+#define FMCDAC_DYNAMIC_CASE8_TRANSITIONS 0U
+#endif
+
 #ifndef FMCDAC_SKIP_SYSREF_TUNE
 #define FMCDAC_SKIP_SYSREF_TUNE 0
 #endif
@@ -300,6 +408,7 @@ static uint32_t fmcdac_cycles_to_us(uint64_t cycles);
 static uint32_t fmcdac_cycles_to_ns_per_op(uint64_t cycles, uint32_t ops);
 static uint32_t fmcdac_ops_per_second(uint32_t ops, uint64_t cycles);
 static void fmcdac_flush_input(void);
+static void fmcdac_awg_stream_poll(void);
 
 static int fmcdac_gpio_init(struct fmcdac_dev *dev)
 {
@@ -1153,6 +1262,7 @@ static void fmcdac_delay_seconds(uint32_t seconds, uint32_t heartbeat_s)
 	uint32_t i;
 
 	for (i = 0; i < seconds; i++) {
+		fmcdac_awg_stream_poll();
 		no_os_mdelay(1000);
 		if (heartbeat_s && ((i + 1) % heartbeat_s) == 0)
 			xil_printf("[DEBUG] toggle heartbeat: %lu/%lu s\n\r",
@@ -1195,6 +1305,7 @@ static int fmcdac_read_line(char *buf, size_t len)
 		return -1;
 
 	while (1) {
+		fmcdac_awg_stream_poll();
 		c = getc(stdin);
 		if (c == EOF)
 			continue;
@@ -1220,6 +1331,7 @@ static int fmcdac_read_exact(uint8_t *buf, size_t len)
 		return -1;
 
 	while (pos < len) {
+		fmcdac_awg_stream_poll();
 		c = getc(stdin);
 		if (c == EOF)
 			continue;
@@ -1250,6 +1362,7 @@ static int fmcdac_read_exact_hex(uint8_t *buf, size_t len)
 		return -1;
 
 	while (pos < len) {
+		fmcdac_awg_stream_poll();
 		c = getc(stdin);
 		if (c == EOF)
 			continue;
@@ -1316,6 +1429,29 @@ static uint32_t fmcdac_cycles_to_us(uint64_t cycles)
 		return 0;
 
 	return (uint32_t)((cycles * 1000000ULL) / FMCDAC_BENCH_TIMER_FREQ_HZ);
+}
+
+static void fmcdac_awg_stream_poll(void)
+{
+#if FMCDAC_AWG_SCHED_STREAM
+	static uint64_t last_poll_cycles;
+	uint64_t now_cycles;
+	uint32_t poll_interval_us;
+
+	poll_interval_us = awg_sched_stream_poll_interval_us();
+	if (poll_interval_us == 0U)
+		return;
+
+	now_cycles = fmcdac_timer_now_cycles();
+	if (now_cycles == 0U)
+		return;
+
+	if (last_poll_cycles == 0U ||
+	    fmcdac_cycles_to_us(now_cycles - last_poll_cycles) >= poll_interval_us) {
+		(void)awg_sched_stream_drain_step();
+		last_poll_cycles = now_cycles;
+	}
+#endif
 }
 
 static uint32_t fmcdac_cycles_to_ns_per_op(uint64_t cycles, uint32_t ops)
@@ -3048,28 +3184,37 @@ static int fmcdac_dynamic_sfdr_test(struct fmcdac_dev *dev)
 {
 	static const char *tag = "DYNAMIC-SFDR";
 	struct dynamic_case {
-		const char *name;
 		uint32_t start_freq_hz;
 		uint32_t stop_freq_hz;
 		uint32_t dwell_ms;
 		uint32_t transitions;
 	};
-	static const struct dynamic_case cases[] = {
+	static const struct dynamic_case legacy_cases[] = {
 		{
-			.name = "toggle_100_to_400_1ms",
 			.start_freq_hz = 100000000U,
 			.stop_freq_hz = 400000000U,
 			.dwell_ms = 1U,
 			.transitions = 12000U,
 		},
 		{
-			.name = "toggle_100_to_400_10ms",
 			.start_freq_hz = 100000000U,
 			.stop_freq_hz = 400000000U,
 			.dwell_ms = 10U,
 			.transitions = 1200U,
 		},
 	};
+	static const struct dynamic_case custom_cases[] = {
+		{ FMCDAC_DYNAMIC_CASE1_START_HZ, FMCDAC_DYNAMIC_CASE1_STOP_HZ, FMCDAC_DYNAMIC_CASE1_DWELL_MS, FMCDAC_DYNAMIC_CASE1_TRANSITIONS },
+		{ FMCDAC_DYNAMIC_CASE2_START_HZ, FMCDAC_DYNAMIC_CASE2_STOP_HZ, FMCDAC_DYNAMIC_CASE2_DWELL_MS, FMCDAC_DYNAMIC_CASE2_TRANSITIONS },
+		{ FMCDAC_DYNAMIC_CASE3_START_HZ, FMCDAC_DYNAMIC_CASE3_STOP_HZ, FMCDAC_DYNAMIC_CASE3_DWELL_MS, FMCDAC_DYNAMIC_CASE3_TRANSITIONS },
+		{ FMCDAC_DYNAMIC_CASE4_START_HZ, FMCDAC_DYNAMIC_CASE4_STOP_HZ, FMCDAC_DYNAMIC_CASE4_DWELL_MS, FMCDAC_DYNAMIC_CASE4_TRANSITIONS },
+		{ FMCDAC_DYNAMIC_CASE5_START_HZ, FMCDAC_DYNAMIC_CASE5_STOP_HZ, FMCDAC_DYNAMIC_CASE5_DWELL_MS, FMCDAC_DYNAMIC_CASE5_TRANSITIONS },
+		{ FMCDAC_DYNAMIC_CASE6_START_HZ, FMCDAC_DYNAMIC_CASE6_STOP_HZ, FMCDAC_DYNAMIC_CASE6_DWELL_MS, FMCDAC_DYNAMIC_CASE6_TRANSITIONS },
+		{ FMCDAC_DYNAMIC_CASE7_START_HZ, FMCDAC_DYNAMIC_CASE7_STOP_HZ, FMCDAC_DYNAMIC_CASE7_DWELL_MS, FMCDAC_DYNAMIC_CASE7_TRANSITIONS },
+		{ FMCDAC_DYNAMIC_CASE8_START_HZ, FMCDAC_DYNAMIC_CASE8_STOP_HZ, FMCDAC_DYNAMIC_CASE8_DWELL_MS, FMCDAC_DYNAMIC_CASE8_TRANSITIONS },
+	};
+	const struct dynamic_case *cases = legacy_cases;
+	uint32_t case_count = NO_OS_ARRAY_SIZE(legacy_cases);
 	const int32_t scale_u = 700000;
 	uint8_t interp_mode = 0;
 	uint32_t i;
@@ -3088,30 +3233,42 @@ static int fmcdac_dynamic_sfdr_test(struct fmcdac_dev *dev)
 
 	ad9144_spi_read(dev->ad9144_device, REG_INTERP_MODE, &interp_mode);
 	xil_printf("[%s] Dynamic retune settling test with NCO disabled.\n\r", tag);
-	xil_printf("[%s] Interpolation mode=0x%02X. Bursts toggle 100 MHz <-> 400 MHz while the analyzer measures live spectrum.\n\r",
-		   tag, interp_mode);
+	if (FMCDAC_DYNAMIC_CASE_COUNT > 0U) {
+		cases = custom_cases;
+		case_count = FMCDAC_DYNAMIC_CASE_COUNT;
+		xil_printf("[%s] Interpolation mode=0x%02X. Running %lu custom dynamic retune burst(s).\n\r",
+			   tag, interp_mode, (unsigned long)case_count);
+	} else {
+		xil_printf("[%s] Interpolation mode=0x%02X. Bursts toggle 100 MHz <-> 400 MHz while the analyzer measures live spectrum.\n\r",
+			   tag, interp_mode);
+	}
 	xil_printf("[%s] DDS scale fixed to %ld micro-units to match the steady-state SFDR baseline.\n\r",
 		   tag, (long)scale_u);
 
-	for (i = 0; i < NO_OS_ARRAY_SIZE(cases); i++) {
+	for (i = 0; i < case_count; i++) {
 		const struct dynamic_case *step = &cases[i];
 		uint32_t active_ms = step->dwell_ms * step->transitions;
 		uint64_t start_cycles;
 		uint64_t end_cycles;
 		uint32_t elapsed_us;
+		char step_name[64];
 
 		ret = fmcdac_program_dds_pair(dev, step->start_freq_hz, scale_u, 0, 0, tag);
 		if (ret != 0) {
-			xil_printf("[%s] Failed to establish starting tone for %s: %ld\n\r",
-				   tag, step->name, (long)ret);
+			xil_printf("[%s] Failed to establish starting tone for dynamic case %lu: %ld\n\r",
+				   tag, (unsigned long)(i + 1U), (long)ret);
 			return ret;
 		}
 
+		snprintf(step_name, sizeof(step_name), "toggle_%lu_to_%lu_%lums",
+			 (unsigned long)(step->start_freq_hz / 1000000U),
+			 (unsigned long)(step->stop_freq_hz / 1000000U),
+			 (unsigned long)step->dwell_ms);
 		xil_printf("[%s] Step %lu/%lu: %s.\n\r",
 			   tag,
 			   (unsigned long)(i + 1U),
-			   (unsigned long)NO_OS_ARRAY_SIZE(cases),
-			   step->name);
+			   (unsigned long)case_count,
+			   step_name);
 		xil_printf("[%s] start=%lu Hz stop=%lu Hz dwell_ms=%lu transitions=%lu active_ms~=%lu\n\r",
 			   tag,
 			   (unsigned long)step->start_freq_hz,
@@ -3119,14 +3276,16 @@ static int fmcdac_dynamic_sfdr_test(struct fmcdac_dev *dev)
 			   (unsigned long)step->dwell_ms,
 			   (unsigned long)step->transitions,
 			   (unsigned long)active_ms);
-		xil_printf("[%s] Analyzer should measure intended peaks near 100/400 MHz and the strongest unintended spur during the burst.\n\r",
-			   tag);
+		xil_printf("[%s] Analyzer should measure intended peaks near %lu/%lu MHz and the strongest unintended spur during the burst.\n\r",
+			   tag,
+			   (unsigned long)(step->start_freq_hz / 1000000U),
+			   (unsigned long)(step->stop_freq_hz / 1000000U));
 		fmcdac_wait_for_enter(tag, "Arm analyzer for the live retune burst.");
 
 		xil_printf("[%s] Burst %lu/%lu running now.\n\r",
 			   tag,
 			   (unsigned long)(i + 1U),
-			   (unsigned long)NO_OS_ARRAY_SIZE(cases));
+			   (unsigned long)case_count);
 		start_cycles = fmcdac_timer_now_cycles();
 		ret = fmcdac_run_dynamic_toggle_burst(dev,
 						      step->start_freq_hz,
@@ -3136,8 +3295,8 @@ static int fmcdac_dynamic_sfdr_test(struct fmcdac_dev *dev)
 						      step->transitions);
 		end_cycles = fmcdac_timer_now_cycles();
 		if (ret != 0) {
-			xil_printf("[%s] Burst failed for %s: %ld\n\r",
-				   tag, step->name, (long)ret);
+			xil_printf("[%s] Burst failed for dynamic case %lu: %ld\n\r",
+				   tag, (unsigned long)(i + 1U), (long)ret);
 			return ret;
 		}
 
@@ -3145,7 +3304,7 @@ static int fmcdac_dynamic_sfdr_test(struct fmcdac_dev *dev)
 		xil_printf("[%s] Completed burst %lu/%lu. elapsed_us=%lu final_freq_hz=%lu\n\r",
 			   tag,
 			   (unsigned long)(i + 1U),
-			   (unsigned long)NO_OS_ARRAY_SIZE(cases),
+			   (unsigned long)case_count,
 			   (unsigned long)elapsed_us,
 			   (unsigned long)step->stop_freq_hz);
 	}

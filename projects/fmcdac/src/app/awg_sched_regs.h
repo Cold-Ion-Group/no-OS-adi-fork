@@ -1,200 +1,108 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/*
- * AWG Timed-Control IP register map.
- *
- * This header is the software-side counterpart of the HDL localparams.
- * It MUST be kept in sync with the HDL peripheral register file.
- * When a register-generator toolflow is adopted, delete this hand-written
- * file and replace it with the generated artifact (same filename).
- *
- * All offsets are byte addresses relative to the peripheral base address.
- * All registers are 32-bit, little-endian at the CPU AXI4-Lite interface.
- *
- * Register map layout:
- *   0x00–0x10  Core control/status
- *   0x14–0x1C  IP identification (read-only)
- *   0x20–0x2C  Time snapshot (read-only)
- *   0x30–0x3C  Counters / IRQ (read-only)
- *   0x40–0x60  Event write window (write-only during load)
- *   0x64–0x74  IRQ enable + SYSREF epoch reload controls
- */
-
 #ifndef AWG_SCHED_REGS_H
 #define AWG_SCHED_REGS_H
 
-/* -----------------------------------------------------------------------
- * Core control / status
- * --------------------------------------------------------------------- */
-
-/** CTRL — control register (W) */
-#define AWG_SCHED_REG_CTRL              0x0000U
-/** STATUS — status register (R) */
-#define AWG_SCHED_REG_STATUS            0x0004U
-/** EVT_COUNT — number of loaded events register (RW) */
-#define AWG_SCHED_REG_EVT_COUNT         0x0008U
-/** CUR_EVT — index of event currently being executed (R) */
-#define AWG_SCHED_REG_CUR_EVT           0x000CU
-/** ERR_REG — latched hardware error code (R, cleared by soft-reset) */
-#define AWG_SCHED_REG_ERR               0x0010U
-
-/* -----------------------------------------------------------------------
- * IP identification (read-only)
- * --------------------------------------------------------------------- */
-
-/** IP_ID — magic identifier word for this IP core (R) */
-#define AWG_SCHED_REG_IP_ID             0x0014U
-/** IP_VERSION — packed major[31:16] / minor[15:0] (R) */
-#define AWG_SCHED_REG_IP_VERSION        0x0018U
-/**
- * IP_CAPS — capability register (R):
- *   [31:24]  log2 of maximum event depth (1 << field gives depth)
- *   [23:16]  payload width in bits
- *   [15:8]   timestamp width in bits
- *   [7:0]    reserved
- */
-#define AWG_SCHED_REG_IP_CAPS           0x001CU
-
-/* -----------------------------------------------------------------------
- * Time snapshot (read-only, latched on STATUS read)
- * --------------------------------------------------------------------- */
-
-/** TIME_LO — current scheduler tick counter, bits [31:0] (R) */
-#define AWG_SCHED_REG_TIME_LO           0x0020U
-/** TIME_HI — current scheduler tick counter, bits [63:32] (R) */
-#define AWG_SCHED_REG_TIME_HI           0x0024U
-/** LAST_EXEC_LO — tick count of last dispatched event, bits [31:0] (R) */
-#define AWG_SCHED_REG_LAST_EXEC_LO      0x0028U
-/** LAST_EXEC_HI — tick count of last dispatched event, bits [63:32] (R) */
-#define AWG_SCHED_REG_LAST_EXEC_HI      0x002CU
-
-/* -----------------------------------------------------------------------
- * Counters / IRQ status (read-only)
- * --------------------------------------------------------------------- */
-
-/** COMMIT_COUNT — total number of events dispatched since last reset (R) */
-#define AWG_SCHED_REG_COMMIT_COUNT      0x0030U
-/** REINIT_COUNT — number of sequence re-starts (e.g. loop) since reset (R) */
-#define AWG_SCHED_REG_REINIT_COUNT      0x0034U
-/** REINIT_REJECT — count of re-init requests rejected (timing violation) (R) */
-#define AWG_SCHED_REG_REINIT_REJECT     0x0038U
-/**
- * IRQ_STATUS — latched interrupt flags (R/W1C):
- *   [0]  done interrupt
- *   [1]  error interrupt
- *   [2]  spacing-violation interrupt
- */
-#define AWG_SCHED_REG_IRQ_STATUS        0x003CU
-#define AWG_SCHED_IRQ_DONE_BIT          (1U << 0)
-#define AWG_SCHED_IRQ_ERROR_BIT         (1U << 1)
-#define AWG_SCHED_IRQ_SPACING_BIT       (1U << 2)
-
-/* -----------------------------------------------------------------------
- * Event write window
+/*
+ * Firmware ABI for awg_timed_ctrl.
  *
- * Write sequence:
- *   1. Write EVT_WADDR = target event index.
- *   2. Write EVT_WDATA0..6 (order does not matter before strobe).
- *   3. Write EVT_WCTRL = 1 to commit (strobe).
- *
- * Event word mapping:
- *   WDATA0  timestamp[31:0]
- *   WDATA1  timestamp[63:32]
- *   WDATA2  channel[31:16] | flags[15:0]
- *   WDATA3  payload.word0
- *   WDATA4  payload.word1
- *   WDATA5  payload.word2
- *   WDATA6  payload.word3
- * --------------------------------------------------------------------- */
-
-/** EVT_WADDR — event BRAM write address (W) */
-#define AWG_SCHED_REG_EVT_WADDR         0x0040U
-/** EVT_WDATA0 — timestamp bits [31:0] (W) */
-#define AWG_SCHED_REG_EVT_WDATA0        0x0044U
-/** EVT_WDATA1 — timestamp bits [63:32] (W) */
-#define AWG_SCHED_REG_EVT_WDATA1        0x0048U
-/** EVT_WDATA2 — channel[31:16] | flags[15:0] (W) */
-#define AWG_SCHED_REG_EVT_WDATA2        0x004CU
-/** EVT_WDATA3 — payload word 0 (W) */
-#define AWG_SCHED_REG_EVT_WDATA3        0x0050U
-/** EVT_WDATA4 — payload word 1 (W) */
-#define AWG_SCHED_REG_EVT_WDATA4        0x0054U
-/** EVT_WDATA5 — payload word 2 (W) */
-#define AWG_SCHED_REG_EVT_WDATA5        0x0058U
-/** EVT_WDATA6 — payload word 3 (W) */
-#define AWG_SCHED_REG_EVT_WDATA6        0x005CU
-/** EVT_WCTRL — write 1 to commit event data to BRAM (W, self-clearing) */
-#define AWG_SCHED_REG_EVT_WCTRL         0x0060U
-
-/** IRQ_ENABLE — interrupt enable mask (RW) */
-#define AWG_SCHED_REG_IRQ_ENABLE        0x0064U
-/** IP_SCRATCH — firmware/software scratch register (RW) */
-#define AWG_SCHED_REG_IP_SCRATCH        0x0068U
-/** TIME_RELOAD_LO — pending scheduler epoch reload low word (RW) */
-#define AWG_SCHED_REG_TIME_RELOAD_LO    0x006CU
-/** TIME_RELOAD_HI — pending scheduler epoch reload high word (RW) */
-#define AWG_SCHED_REG_TIME_RELOAD_HI    0x0070U
-/**
- * TIME_RELOAD_CTRL — epoch reload control (RW/pulse)
- *   [0] arm reload on next SYSREF
- *   [1] load immediately (write-1 pulse)
+ * Keep this header synchronized with projects/awg/common/awg_timed_ctrl.v.
+ * Phase A freezes the register offsets below for both legacy fixed-length
+ * mode and stream mode. Firmware should treat AWG_SCHED_REG_STREAM_DEPTH as
+ * the authoritative stream FIFO capacity; do not hardcode the HDL parameter.
  */
-#define AWG_SCHED_REG_TIME_RELOAD_CTRL  0x0074U
-#define AWG_SCHED_TIME_RELOAD_ARM_ON_SYSREF  (1U << 0)
-#define AWG_SCHED_TIME_RELOAD_LOAD_NOW       (1U << 1)
 
-/* -----------------------------------------------------------------------
- * CTRL register bit fields
- * --------------------------------------------------------------------- */
+#define AWG_SCHED_IP_ID                 0x41574753u
+#define AWG_SCHED_IP_VERSION            0x00010000u
 
-/** CTRL[0]: RUN — assert to start sequence execution */
-#define AWG_SCHED_CTRL_RUN              (1U << 0)
-/** CTRL[1]: ARM — arm the hardware trigger gate */
-#define AWG_SCHED_CTRL_ARM              (1U << 1)
-/** CTRL[2]: STOP_REQ — request graceful stop after current event */
-#define AWG_SCHED_CTRL_STOP_REQ         (1U << 2)
-/** CTRL[3]: RESET_SOFT — pulse to clear state (does NOT fire commit) */
-#define AWG_SCHED_CTRL_RESET_SOFT       (1U << 3)
+#define AWG_SCHED_REG_CTRL              0x00u
+#define AWG_SCHED_REG_STATUS            0x04u
+#define AWG_SCHED_REG_EVENT_COUNT       0x08u
+#define AWG_SCHED_REG_CUR_EVENT         0x0Cu
+#define AWG_SCHED_REG_ERR_REG           0x10u
+#define AWG_SCHED_REG_IP_ID             0x14u
+#define AWG_SCHED_REG_IP_VERSION        0x18u
+#define AWG_SCHED_REG_IP_CAPS           0x1Cu
+#define AWG_SCHED_REG_TIME_NOW_LO       0x20u
+#define AWG_SCHED_REG_TIME_NOW_HI       0x24u
+#define AWG_SCHED_REG_LAST_EXEC_LO      0x28u
+#define AWG_SCHED_REG_LAST_EXEC_HI      0x2Cu
+#define AWG_SCHED_REG_COMMIT_COUNT      0x30u
+#define AWG_SCHED_REG_REINIT_COUNT      0x34u
+#define AWG_SCHED_REG_REINIT_REJECT     0x38u
+#define AWG_SCHED_REG_IRQ_STATUS        0x3Cu
+#define AWG_SCHED_REG_EVT_WADDR         0x40u
+#define AWG_SCHED_REG_EVT_WDATA0        0x44u
+#define AWG_SCHED_REG_EVT_WDATA1        0x48u
+#define AWG_SCHED_REG_EVT_WDATA2        0x4Cu
+#define AWG_SCHED_REG_EVT_WDATA3        0x50u
+#define AWG_SCHED_REG_EVT_WDATA4        0x54u
+#define AWG_SCHED_REG_EVT_WDATA5        0x58u
+#define AWG_SCHED_REG_EVT_WDATA6        0x5Cu
+#define AWG_SCHED_REG_EVT_WCTRL         0x60u
+#define AWG_SCHED_REG_IRQ_ENABLE        0x64u
+#define AWG_SCHED_REG_IP_SCRATCH        0x68u
+#define AWG_SCHED_REG_TIME_RELOAD_LO    0x6Cu
+#define AWG_SCHED_REG_TIME_RELOAD_HI    0x70u
+#define AWG_SCHED_REG_TIME_RELOAD_CTRL  0x74u
+#define AWG_SCHED_REG_STREAM_CTRL       0x78u
+#define AWG_SCHED_REG_OCCUPANCY         0x7Cu
+#define AWG_SCHED_REG_FREE_SPACE        0x80u
+#define AWG_SCHED_REG_LOW_WMARK         0x84u
+#define AWG_SCHED_REG_STREAM_DEPTH      0x88u
+#define AWG_SCHED_REG_STREAM_PUSHES     0x8Cu
+#define AWG_SCHED_REG_STREAM_STALLS     0x90u
 
-/* -----------------------------------------------------------------------
- * STATUS register bit fields
- * --------------------------------------------------------------------- */
+/* CTRL register bits */
+#define AWG_SCHED_CTRL_RUN              (1u << 0)
+#define AWG_SCHED_CTRL_ARM              (1u << 1)
+#define AWG_SCHED_CTRL_STOP             (1u << 2)
+#define AWG_SCHED_CTRL_RESET_SOFT       (1u << 3)
+#define AWG_SCHED_CTRL_IRQ_ENABLE       (1u << 8)
 
-/** STATUS[0]: armed — hardware trigger gate is armed */
-#define AWG_SCHED_STATUS_ARMED          (1U << 0)
-/** STATUS[1]: running — sequence is currently executing */
-#define AWG_SCHED_STATUS_RUNNING        (1U << 1)
-/** STATUS[2]: done — sequence has completed */
-#define AWG_SCHED_STATUS_DONE           (1U << 2)
-/** STATUS[3]: error — hardware error latched; see ERR_REG */
-#define AWG_SCHED_STATUS_ERROR          (1U << 3)
-/** STATUS[15:8]: err_code — latched error code (same as ERR_REG[7:0]) */
-#define AWG_SCHED_STATUS_ERR_CODE_SHIFT 8U
-#define AWG_SCHED_STATUS_ERR_CODE_MASK  0xFFU
+/* TIME_RELOAD_CTRL register bits */
+#define AWG_SCHED_TIME_RELOAD_ARM_ON_SYSREF (1u << 0)
+#define AWG_SCHED_TIME_RELOAD_LOAD_NOW      (1u << 1)
 
-/* -----------------------------------------------------------------------
- * IP identification constants
- * --------------------------------------------------------------------- */
+/* STATUS low-byte bits */
+#define AWG_SCHED_STATUS_IDLE           (1u << 0)
+#define AWG_SCHED_STATUS_ARMED          (1u << 1)
+#define AWG_SCHED_STATUS_RUNNING        (1u << 2)
+#define AWG_SCHED_STATUS_DONE           (1u << 3)
+#define AWG_SCHED_STATUS_ERROR          (1u << 4)
 
-/** Expected value of IP_ID register ('A','W','G','S' in ASCII) */
-#define AWG_TIMED_CTRL_IP_ID            0x41574753U
+/* STATUS[15:8] / ERR_REG error codes */
+#define AWG_SCHED_ERR_NONE              0x00u
+#define AWG_SCHED_ERR_MISSED_DEADLINE   0x01u
+#define AWG_SCHED_ERR_SPACING_VIOLATION 0x02u
+#define AWG_SCHED_ERR_REINIT_SPACING    0x03u
 
-/** Expected major version (IP_VERSION[31:16]) */
-#define AWG_TIMED_CTRL_MAJOR_EXPECTED   1U
+/* IRQ_STATUS / IRQ_ENABLE bits. IRQ_STATUS is write-one-to-clear. */
+#define AWG_SCHED_IRQ_DONE              (1u << 0)
+#define AWG_SCHED_IRQ_ERROR             (1u << 1)
+#define AWG_SCHED_IRQ_SPACING_VIOLATION (1u << 2)
+#define AWG_SCHED_IRQ_UNDERRUN          (1u << 3)
+#define AWG_SCHED_IRQ_LOW_WATERMARK     (1u << 4)
+#define AWG_SCHED_IRQ_EMPTY_STALL       (1u << 5)
+#define AWG_SCHED_IRQ_ALL               (AWG_SCHED_IRQ_DONE | \
+                                         AWG_SCHED_IRQ_ERROR | \
+                                         AWG_SCHED_IRQ_SPACING_VIOLATION | \
+                                         AWG_SCHED_IRQ_UNDERRUN | \
+                                         AWG_SCHED_IRQ_LOW_WATERMARK | \
+                                         AWG_SCHED_IRQ_EMPTY_STALL)
 
-/* -----------------------------------------------------------------------
- * IP_CAPS field extraction macros
- * --------------------------------------------------------------------- */
+/* STREAM_CTRL bits. WRITE_OVERFLOW is W1C; EOF_SEEN is read-only. */
+#define AWG_SCHED_STREAM_CTRL_MODE      (1u << 0)
+#define AWG_SCHED_STREAM_CTRL_OVERFLOW  (1u << 1)
+#define AWG_SCHED_STREAM_CTRL_EOF_SEEN  (1u << 2)
 
-/** Extract log2(event_depth) from IP_CAPS; depth = 1 << this value */
-#define AWG_SCHED_CAPS_EVT_DEPTH_LOG2(caps) \
-	(((caps) >> 24) & 0xFFU)
+/* EVT_WCTRL bits */
+#define AWG_SCHED_EVT_WCTRL_PUSH        (1u << 0)
 
-/** Extract payload width in bits from IP_CAPS */
-#define AWG_SCHED_CAPS_PAYLOAD_BITS(caps) \
-	(((caps) >> 16) & 0xFFU)
+/* Event flags in EVT_WDATA2[15:0]. */
+#define AWG_SCHED_EVENT_FLAG_PHASE_REINIT (1u << 0)
+#define AWG_SCHED_EVENT_FLAG_EOF          (1u << 1)
 
-/** Extract timestamp width in bits from IP_CAPS */
-#define AWG_SCHED_CAPS_TS_BITS(caps) \
-	(((caps) >> 8) & 0xFFU)
+/* Event packing for the 7-word MMIO write path. */
+#define AWG_SCHED_EVENT_WORDS           7u
+#define AWG_SCHED_EVENT_BYTES           32u
 
-#endif /* AWG_SCHED_REGS_H */
+#endif

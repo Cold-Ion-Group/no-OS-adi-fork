@@ -7,5 +7,6 @@
 #include <stdint.h>
 
 void no_os_mdelay(uint32_t ms);
+void no_os_udelay(uint32_t us);
 
 #endif /* NO_OS_DELAY_H */

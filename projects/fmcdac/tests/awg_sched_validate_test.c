@@ -29,8 +29,11 @@
  * --------------------------------------------------------------------- */
 
 #define STUB_REG_WORDS 256U
-#define TEST_IRQ_DONE_AND_ERROR_MASK (AWG_SCHED_IRQ_DONE_BIT | AWG_SCHED_IRQ_ERROR_BIT)
+#define TEST_IRQ_DONE_AND_ERROR_MASK (AWG_SCHED_IRQ_DONE | AWG_SCHED_IRQ_ERROR)
 #define TEST_EVENT_FLAG AWG_SCHED_FLAG_PHASE_REINIT
+#define TEST_STATUS_ARMED_LEGACY  (1U << 0)
+#define TEST_STATUS_RUNNING_LEGACY (1U << 1)
+#define TEST_STATUS_DONE_LEGACY   (1U << 2)
 static uint32_t s_stub_regs[STUB_REG_WORDS];
 static int s_irq_wait_simulate_done;
 static int s_epoch_reload_simulate_done;
@@ -62,9 +65,14 @@ void no_os_mdelay(uint32_t ms)
 (void)ms;
 
 if (s_epoch_reload_simulate_done) {
-s_stub_regs[AWG_SCHED_REG_TIME_LO / 4U] = 0U;
+s_stub_regs[AWG_SCHED_REG_TIME_NOW_LO / 4U] = 0U;
 s_epoch_reload_simulate_done = 0;
 }
+}
+
+void no_os_udelay(uint32_t us)
+{
+	(void)us;
 }
 
 void awg_sched_irq_wait_hook(uint32_t wait_ms_left)
@@ -74,7 +82,7 @@ void awg_sched_irq_wait_hook(uint32_t wait_ms_left)
 	if (!s_irq_wait_simulate_done)
 		return;
 
-	s_stub_regs[AWG_SCHED_REG_STATUS / 4U] = AWG_SCHED_STATUS_DONE;
+	s_stub_regs[AWG_SCHED_REG_STATUS / 4U] = TEST_STATUS_DONE_LEGACY;
 	s_stub_regs[AWG_SCHED_REG_IRQ_STATUS / 4U] = TEST_IRQ_DONE_AND_ERROR_MASK;
 	awg_sched_irq_signal();
 	s_irq_wait_simulate_done = 0;
@@ -126,9 +134,9 @@ s_irq_wait_simulate_done = 0;
 s_epoch_reload_simulate_done = 0;
 
 /* IP identity registers (byte offsets / 4 = word index). */
-s_stub_regs[AWG_SCHED_REG_IP_ID      / 4U] = AWG_TIMED_CTRL_IP_ID;
+s_stub_regs[AWG_SCHED_REG_IP_ID      / 4U] = AWG_SCHED_IP_ID;
 s_stub_regs[AWG_SCHED_REG_IP_VERSION / 4U] =
-(AWG_TIMED_CTRL_MAJOR_EXPECTED << 16) | 0x0000U;
+AWG_SCHED_IP_VERSION;
 /* caps: depth_log2=6 → hw_event_depth=64; payload=128b; ts=64b */
 s_stub_regs[AWG_SCHED_REG_IP_CAPS    / 4U] =
 (6U   << 24) |  /* log2(depth)    */
@@ -439,14 +447,15 @@ static void test_set_epoch(void)
 	test_begin("set_epoch writes reload registers");
 	EXPECT_EQ(stub_config(64), 0);
 
-	s_stub_regs[AWG_SCHED_REG_TIME_LO / 4U] = 100U;
+	s_stub_regs[AWG_SCHED_REG_TIME_NOW_LO / 4U] = 100U;
 	s_epoch_reload_simulate_done = 1;
 
 	ret = awg_sched_set_epoch();
 	EXPECT_EQ(ret, 0);
 	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_TIME_RELOAD_LO / 4U], 0);
 	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_TIME_RELOAD_HI / 4U], 0);
-	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_TIME_RELOAD_CTRL / 4U], 1);
+	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_TIME_RELOAD_CTRL / 4U],
+		  (int)AWG_SCHED_TIME_RELOAD_LOAD_NOW);
 	EXPECT_TRUE(strstr(s_log_buf, "[SCHED-ARTIFACT] set_epoch") != NULL);
 }
 
@@ -609,7 +618,7 @@ static void test_fake_hw_progression(void)
 		  (int)AWG_SCHED_CTRL_ARM);
 
 	/* Simulate hardware acknowledging ARM. */
-	s_stub_regs[AWG_SCHED_REG_STATUS / 4U] = AWG_SCHED_STATUS_ARMED;
+	s_stub_regs[AWG_SCHED_REG_STATUS / 4U] = TEST_STATUS_ARMED_LEGACY;
 
 	ret = awg_sched_start();
 	EXPECT_EQ(ret, 0);
@@ -644,6 +653,8 @@ static void test_irq_wait_done(void)
 
 	ret = awg_sched_load_events(&ev, 1U);
 	EXPECT_EQ(ret, 0);
+
+	s_stub_regs[AWG_SCHED_REG_STATUS / 4U] = TEST_STATUS_ARMED_LEGACY;
 
 	ret = awg_sched_start();
 	EXPECT_EQ(ret, 0);

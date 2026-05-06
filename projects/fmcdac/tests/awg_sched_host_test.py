@@ -15,6 +15,7 @@ from awg_sched_host import (
     parse_info_line,
     parse_last_artifact_block,
 )
+from run_nco_scope_test import build_scheduler_batch_specs, chunk_sequence
 
 
 class AwgSchedHostTest(unittest.TestCase):
@@ -87,6 +88,20 @@ class AwgSchedHostTest(unittest.TestCase):
         self.assertEqual(word1, 0x9BDF89AB)
         self.assertEqual(word2, 0x00001357)
         self.assertEqual(word3, 0x00000000)
+
+    def test_chunk_sequence(self) -> None:
+        self.assertEqual(chunk_sequence([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]])
+
+    def test_build_scheduler_batch_specs(self) -> None:
+        specs = build_scheduler_batch_specs(
+            [200_000_000.0, 201_000_000.0, 202_000_000.0, 203_000_000.0, 204_000_000.0],
+            2,
+        )
+        self.assertEqual(len(specs), 3)
+        self.assertEqual(specs[0].start_index, 0)
+        self.assertEqual(specs[1].start_index, 2)
+        self.assertEqual(specs[2].start_index, 4)
+        self.assertEqual(specs[2].freqs_hz, [204_000_000.0])
 
 
 if __name__ == "__main__":

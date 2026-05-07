@@ -19,6 +19,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import struct
 import subprocess
@@ -247,6 +248,8 @@ class DynamicRetuneMetrics:
     impedance_ohms: int
     intended_peaks: List[WindowPeak]
     unintended_peaks: List[WindowPeak]
+    measured_elapsed_us: Optional[int]
+    measured_us_per_transition: Optional[float]
     reference_power_dbm: Optional[float]
     reference_freq_hz: Optional[float]
     spur_power_dbm: Optional[float]
@@ -1850,7 +1853,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--make-args",
         default="",
-        help="Legacy no-op kept for CLI compatibility now that the host no longer invokes make.",
+        help="Legacy no-op kept for CLI compatibility.",
     )
     parser.add_argument(
         "--xilinx-settings",
@@ -2646,9 +2649,9 @@ def build_sweep_override_cflags(args: argparse.Namespace) -> str:
                     f"-DFMCDAC_DYNAMIC_CASE{index}_TRANSITIONS={int(transitions)}U",
                 ]
             )
-    if not defines:
-        return ""
-    return " ".join(defines)
+    existing = os.environ.get("NEW_CFLAGS", "").strip()
+    generated = " ".join(defines)
+    return " ".join(item for item in (existing, generated) if item)
 
 
 def awg_scheduler_console_requested(args: argparse.Namespace) -> bool:
@@ -3861,6 +3864,54 @@ def build_xsdb_launch_command(
     return " && ".join(parts)
 
 
+def run_make_launch(
+    project_dir: Path,
+    timeout_s: float,
+    settings_files: List[Path],
+    cflags: str,
+    refresh_build: bool,
+    uart: Optional[UartCoordinator] = None,
+) -> None:
+    lines: List[str] = ["@echo off"]
+    for item in settings_files:
+        if not item.is_file():
+            raise RuntimeError(f"Xilinx settings file not found: {item}")
+        lines.append(f'call "{item}"')
+    if refresh_build:
+        lines.extend(["make update", "make clean"])
+    lines.append("make run")
+    script_path = project_dir / "build" / "host_make_launch.bat"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+    env = os.environ.copy()
+    env["NEW_CFLAGS"] = cflags
+    try:
+        proc = subprocess.Popen(
+            ["cmd.exe", "/d", "/c", str(script_path)],
+            cwd=str(project_dir),
+            env=env,
+        )
+    except FileNotFoundError as exc:  # pragma: no cover - Windows-specific
+        raise RuntimeError("Could not find 'cmd.exe' or make in PATH") from exc
+
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if uart is not None:
+            uart.pump()
+        ret = proc.poll()
+        if ret is not None:
+            if uart is not None:
+                while uart.pump():
+                    pass
+            if ret != 0:
+                raise RuntimeError(f"'make run' failed with exit code {ret}")
+            return
+        if time.monotonic() >= deadline:
+            proc.kill()
+            raise TimeoutError(f"'make run' exceeded timeout of {timeout_s:.0f} seconds")
+        time.sleep(HOST_POLL_SLEEP_S)
+
+
 def run_xsdb_launch(
     project_dir: Path,
     output_dir: Path,
@@ -3899,11 +3950,9 @@ def run_xsdb_launch(
         args.xsdb_exe,
         script_path,
     )
-    escaped_command = command.replace('"', '""')
-    command_line = f'cmd.exe /d /c "{escaped_command}"'
     try:
         proc = subprocess.Popen(
-            command_line,
+            ["cmd.exe", "/d", "/c", command],
             cwd=str(project_dir),
         )
     except FileNotFoundError as exc:  # pragma: no cover - Windows-specific
@@ -4291,15 +4340,20 @@ def capture_dynamic_retune_metrics(
     step: DynamicRetuneSpec,
     settings: AnalyzerSettings,
     sfdr_settings: SfdrSettings,
+    measured_elapsed_us: Optional[int] = None,
 ) -> DynamicRetuneMetrics:
     exclusion_guard_hz = max(sfdr_settings.carrier_guard_hz, step.intended_margin_hz)
     intended_peaks: List[WindowPeak] = []
     for freq_hz in step.intended_freq_hz:
         left_hz = max(sfdr_settings.search_start_hz, freq_hz - step.intended_margin_hz)
         right_hz = min(sfdr_settings.search_stop_hz, freq_hz + step.intended_margin_hz)
-        center_hz = (left_hz + right_hz) / 2.0
         span_hz = max(right_hz - left_hz, 1.0)
-        power_dbm, peak_freq_hz = analyzer._capture_peak_for_span(center_hz, span_hz, settings)
+        power_dbm, peak_freq_hz = analyzer._capture_marker_at_frequency(
+            freq_hz,
+            span_hz,
+            freq_hz,
+            settings,
+        )
         intended_peaks.append(
             WindowPeak(
                 label=f"intended_{int(freq_hz / 1e6)}mhz",
@@ -4351,6 +4405,9 @@ def capture_dynamic_retune_metrics(
     dynamic_spur_margin_db = None
     if reference_power_dbm is not None and spur_power_dbm is not None:
         dynamic_spur_margin_db = reference_power_dbm - spur_power_dbm
+    measured_us_per_transition = None
+    if measured_elapsed_us is not None and step.transitions > 0:
+        measured_us_per_transition = float(measured_elapsed_us) / float(step.transitions)
 
     return DynamicRetuneMetrics(
         dwell_ms=step.dwell_ms,
@@ -4372,6 +4429,8 @@ def capture_dynamic_retune_metrics(
         impedance_ohms=settings.impedance_ohms,
         intended_peaks=intended_peaks,
         unintended_peaks=unintended_peaks,
+        measured_elapsed_us=measured_elapsed_us,
+        measured_us_per_transition=measured_us_per_transition,
         reference_power_dbm=reference_power_dbm,
         reference_freq_hz=reference_freq_hz,
         spur_power_dbm=spur_power_dbm,
@@ -4398,13 +4457,26 @@ def print_dynamic_summary(step: DynamicRetuneSpec, metrics: DynamicRetuneMetrics
     if metrics.dynamic_spur_margin_db is not None:
         margin_text = f"margin={metrics.dynamic_spur_margin_db:.3f} dB"
 
+    elapsed_text = "elapsed=n/a"
+    if metrics.measured_elapsed_us is not None:
+        elapsed_text = f"elapsed={metrics.measured_elapsed_us} us"
+        if metrics.measured_us_per_transition is not None:
+            elapsed_text += f" ({metrics.measured_us_per_transition:.3f} us/transition)"
+
     print(
         f"[HOST] {step.name}: dwell_ms={metrics.dwell_ms}, "
         f"transitions={metrics.transitions}, "
         f"active_ms~={metrics.active_duration_ms}, "
         + ", ".join(intended_parts)
-        + f", {spur_text}, {margin_text}"
+        + f", {spur_text}, {margin_text}, {elapsed_text}"
     )
+
+
+def parse_dynamic_elapsed_us(line: str) -> Optional[int]:
+    match = re.search(r"\belapsed_us=(\d+)\b", line)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def capture_dynamic_sfdr_group(
@@ -4476,8 +4548,16 @@ def capture_dynamic_sfdr_group(
             metrics=metrics,
         )
         summaries.append(summary)
+        done_line = uart.wait_for_line_containing(step.done_marker, timeout_s)
+        measured_elapsed_us = parse_dynamic_elapsed_us(done_line)
+        if measured_elapsed_us is not None:
+            metrics.measured_elapsed_us = measured_elapsed_us
+            metrics.measured_us_per_transition = (
+                float(measured_elapsed_us) / float(step.transitions)
+                if step.transitions > 0
+                else None
+            )
         print_dynamic_summary(step, metrics)
-        uart.wait_for(step.done_marker, timeout_s)
 
     uart.wait_for(done_marker, timeout_s)
     return summaries
@@ -4692,15 +4772,29 @@ def write_dynamic_results_csv(steps: Sequence[StepCaptureSummary], output_path: 
         return
 
     lines = [
-        "name,dwell_ms,transitions,active_duration_ms,reference_power_dbm,reference_freq_mhz,spur_power_dbm,spur_freq_mhz,dynamic_spur_margin_db,csv_path"
+        "name,dwell_ms,transitions,active_duration_ms,measured_elapsed_us,measured_us_per_transition,"
+        "intended1_label,intended1_power_dbm,intended1_freq_mhz,"
+        "intended2_label,intended2_power_dbm,intended2_freq_mhz,"
+        "reference_power_dbm,reference_freq_mhz,spur_power_dbm,spur_freq_mhz,dynamic_spur_margin_db,csv_path"
     ]
     for step in sorted(dynamic_steps, key=lambda item: item.step_index):
         metrics = step.metrics
+        intended = list(metrics.intended_peaks[:2])
+        while len(intended) < 2:
+            intended.append(WindowPeak("", 0.0, 0.0, None, None))
         lines.append(
             f"{step.name},"
             f"{metrics.dwell_ms},"
             f"{metrics.transitions},"
             f"{metrics.active_duration_ms},"
+            f"{'' if metrics.measured_elapsed_us is None else metrics.measured_elapsed_us},"
+            f"{'' if metrics.measured_us_per_transition is None else f'{metrics.measured_us_per_transition:.6f}'},"
+            f"{intended[0].label},"
+            f"{'' if intended[0].power_dbm is None else f'{intended[0].power_dbm:.6f}'},"
+            f"{'' if intended[0].freq_hz is None else f'{intended[0].freq_hz / 1e6:.6f}'},"
+            f"{intended[1].label},"
+            f"{'' if intended[1].power_dbm is None else f'{intended[1].power_dbm:.6f}'},"
+            f"{'' if intended[1].freq_hz is None else f'{intended[1].freq_hz / 1e6:.6f}'},"
             f"{'' if metrics.reference_power_dbm is None else f'{metrics.reference_power_dbm:.6f}'},"
             f"{'' if metrics.reference_freq_hz is None else f'{metrics.reference_freq_hz / 1e6:.6f}'},"
             f"{'' if metrics.spur_power_dbm is None else f'{metrics.spur_power_dbm:.6f}'},"
@@ -4768,13 +4862,8 @@ def main() -> int:
         dynamic_specs = build_dynamic_specs(args)
         dds_band_step_specs = build_dds_band_step_specs(args)
         sfdr_step_specs = build_sfdr_step_specs(args)
-        benchmark_prompts_disabled = False
         extra_cflags = build_sweep_override_cflags(args)
-        if extra_cflags:
-            print(
-                "[HOST] WARNING: generated firmware override CFLAGS are not applied by XSDB launch; "
-                "ensure the selected ELF was built with matching sweep/dynamic options."
-            )
+        benchmark_prompts_disabled = False
 
         trace_capture_flags: List[str] = []
         if analyzer_settings.capture_trace:
@@ -4802,16 +4891,19 @@ def main() -> int:
             rx_before = uart.rx_count
             for item in settings_files:
                 print(f"[HOST] Using Xilinx settings: {item}")
-            print("[HOST] Launching XSDB reset/download/start...")
-            run_xsdb_launch(
+            if extra_cflags:
+                print("[HOST] Launching 'make update && make clean && make run' with generated/user NEW_CFLAGS...")
+            else:
+                print("[HOST] Launching 'make run'...")
+            run_make_launch(
                 project_dir=project_dir,
-                output_dir=output_dir,
-                uart=uart,
                 timeout_s=args.make_timeout,
                 settings_files=settings_files,
-                args=args,
+                cflags=extra_cflags,
+                refresh_build=bool(extra_cflags),
+                uart=uart,
             )
-            print("[HOST] XSDB launch completed.")
+            print("[HOST] 'make run' completed.")
 
             if uart.rx_count == rx_before:
                 print(f"[HOST] Reopening UART {args.serial_port} after programming...")

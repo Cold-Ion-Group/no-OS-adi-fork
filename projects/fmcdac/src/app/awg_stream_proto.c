@@ -167,6 +167,9 @@ int awg_stream_proto_handle_frame(const uint8_t *frame, size_t len,
 	off = AWG_STREAM_PROTO_HEADER_BYTES;
 	for (i = 0U; i < n_events; i++) {
 		awg_stream_event_from_le(frame + off, &ev);
+		if (((flags & AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF) != 0U) &&
+		    (i == (uint32_t)n_events - 1U))
+			ev.flags |= AWG_SCHED_FLAG_EOF;
 		ret = awg_sched_stream_push(&ev, 1U);
 		if (ret != 0) {
 			awg_stream_ack_init(ack, seq,

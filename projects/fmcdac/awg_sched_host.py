@@ -5,6 +5,7 @@ Host-side helpers for the FMCDAC AWG scheduler UART control path.
 
 from __future__ import annotations
 
+import binascii
 import math
 import re
 import struct
@@ -13,9 +14,32 @@ from typing import Iterable, List, Optional
 
 
 AWG_SCHED_FLAG_PHASE_REINIT = 0x0001
+AWG_SCHED_FLAG_EOF = 0x0002
 AWG_EVENT_V1_SIZE = 32
 AWG_EVENT_V1_STRUCT = struct.Struct("<QHHIIIII")
 AWG_SCHED_DEFAULT_STARTUP_MARGIN_US = 20_000
+AWG_STREAM_PROTO_MAGIC = 0x53415747
+AWG_STREAM_PROTO_HEADER_STRUCT = struct.Struct("<IIHH")
+AWG_STREAM_PROTO_ACK_STRUCT = struct.Struct("<IIII")
+AWG_STREAM_PROTO_FLAG_OPEN = 0x0001
+AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF = 0x0002
+AWG_STREAM_ACK_STATUS_NAMES = {
+    0: "ok",
+    1: "bad_arg",
+    2: "bad_magic",
+    3: "bad_length",
+    4: "bad_crc",
+    5: "disabled",
+    6: "open_failed",
+    7: "ddr_full",
+    8: "overflow",
+    9: "scheduler_error",
+    10: "close_failed",
+}
+AWG_STREAM_UART_RAW_BAUD = 115200
+AWG_STREAM_UART_RAW_BYTES_PER_S = AWG_STREAM_UART_RAW_BAUD / 10.0
+AWG_STREAM_UART_HEX_BYTES_PER_EVENT = AWG_EVENT_V1_SIZE * 2
+AWG_STREAM_UART_EXPECTED_EVENTS_PER_S = (100.0, 150.0)
 AWG_CONSOLE_READY_MARKER = "[AWG-UART] Ready."
 AWG_CONSOLE_LOAD_READY_MARKER = "[AWG-UART] LOADBIN READY"
 AWG_CONSOLE_LOAD_RX_BEGIN_MARKER = "[AWG-UART] LOADBIN RX BEGIN"
@@ -25,6 +49,11 @@ AWG_CONSOLE_ABORT_DONE_MARKER = "[AWG-UART] ABORT DONE"
 AWG_CONSOLE_ERROR_MARKER = "[AWG-UART] ERROR "
 AWG_CONSOLE_ARTIFACT_BEGIN = "[AWG-UART] ARTIFACT_BEGIN"
 AWG_CONSOLE_ARTIFACT_END = "[AWG-UART] ARTIFACT_END"
+AWG_STREAM_READY_MARKER = "[AWG-STREAM] STREAMHEX READY"
+AWG_STREAM_RX_BEGIN_MARKER = "[AWG-STREAM] STREAMHEX RX BEGIN"
+AWG_STREAM_ACK_PREFIX = "[AWG-STREAM] ACK "
+AWG_STREAM_STATUS_PREFIX = "[AWG-STREAM] STATUS "
+AWG_STREAM_ERROR_MARKER = "[AWG-STREAM] ERROR "
 
 _INFO_RE = re.compile(
     r"^\[AWG-UART\] INFO "
@@ -72,6 +101,52 @@ _ARTIFACT_STATUS_RE = re.compile(
 _ARTIFACT_TIME_RE = re.compile(
     r"^\[SCHED-ARTIFACT\] time_now=0x(?P<time_hi>[0-9A-Fa-f]+)_(?P<time_lo>[0-9A-Fa-f]+) "
     r"last_exec=0x(?P<last_hi>[0-9A-Fa-f]+)_(?P<last_lo>[0-9A-Fa-f]+)$"
+)
+_ARTIFACT_STREAM_RE = re.compile(
+    r"^\[SCHED-ARTIFACT\] stream "
+    r"depth=(?P<depth>\d+) "
+    r"low_wmark=(?P<low_wmark>\d+) "
+    r"ctrl=0x(?P<ctrl>[0-9A-Fa-f]+) "
+    r"occupancy=(?P<occupancy>\d+) "
+    r"free_space=(?P<free_space>\d+) "
+    r"pushes=(?P<pushes>\d+) "
+    r"stalls=(?P<stalls>\d+) "
+    r"irq=0x(?P<irq>[0-9A-Fa-f]+) "
+    r"err=0x(?P<err>[0-9A-Fa-f]+)$"
+)
+_STREAM_ACK_RE = re.compile(
+    r"^\[AWG-STREAM\] ACK "
+    r"magic=0x(?P<magic>[0-9A-Fa-f]+) "
+    r"seq=(?P<seq>\d+) "
+    r"ddr_free=(?P<ddr_free>\d+) "
+    r"status=(?P<status>\d+) "
+    r"ret=(?P<ret>-?\d+) "
+    r"bytes=(?P<bytes>\d+) "
+    r"events=(?P<events>\d+) "
+    r"flags=0x(?P<flags>[0-9A-Fa-f]+)$"
+)
+_STREAM_STATUS_RE = re.compile(
+    r"^\[AWG-STREAM\] STATUS "
+    r"tag=(?P<tag>\S+) "
+    r"ip_id=0x(?P<ip_id>[0-9A-Fa-f]+) "
+    r"ip_version=0x(?P<ip_version>[0-9A-Fa-f]+) "
+    r"stream_depth=(?P<stream_depth>\d+) "
+    r"low_wmark=(?P<low_wmark>\d+) "
+    r"stream_ctrl=0x(?P<stream_ctrl>[0-9A-Fa-f]+) "
+    r"occupancy=(?P<occupancy>\d+) "
+    r"free_space=(?P<free_space>\d+) "
+    r"stream_pushes=(?P<stream_pushes>\d+) "
+    r"stream_stalls=(?P<stream_stalls>\d+) "
+    r"commit=(?P<commit>\d+) "
+    r"err=0x(?P<err>[0-9A-Fa-f]+) "
+    r"irq=0x(?P<irq>[0-9A-Fa-f]+) "
+    r"hw_status=0x(?P<hw_status>[0-9A-Fa-f]+) "
+    r"mode=(?P<mode>[01]) "
+    r"overflow=(?P<overflow>[01]) "
+    r"eof_seen=(?P<eof_seen>[01]) "
+    r"running=(?P<running>[01]) "
+    r"done=(?P<done>[01]) "
+    r"error=(?P<error>[01])$"
 )
 
 
@@ -141,11 +216,65 @@ class AwgSchedArtifactTime:
 
 
 @dataclass(frozen=True)
+class AwgSchedArtifactStream:
+    stream_depth: int
+    low_wmark: int
+    stream_ctrl: int
+    occupancy: int
+    free_space: int
+    stream_pushes: int
+    stream_stalls: int
+    irq_status: int
+    err_reg: int
+
+
+@dataclass(frozen=True)
 class AwgSchedArtifactBlock:
     config: Optional[AwgSchedArtifactConfig]
     events: List[AwgSchedEvent]
     status: Optional[AwgSchedArtifactStatus]
     time: Optional[AwgSchedArtifactTime]
+    stream: Optional[AwgSchedArtifactStream]
+
+
+@dataclass(frozen=True)
+class AwgStreamAck:
+    magic: int
+    seq_acked: int
+    ddr_free_events: int
+    status: int
+    ret: int
+    frame_bytes: int
+    event_count: int
+    flags: int
+
+    @property
+    def status_name(self) -> str:
+        return AWG_STREAM_ACK_STATUS_NAMES.get(self.status, f"unknown_{self.status}")
+
+
+@dataclass(frozen=True)
+class AwgStreamStatus:
+    tag: str
+    ip_id: int
+    ip_version: int
+    stream_depth: int
+    low_wmark: int
+    stream_ctrl: int
+    occupancy: int
+    free_space: int
+    stream_pushes: int
+    stream_stalls: int
+    commit_count: int
+    err_reg: int
+    irq_status: int
+    hw_status: int
+    mode: bool
+    overflow: bool
+    eof_seen: bool
+    running: bool
+    done: bool
+    error: bool
 
 
 def parse_info_line(line: str) -> AwgSchedInfo:
@@ -213,6 +342,7 @@ def _parse_artifact_block_lines(lines: Iterable[str]) -> AwgSchedArtifactBlock:
     events: List[AwgSchedEvent] = []
     status: Optional[AwgSchedArtifactStatus] = None
     time_info: Optional[AwgSchedArtifactTime] = None
+    stream_info: Optional[AwgSchedArtifactStream] = None
 
     for line in lines:
         match = _ARTIFACT_CONFIG_RE.match(line)
@@ -265,17 +395,138 @@ def _parse_artifact_block_lines(lines: Iterable[str]) -> AwgSchedArtifactBlock:
                 time_now=_u64_from_parts(match.group("time_hi"), match.group("time_lo")),
                 last_exec=_u64_from_parts(match.group("last_hi"), match.group("last_lo")),
             )
+            continue
+
+        match = _ARTIFACT_STREAM_RE.match(line)
+        if match:
+            stream_info = AwgSchedArtifactStream(
+                stream_depth=int(match.group("depth")),
+                low_wmark=int(match.group("low_wmark")),
+                stream_ctrl=int(match.group("ctrl"), 16),
+                occupancy=int(match.group("occupancy")),
+                free_space=int(match.group("free_space")),
+                stream_pushes=int(match.group("pushes")),
+                stream_stalls=int(match.group("stalls")),
+                irq_status=int(match.group("irq"), 16),
+                err_reg=int(match.group("err"), 16),
+            )
 
     return AwgSchedArtifactBlock(
         config=config,
         events=events,
         status=status,
         time=time_info,
+        stream=stream_info,
     )
 
 
 def pack_events(events: Iterable[AwgSchedEvent]) -> bytes:
     return b"".join(event.pack() for event in events)
+
+
+def stream_crc32_ieee(data: bytes) -> int:
+    return binascii.crc32(data) & 0xFFFFFFFF
+
+
+def pack_stream_frame(
+    events: Iterable[AwgSchedEvent],
+    *,
+    seq: int,
+    open_stream: bool = False,
+    close_with_eof: bool = False,
+    corrupt_crc: bool = False,
+) -> bytes:
+    event_list = list(events)
+    if len(event_list) > 0xFFFF:
+        raise ValueError("stream frame cannot carry more than 65535 events")
+
+    flags = 0
+    if open_stream:
+        flags |= AWG_STREAM_PROTO_FLAG_OPEN
+    if close_with_eof:
+        flags |= AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF
+
+    body = AWG_STREAM_PROTO_HEADER_STRUCT.pack(
+        AWG_STREAM_PROTO_MAGIC,
+        seq & 0xFFFFFFFF,
+        len(event_list),
+        flags,
+    ) + pack_events(event_list)
+    crc = stream_crc32_ieee(body)
+    if corrupt_crc:
+        crc ^= 0xFFFFFFFF
+    return body + struct.pack("<I", crc)
+
+
+def stream_frame_wire_stats(frame: bytes, *, elapsed_s: Optional[float] = None) -> dict:
+    hex_chars = len(frame) * 2
+    stats = {
+        "frame_bytes": len(frame),
+        "frame_hex_chars": hex_chars,
+        "raw_uart_baud": AWG_STREAM_UART_RAW_BAUD,
+        "raw_uart_bytes_per_s": AWG_STREAM_UART_RAW_BYTES_PER_S,
+        "ascii_hex_event_wire_bytes": AWG_STREAM_UART_HEX_BYTES_PER_EVENT,
+        "expected_sustained_events_per_s": list(AWG_STREAM_UART_EXPECTED_EVENTS_PER_S),
+        "is_transport_correctness_path": True,
+    }
+    if elapsed_s is not None and elapsed_s > 0:
+        stats["wall_clock_s"] = elapsed_s
+        stats["wire_hex_chars_per_s"] = hex_chars / elapsed_s
+    return stats
+
+
+def estimate_uartlite_stream_seconds(event_count: int, events_per_s: float = 125.0) -> float:
+    if event_count < 0:
+        raise ValueError("event_count must be non-negative")
+    if events_per_s <= 0:
+        raise ValueError("events_per_s must be positive")
+    return event_count / events_per_s
+
+
+def parse_stream_ack_line(line: str) -> AwgStreamAck:
+    match = _STREAM_ACK_RE.match(line.strip())
+    if not match:
+        raise ValueError(f"Unrecognized AWG stream ACK line: {line!r}")
+
+    return AwgStreamAck(
+        magic=int(match.group("magic"), 16),
+        seq_acked=int(match.group("seq")),
+        ddr_free_events=int(match.group("ddr_free")),
+        status=int(match.group("status")),
+        ret=int(match.group("ret")),
+        frame_bytes=int(match.group("bytes")),
+        event_count=int(match.group("events")),
+        flags=int(match.group("flags"), 16),
+    )
+
+
+def parse_stream_status_line(line: str) -> AwgStreamStatus:
+    match = _STREAM_STATUS_RE.match(line.strip())
+    if not match:
+        raise ValueError(f"Unrecognized AWG stream status line: {line!r}")
+
+    return AwgStreamStatus(
+        tag=match.group("tag"),
+        ip_id=int(match.group("ip_id"), 16),
+        ip_version=int(match.group("ip_version"), 16),
+        stream_depth=int(match.group("stream_depth")),
+        low_wmark=int(match.group("low_wmark")),
+        stream_ctrl=int(match.group("stream_ctrl"), 16),
+        occupancy=int(match.group("occupancy")),
+        free_space=int(match.group("free_space")),
+        stream_pushes=int(match.group("stream_pushes")),
+        stream_stalls=int(match.group("stream_stalls")),
+        commit_count=int(match.group("commit")),
+        err_reg=int(match.group("err"), 16),
+        irq_status=int(match.group("irq"), 16),
+        hw_status=int(match.group("hw_status"), 16),
+        mode=(match.group("mode") == "1"),
+        overflow=(match.group("overflow") == "1"),
+        eof_seen=(match.group("eof_seen") == "1"),
+        running=(match.group("running") == "1"),
+        done=(match.group("done") == "1"),
+        error=(match.group("error") == "1"),
+    )
 
 
 def awg_scale_reg_from_u(scale_u: int) -> int:

@@ -17,6 +17,7 @@
 #include "xilinx_gpio.h"
 #include "no_os_delay.h"
 #include "no_os_error.h"
+#include "no_os_axi_io.h"
 #include "ad9144.h"
 #include "ad9516.h"
 #include "axi_dac_core.h"
@@ -24,6 +25,8 @@
 #include "axi_jesd204_tx.h"
 #include "si5328drv.h"
 #include "awg_sched.h"
+#include "awg_sched_regs.h"
+#include "awg_stream_proto.h"
 
 /* Stringify NO_OS_VERSION — the Makefile's -D quotes may not survive
  * the Windows shell, so we force stringification here. */
@@ -297,6 +300,22 @@ static awg_event_v1_t g_fmcdac_sched_console_events[FMCDAC_AWG_SCHED_MAX_EVENTS]
 static uint32_t g_fmcdac_sched_console_loaded_count;
 static int g_fmcdac_sched_console_configured;
 
+#if FMCDAC_AWG_SCHED_STREAM
+#ifndef FMCDAC_AWG_STREAM_CONSOLE_MAX_FRAME_EVENTS
+#define FMCDAC_AWG_STREAM_CONSOLE_MAX_FRAME_EVENTS 128U
+#endif
+
+#define FMCDAC_AWG_STREAM_CONSOLE_FRAME_HEADER_BYTES 12U
+#define FMCDAC_AWG_STREAM_CONSOLE_FRAME_CRC_BYTES    4U
+#define FMCDAC_AWG_STREAM_CONSOLE_MAX_FRAME_BYTES \
+	(FMCDAC_AWG_STREAM_CONSOLE_FRAME_HEADER_BYTES + \
+	 ((size_t)FMCDAC_AWG_STREAM_CONSOLE_MAX_FRAME_EVENTS * sizeof(awg_event_v1_t)) + \
+	 FMCDAC_AWG_STREAM_CONSOLE_FRAME_CRC_BYTES)
+
+static uint8_t g_fmcdac_stream_console_frame[FMCDAC_AWG_STREAM_CONSOLE_MAX_FRAME_BYTES];
+static int g_fmcdac_stream_console_output_prepared;
+#endif
+
 static void fmcdac_flush_input(void);
 
 #ifndef FMCDAC_DEFAULT_RATE_OPTION
@@ -394,6 +413,10 @@ static int fmcdac_read_exact_hex(uint8_t *buf, size_t len);
 static int fmcdac_run_scheduler_deterministic_path(struct fmcdac_dev *dev);
 static int fmcdac_run_awg_sweep_test(struct fmcdac_dev *dev);
 static void fmcdac_run_awg_sched_console(struct fmcdac_dev *dev);
+static int fmcdac_awg_stream_console_streamhex(struct fmcdac_dev *dev,
+					       const char *line);
+static int fmcdac_awg_stream_console_status(const char *tag);
+static int fmcdac_awg_stream_console_reset(void);
 static void fmcdac_run_benchmark_prompt_flow(struct fmcdac_dev *dev);
 static int fmcdac_dds_band_sweep_override_enabled(void);
 static int fmcdac_sfdr_sweep_override_enabled(void);
@@ -3508,6 +3531,297 @@ static void fmcdac_awg_sched_console_emit_count_error(const char *reason,
 		   (unsigned long)FMCDAC_AWG_SCHED_MAX_EVENTS);
 }
 
+#if FMCDAC_AWG_SCHED_STREAM
+static uint16_t fmcdac_get_le16(const uint8_t *p)
+{
+	return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t fmcdac_get_le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] |
+	       ((uint32_t)p[1] << 8) |
+	       ((uint32_t)p[2] << 16) |
+	       ((uint32_t)p[3] << 24);
+}
+
+static int fmcdac_awg_sched_console_read_reg(uint32_t offset, uint32_t *val)
+{
+	if (!val)
+		return -EINVAL;
+
+	if (FMCDAC_AWG_SCHED_BASEADDR == 0U)
+		return -ENODEV;
+
+	return no_os_axi_io_read(FMCDAC_AWG_SCHED_BASEADDR, offset, val);
+}
+
+static int fmcdac_awg_stream_console_prepare_output(struct fmcdac_dev *dev)
+{
+	int ret;
+
+	if (!dev || !dev->ad9144_core || !dev->ad9144_device) {
+		xil_printf("[AWG-STREAM] ERROR reason=dac_core_unavailable\n\r");
+		return -EINVAL;
+	}
+
+	if (!g_fmcdac_sched_console_configured) {
+		xil_printf("[AWG-STREAM] CONFIG BEGIN base=0x%08lX\n\r",
+			   (unsigned long)FMCDAC_AWG_SCHED_BASEADDR);
+		ret = fmcdac_awg_sched_console_configure();
+		if (ret != 0) {
+			xil_printf("[AWG-STREAM] ERROR reason=config_failed status=%d\n\r",
+				   ret);
+			return ret;
+		}
+		xil_printf("[AWG-STREAM] CONFIG OK\n\r");
+	}
+
+	if (!g_fmcdac_stream_console_output_prepared) {
+		ret = fmcdac_prepare_dds_output(dev, "AWG-STREAM");
+		if (ret != 0) {
+			xil_printf("[AWG-STREAM] ERROR reason=prepare_dds_failed status=%d\n\r",
+				   ret);
+			return ret;
+		}
+
+		ret = ad9144_set_nco(dev->ad9144_device, 0, 0);
+		if (ret != 0) {
+			xil_printf("[AWG-STREAM] ERROR reason=disable_nco_failed status=%ld\n\r",
+				   (long)ret);
+			return ret;
+		}
+
+		g_fmcdac_stream_console_output_prepared = 1;
+	}
+
+	return 0;
+}
+#endif
+
+#if FMCDAC_AWG_SCHED_STREAM
+static void fmcdac_awg_stream_console_emit_ack(const awg_stream_proto_ack_t *ack,
+					       int ret, size_t frame_bytes,
+					       uint16_t n_events,
+					       uint16_t flags)
+{
+	if (!ack)
+		return;
+
+	xil_printf("[AWG-STREAM] ACK magic=0x%08lX seq=%lu ddr_free=%lu "
+		   "status=%lu ret=%d bytes=%lu events=%u flags=0x%04X\n\r",
+		   (unsigned long)ack->magic,
+		   (unsigned long)ack->seq_acked,
+		   (unsigned long)ack->ddr_free_events,
+		   (unsigned long)ack->status,
+		   ret,
+		   (unsigned long)frame_bytes,
+		   (unsigned)n_events,
+		   (unsigned)flags);
+}
+#endif
+
+static int fmcdac_awg_stream_console_streamhex(struct fmcdac_dev *dev,
+					       const char *line)
+{
+#if FMCDAC_AWG_SCHED_STREAM
+	static const char *prefix = "STREAMHEX ";
+	awg_sched_stream_cfg_t stream_cfg;
+	awg_stream_proto_ack_t ack;
+	char *endptr;
+	unsigned long bytes_ul;
+	size_t frame_bytes;
+	size_t expected_frame_bytes;
+	uint32_t frame_magic = 0U;
+	uint32_t frame_seq = 0U;
+	uint16_t n_events = 0U;
+	uint16_t flags = 0U;
+	int ret;
+
+	if (!line)
+		return -EINVAL;
+
+	bytes_ul = strtoul(line + strlen(prefix), &endptr, 0);
+	if ((line + strlen(prefix)) == endptr || *endptr != '\0') {
+		xil_printf("[AWG-STREAM] ERROR reason=bad_streamhex_syntax\n\r");
+		return -EINVAL;
+	}
+
+	frame_bytes = (size_t)bytes_ul;
+	if (frame_bytes < (FMCDAC_AWG_STREAM_CONSOLE_FRAME_HEADER_BYTES +
+			   FMCDAC_AWG_STREAM_CONSOLE_FRAME_CRC_BYTES)) {
+		xil_printf("[AWG-STREAM] ERROR reason=frame_too_short bytes=%lu\n\r",
+			   (unsigned long)frame_bytes);
+		return -EINVAL;
+	}
+
+	if (frame_bytes > sizeof(g_fmcdac_stream_console_frame)) {
+		xil_printf("[AWG-STREAM] ERROR reason=frame_too_large bytes=%lu max_bytes=%lu max_events=%lu\n\r",
+			   (unsigned long)frame_bytes,
+			   (unsigned long)sizeof(g_fmcdac_stream_console_frame),
+			   (unsigned long)FMCDAC_AWG_STREAM_CONSOLE_MAX_FRAME_EVENTS);
+		return -E2BIG;
+	}
+
+	ret = fmcdac_awg_stream_console_prepare_output(dev);
+	if (ret != 0)
+		return ret;
+
+	xil_printf("[AWG-STREAM] STREAMHEX READY bytes=%lu max_bytes=%lu\n\r",
+		   (unsigned long)frame_bytes,
+		   (unsigned long)sizeof(g_fmcdac_stream_console_frame));
+	xil_printf("[AWG-STREAM] STREAMHEX RX BEGIN bytes=%lu hex_chars=%lu\n\r",
+		   (unsigned long)frame_bytes,
+		   (unsigned long)(frame_bytes * 2U));
+	ret = fmcdac_read_exact_hex(g_fmcdac_stream_console_frame, frame_bytes);
+	if (ret != 0) {
+		xil_printf("[AWG-STREAM] ERROR reason=payload_read_failed status=%d\n\r",
+			   ret);
+		return ret;
+	}
+	frame_magic = fmcdac_get_le32(g_fmcdac_stream_console_frame);
+	frame_seq = fmcdac_get_le32(g_fmcdac_stream_console_frame + 4U);
+	n_events = fmcdac_get_le16(g_fmcdac_stream_console_frame + 8U);
+	flags = fmcdac_get_le16(g_fmcdac_stream_console_frame + 10U);
+	expected_frame_bytes = FMCDAC_AWG_STREAM_CONSOLE_FRAME_HEADER_BYTES +
+			       ((size_t)n_events * sizeof(awg_event_v1_t)) +
+			       FMCDAC_AWG_STREAM_CONSOLE_FRAME_CRC_BYTES;
+	xil_printf("[AWG-STREAM] STREAMHEX RX OK bytes=%lu magic=0x%08lX seq=%lu events=%u flags=0x%04X expected_bytes=%lu\n\r",
+		   (unsigned long)frame_bytes,
+		   (unsigned long)frame_magic,
+		   (unsigned long)frame_seq,
+		   (unsigned)n_events,
+		   (unsigned)flags,
+		   (unsigned long)expected_frame_bytes);
+
+	memset(&stream_cfg, 0, sizeof(stream_cfg));
+	ret = awg_stream_proto_handle_frame(g_fmcdac_stream_console_frame,
+					    frame_bytes,
+					    &stream_cfg,
+					    &ack);
+	fmcdac_awg_stream_console_emit_ack(&ack, ret, frame_bytes,
+					   n_events, flags);
+	return ret;
+#else
+	(void)dev;
+	(void)line;
+	xil_printf("[AWG-STREAM] ACK magic=0x%08lX seq=0 ddr_free=0 status=%lu ret=%d bytes=0 events=0 flags=0x0000\n\r",
+		   (unsigned long)AWG_STREAM_PROTO_MAGIC,
+		   (unsigned long)AWG_STREAM_PROTO_ACK_DISABLED,
+		   -ENOTSUP);
+	return -ENOTSUP;
+#endif
+}
+
+static int fmcdac_awg_stream_console_status(const char *tag)
+{
+#if FMCDAC_AWG_SCHED_STREAM
+	uint32_t ip_id = 0U;
+	uint32_t ip_version = 0U;
+	uint32_t status = 0U;
+	uint32_t err_reg = 0U;
+	uint32_t irq_status = 0U;
+	uint32_t stream_ctrl = 0U;
+	uint32_t occupancy = 0U;
+	uint32_t free_space = 0U;
+	uint32_t low_wmark = 0U;
+	uint32_t stream_depth = 0U;
+	uint32_t stream_pushes = 0U;
+	uint32_t stream_stalls = 0U;
+	uint32_t commit_count = 0U;
+	int ret = 0;
+
+	if (!g_fmcdac_sched_console_configured) {
+		ret = fmcdac_awg_sched_console_configure();
+		if (ret != 0) {
+			xil_printf("[AWG-STREAM] ERROR reason=config_failed status=%d\n\r",
+				   ret);
+			return ret;
+		}
+	}
+
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_IP_ID, &ip_id);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_IP_VERSION, &ip_version);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_STATUS, &status);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_ERR_REG, &err_reg);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_IRQ_STATUS, &irq_status);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_STREAM_CTRL, &stream_ctrl);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_OCCUPANCY, &occupancy);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_FREE_SPACE, &free_space);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_LOW_WMARK, &low_wmark);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_STREAM_DEPTH, &stream_depth);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_STREAM_PUSHES, &stream_pushes);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_STREAM_STALLS, &stream_stalls);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_COMMIT_COUNT, &commit_count);
+	if (ret != 0) {
+		xil_printf("[AWG-STREAM] ERROR reason=status_read_failed status=%d\n\r",
+			   ret);
+		return ret;
+	}
+
+	xil_printf("[AWG-STREAM] STATUS tag=%s ip_id=0x%08lX ip_version=0x%08lX "
+		   "stream_depth=%lu low_wmark=%lu stream_ctrl=0x%08lX "
+		   "occupancy=%lu free_space=%lu stream_pushes=%lu stream_stalls=%lu "
+		   "commit=%lu err=0x%08lX irq=0x%08lX hw_status=0x%08lX "
+		   "mode=%u overflow=%u eof_seen=%u running=%u done=%u error=%u\n\r",
+		   tag ? tag : "status",
+		   (unsigned long)ip_id,
+		   (unsigned long)ip_version,
+		   (unsigned long)stream_depth,
+		   (unsigned long)low_wmark,
+		   (unsigned long)stream_ctrl,
+		   (unsigned long)occupancy,
+		   (unsigned long)free_space,
+		   (unsigned long)stream_pushes,
+		   (unsigned long)stream_stalls,
+		   (unsigned long)commit_count,
+		   (unsigned long)err_reg,
+		   (unsigned long)irq_status,
+		   (unsigned long)status,
+		   (unsigned)((stream_ctrl & AWG_SCHED_STREAM_CTRL_MODE) != 0U),
+		   (unsigned)((stream_ctrl & AWG_SCHED_STREAM_CTRL_OVERFLOW) != 0U),
+		   (unsigned)((stream_ctrl & AWG_SCHED_STREAM_CTRL_EOF_SEEN) != 0U),
+		   (unsigned)((status & (AWG_SCHED_STATUS_RUNNING | (1U << 1))) != 0U),
+		   (unsigned)((status & (AWG_SCHED_STATUS_DONE | (1U << 2))) != 0U),
+		   (unsigned)((status & (AWG_SCHED_STATUS_ERROR | (1U << 3))) != 0U));
+	return 0;
+#else
+	(void)tag;
+	xil_printf("[AWG-STREAM] ERROR reason=stream_disabled\n\r");
+	return -ENOTSUP;
+#endif
+}
+
+static int fmcdac_awg_stream_console_reset(void)
+{
+#if FMCDAC_AWG_SCHED_STREAM
+	int ret;
+
+	if (!g_fmcdac_sched_console_configured) {
+		ret = fmcdac_awg_sched_console_configure();
+		if (ret != 0) {
+			xil_printf("[AWG-STREAM] ERROR reason=config_failed status=%d\n\r",
+				   ret);
+			return ret;
+		}
+	}
+
+	ret = awg_sched_stream_reset_soft();
+	if (ret != 0) {
+		xil_printf("[AWG-STREAM] ERROR reason=reset_failed status=%d\n\r", ret);
+		return ret;
+	}
+
+	g_fmcdac_sched_console_loaded_count = 0U;
+	g_fmcdac_stream_console_output_prepared = 0;
+	xil_printf("[AWG-STREAM] RESET DONE type=soft\n\r");
+	return fmcdac_awg_stream_console_status("after_reset");
+#else
+	xil_printf("[AWG-STREAM] ERROR reason=stream_disabled\n\r");
+	return -ENOTSUP;
+#endif
+}
+
 static int fmcdac_awg_sched_console_loadbin(struct fmcdac_dev *dev,
 					    const char *line)
 {
@@ -3759,13 +4073,16 @@ static void fmcdac_run_awg_sched_console(struct fmcdac_dev *dev)
 
 	g_fmcdac_sched_console_loaded_count = 0U;
 	g_fmcdac_sched_console_configured = 0;
+#if FMCDAC_AWG_SCHED_STREAM
+	g_fmcdac_stream_console_output_prepared = 0;
+#endif
 
 	xil_printf("[AWG-UART] CONSOLE BEGIN base=0x%08lX max_events=%lu tick_hz=%lu timeout_ms=%lu\n\r",
 		   (unsigned long)FMCDAC_AWG_SCHED_BASEADDR,
 		   (unsigned long)FMCDAC_AWG_SCHED_MAX_EVENTS,
 		   (unsigned long)FMCDAC_AWG_SCHED_TICK_HZ,
 		   (unsigned long)FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS);
-	xil_printf("[AWG-UART] Ready. Commands: INFO STATUS LOADBIN <count> RUN ABORT DUMP EXIT\n\r");
+	xil_printf("[AWG-UART] Ready. Commands: INFO STATUS LOADBIN <count> RUN ABORT DUMP STREAMINFO STREAMSTATUS STREAMRESET STREAMHEX <bytes> EXIT\n\r");
 
 	while (1) {
 		if (fmcdac_read_line(line, sizeof(line)) < 0)
@@ -3798,6 +4115,26 @@ static void fmcdac_run_awg_sched_console(struct fmcdac_dev *dev)
 
 		if (strcmp(line, "DUMP") == 0) {
 			(void)fmcdac_awg_sched_console_dump_status();
+			continue;
+		}
+
+		if (strcmp(line, "STREAMINFO") == 0) {
+			(void)fmcdac_awg_stream_console_status("info");
+			continue;
+		}
+
+		if (strcmp(line, "STREAMSTATUS") == 0) {
+			(void)fmcdac_awg_stream_console_status("status");
+			continue;
+		}
+
+		if (strcmp(line, "STREAMRESET") == 0) {
+			(void)fmcdac_awg_stream_console_reset();
+			continue;
+		}
+
+		if (strncmp(line, "STREAMHEX ", strlen("STREAMHEX ")) == 0) {
+			(void)fmcdac_awg_stream_console_streamhex(dev, line);
 			continue;
 		}
 

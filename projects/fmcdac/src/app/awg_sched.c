@@ -1325,6 +1325,10 @@ int awg_sched_stream_open(const awg_sched_stream_cfg_t *cfg)
 	if (ret)
 		goto fail;
 
+	ret = awg_sched_set_epoch();
+	if (ret)
+		goto fail;
+
 	return 0;
 
 fail:
@@ -1472,6 +1476,10 @@ int awg_sched_stream_close(bool send_eof)
 			idx = awg_stream_ring_prev(g_awg_stream.write_idx);
 			g_awg_stream.ring[idx].flags |= AWG_SCHED_FLAG_EOF;
 		} else {
+			if (g_awg_stream.has_last_event &&
+			    ((g_awg_stream.last_event.flags & AWG_SCHED_FLAG_EOF) != 0U))
+				return awg_sched_stream_drain_step();
+
 			if (awg_stream_ring_free() == 0U)
 				return -EAGAIN;
 
@@ -1542,6 +1550,30 @@ int awg_sched_stream_get_error_snapshot(awg_sched_stream_snapshot_t *snapshot)
 	return 0;
 }
 
+int awg_sched_stream_reset_soft(void)
+{
+	int ret;
+
+	if (!g_awg_sched.configured)
+		return -ENODEV;
+
+	ret = awg_sched_reset();
+	if (ret)
+		return ret;
+
+	ret = awg_sched_reg_write(AWG_SCHED_REG_IRQ_STATUS, AWG_SCHED_IRQ_ALL);
+	if (ret)
+		return ret;
+
+	/*
+	 * The HDL soft reset flushes the stream FIFO and held/prefetched event.
+	 * Clear software state as well so foreground polling cannot refill from
+	 * stale DDR ring indices after an operator-triggered reset.
+	 */
+	memset(&g_awg_stream, 0, sizeof(g_awg_stream));
+	return 0;
+}
+
 #else
 
 int awg_sched_stream_open(const awg_sched_stream_cfg_t *cfg)
@@ -1586,6 +1618,11 @@ uint32_t awg_sched_stream_poll_interval_us(void)
 int awg_sched_stream_get_error_snapshot(awg_sched_stream_snapshot_t *snapshot)
 {
 	(void)snapshot;
+	return -ENOTSUP;
+}
+
+int awg_sched_stream_reset_soft(void)
+{
 	return -ENOTSUP;
 }
 
@@ -1643,4 +1680,41 @@ AWG_LOG("[SCHED-ARTIFACT] time_now=0x%08lX_%08lX last_exec=0x%08lX_%08lX\n\r",
 (unsigned long)(status->last_exec >> 32),
 (unsigned long)(status->last_exec));
 }
+
+#if FMCDAC_AWG_SCHED_STREAM
+{
+uint32_t stream_depth;
+uint32_t low_wmark;
+uint32_t stream_ctrl;
+uint32_t occupancy;
+uint32_t free_space;
+uint32_t stream_pushes;
+uint32_t stream_stalls;
+uint32_t irq_status;
+uint32_t err_reg;
+
+if (awg_sched_reg_read(AWG_SCHED_REG_STREAM_DEPTH, &stream_depth) == 0 &&
+    awg_sched_reg_read(AWG_SCHED_REG_LOW_WMARK, &low_wmark) == 0 &&
+    awg_sched_reg_read(AWG_SCHED_REG_STREAM_CTRL, &stream_ctrl) == 0 &&
+    awg_sched_reg_read(AWG_SCHED_REG_OCCUPANCY, &occupancy) == 0 &&
+    awg_sched_reg_read(AWG_SCHED_REG_FREE_SPACE, &free_space) == 0 &&
+    awg_sched_reg_read(AWG_SCHED_REG_STREAM_PUSHES, &stream_pushes) == 0 &&
+    awg_sched_reg_read(AWG_SCHED_REG_STREAM_STALLS, &stream_stalls) == 0 &&
+    awg_sched_reg_read(AWG_SCHED_REG_IRQ_STATUS, &irq_status) == 0 &&
+    awg_sched_reg_read(AWG_SCHED_REG_ERR_REG, &err_reg) == 0) {
+AWG_LOG("[SCHED-ARTIFACT] stream depth=%lu low_wmark=%lu "
+"ctrl=0x%08lX occupancy=%lu free_space=%lu pushes=%lu stalls=%lu "
+"irq=0x%08lX err=0x%08lX\n\r",
+(unsigned long)stream_depth,
+(unsigned long)low_wmark,
+(unsigned long)stream_ctrl,
+(unsigned long)occupancy,
+(unsigned long)free_space,
+(unsigned long)stream_pushes,
+(unsigned long)stream_stalls,
+(unsigned long)irq_status,
+(unsigned long)err_reg);
+}
+}
+#endif
 }

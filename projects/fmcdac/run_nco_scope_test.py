@@ -38,11 +38,26 @@ from awg_sched_host import (
     AWG_CONSOLE_LOAD_RX_BEGIN_MARKER,
     AWG_CONSOLE_READY_MARKER,
     AWG_CONSOLE_RUN_DONE_MARKER,
+    AWG_EVENT_V1_SIZE,
+    AWG_STREAM_ACK_PREFIX,
+    AWG_STREAM_ERROR_MARKER,
+    AWG_STREAM_PROTO_MAGIC,
+    AWG_STREAM_READY_MARKER,
+    AWG_STREAM_RX_BEGIN_MARKER,
+    AWG_STREAM_UART_EXPECTED_EVENTS_PER_S,
+    AWG_STREAM_UART_HEX_BYTES_PER_EVENT,
+    AWG_STREAM_UART_RAW_BAUD,
+    AWG_STREAM_UART_RAW_BYTES_PER_S,
     build_awg_sweep_events,
     build_uniform_freq_list,
+    estimate_uartlite_stream_seconds,
     pack_events,
+    pack_stream_frame,
     parse_info_line,
     parse_last_artifact_block,
+    parse_stream_ack_line,
+    parse_stream_status_line,
+    stream_frame_wire_stats,
 )
 
 try:
@@ -1690,18 +1705,207 @@ def load_awg_scheduler_events_into_console(
     }
 
 
+def query_awg_stream_status(
+    uart: "UartCoordinator",
+    args: argparse.Namespace,
+    *,
+    command: str = "STREAMSTATUS",
+) -> Any:
+    uart.send_line(command)
+    line = uart.wait_for_line_containing(AWG_STREAM_STATUS_PREFIX, args.uart_timeout)
+    return parse_stream_status_line(line)
+
+
+def reset_awg_stream_console(uart: "UartCoordinator", args: argparse.Namespace) -> Any:
+    uart.send_line("STREAMRESET")
+    line = uart.wait_for_line_containing(AWG_STREAM_STATUS_PREFIX, args.uart_timeout)
+    return parse_stream_status_line(line)
+
+
+def send_awg_stream_frame_hex(
+    uart: "UartCoordinator",
+    args: argparse.Namespace,
+    frame: bytes,
+    *,
+    expected_status: Optional[int] = 0,
+) -> dict:
+    payload_hex = frame.hex()
+    command_start_s = time.monotonic()
+
+    uart.send_line(f"STREAMHEX {len(frame)}")
+    matched = uart.wait_for(
+        AWG_STREAM_READY_MARKER,
+        args.uart_timeout,
+        extra_needles=[AWG_STREAM_ERROR_MARKER, AWG_CONSOLE_ERROR_MARKER],
+    )
+    if matched != AWG_STREAM_READY_MARKER:
+        raise RuntimeError(f"Stream console rejected frame before payload: {matched}")
+
+    matched = uart.wait_for(
+        AWG_STREAM_RX_BEGIN_MARKER,
+        args.uart_timeout,
+        extra_needles=[AWG_STREAM_ERROR_MARKER, AWG_CONSOLE_ERROR_MARKER],
+    )
+    if matched != AWG_STREAM_RX_BEGIN_MARKER:
+        raise RuntimeError(f"Stream console rejected frame before RX: {matched}")
+
+    chunk_chars = max(2, int(args.scheduler_stream_hex_line_chars))
+    if chunk_chars % 2:
+        chunk_chars -= 1
+    for offset in range(0, len(payload_hex), chunk_chars):
+        uart.send(payload_hex[offset : offset + chunk_chars])
+        if args.scheduler_stream_hex_chunk_delay_s > 0:
+            time.sleep(args.scheduler_stream_hex_chunk_delay_s)
+    uart.send_line()
+
+    ack_line, ack_time_s = uart.wait_for_line_containing_timed(
+        AWG_STREAM_ACK_PREFIX,
+        args.uart_timeout,
+    )
+    ack = parse_stream_ack_line(ack_line)
+    elapsed_s = max(0.0, ack_time_s - command_start_s)
+    stats = stream_frame_wire_stats(frame, elapsed_s=elapsed_s)
+    event_count = max(0, ack.event_count)
+    if elapsed_s > 0 and event_count > 0:
+        stats["wall_clock_per_event_s"] = elapsed_s / event_count
+        stats["effective_events_per_s"] = event_count / elapsed_s
+    stats["ack_latency_s"] = elapsed_s
+
+    if ack.magic != AWG_STREAM_PROTO_MAGIC:
+        raise RuntimeError(f"Stream ACK magic mismatch: 0x{ack.magic:08X}")
+    if expected_status is not None and ack.status != expected_status:
+        raise RuntimeError(
+            f"Stream ACK status mismatch: expected {expected_status}, got {ack.status} ({ack.status_name})"
+        )
+
+    return {
+        "ack": asdict(ack),
+        "ack_status_name": ack.status_name,
+        "wire_stats": stats,
+    }
+
+
+def wait_awg_stream_done(
+    uart: "UartCoordinator",
+    args: argparse.Namespace,
+    *,
+    timeout_s: float,
+) -> Any:
+    deadline = time.monotonic() + timeout_s
+    last_status = None
+    while time.monotonic() < deadline:
+        last_status = query_awg_stream_status(uart, args)
+        if last_status.error:
+            raise RuntimeError(f"Stream scheduler entered error state: {asdict(last_status)}")
+        if last_status.done and last_status.eof_seen:
+            return last_status
+        time.sleep(args.scheduler_stream_status_poll_s)
+
+    raise TimeoutError(f"Timed out waiting for stream done/EOF; last_status={last_status}")
+
+
+def build_scheduler_transport_manifest(args: argparse.Namespace) -> dict:
+    return {
+        "selected_transport": args.scheduler_transport,
+        "preload_limit_events": 256,
+        "uartlite_ascii_hex_stream": {
+            "raw_baud": AWG_STREAM_UART_RAW_BAUD,
+            "raw_bytes_per_s": AWG_STREAM_UART_RAW_BYTES_PER_S,
+            "event_size_bytes": AWG_EVENT_V1_SIZE,
+            "wire_bytes_per_event_ascii_hex": AWG_STREAM_UART_HEX_BYTES_PER_EVENT,
+            "expected_sustained_events_per_s": list(AWG_STREAM_UART_EXPECTED_EVENTS_PER_S),
+            "dense_10k_event_expected_s": {
+                "at_100_events_per_s": estimate_uartlite_stream_seconds(10_000, 100.0),
+                "at_150_events_per_s": estimate_uartlite_stream_seconds(10_000, 150.0),
+            },
+            "soak_100k_event_expected_s": {
+                "at_100_events_per_s": estimate_uartlite_stream_seconds(100_000, 100.0),
+                "at_150_events_per_s": estimate_uartlite_stream_seconds(100_000, 150.0),
+            },
+            "throughput_claims_deferred_until": ["UART16550", "Ethernet"],
+        },
+        "stream_depth_sentinel": args.scheduler_stream_depth_sentinel,
+    }
+
+
+def assert_stream_bringup_identity(status: Any, args: argparse.Namespace) -> None:
+    if status.ip_id != 0x41574753:
+        raise RuntimeError(f"Unexpected scheduler IP_ID: 0x{status.ip_id:08X}")
+    if status.ip_version != 0x00010000:
+        raise RuntimeError(f"Unexpected scheduler IP_VERSION: 0x{status.ip_version:08X}")
+    if args.scheduler_stream_depth_sentinel is not None:
+        if status.stream_depth != args.scheduler_stream_depth_sentinel:
+            raise RuntimeError(
+                f"STREAM_DEPTH sentinel failed: expected {args.scheduler_stream_depth_sentinel}, "
+                f"observed {status.stream_depth}"
+            )
+
+
 def build_scheduler_benchmark_catalog() -> dict:
     return {
         "scheduler_console_transport": {
             "mode": "uart_ascii_hex",
-            "commands": ["INFO", "STATUS", "LOADBIN <count>", "RUN", "ABORT", "DUMP", "EXIT"],
+            "commands": [
+                "INFO",
+                "STATUS",
+                "LOADBIN <count>",
+                "RUN",
+                "ABORT",
+                "DUMP",
+                "STREAMINFO",
+                "STREAMSTATUS",
+                "STREAMRESET",
+                "STREAMHEX <bytes>",
+                "EXIT",
+            ],
             "batch_reuse_supported": True,
+        },
+        "stream_transport": {
+            "mode": "uartlite_ascii_hex_frames",
+            "purpose": "correctness_and_observability_not_throughput",
+            "raw_baud": AWG_STREAM_UART_RAW_BAUD,
+            "raw_bytes_per_s": AWG_STREAM_UART_RAW_BYTES_PER_S,
+            "event_size_bytes": AWG_EVENT_V1_SIZE,
+            "wire_bytes_per_event_ascii_hex": AWG_STREAM_UART_HEX_BYTES_PER_EVENT,
+            "expected_sustained_events_per_s": list(AWG_STREAM_UART_EXPECTED_EVENTS_PER_S),
+            "dense_10k_event_expected_s": {
+                "at_100_events_per_s": estimate_uartlite_stream_seconds(10_000, 100.0),
+                "at_150_events_per_s": estimate_uartlite_stream_seconds(10_000, 150.0),
+            },
+            "soak_100k_event_expected_s": {
+                "at_100_events_per_s": estimate_uartlite_stream_seconds(100_000, 100.0),
+                "at_150_events_per_s": estimate_uartlite_stream_seconds(100_000, 150.0),
+            },
         },
         "known_hardware_limits": {
             "event_ram_is_finite": True,
+            "legacy_preload_comparison_limit_events": 256,
             "current_firmware_reports_max_events_at_runtime": True,
             "dense_sweeps_may_require_batching": True,
+            "stream_depth_sentinel_events": 511,
         },
+        "stream_bringup_capabilities": [
+            {
+                "id": "stream_identity_depth_sentinel",
+                "kind": "implemented",
+                "measures": ["IP_ID", "IP_VERSION", "observed STREAM_DEPTH == 511"],
+            },
+            {
+                "id": "stream_finite_eof",
+                "kind": "implemented",
+                "measures": ["ACK status", "EOF seen", "done/error bits", "STREAM_PUSHES"],
+            },
+            {
+                "id": "stream_bad_crc",
+                "kind": "implemented",
+                "measures": ["BAD_CRC ACK", "unchanged accepted counters"],
+            },
+            {
+                "id": "stream_reset_recovery",
+                "kind": "implemented",
+                "measures": ["soft-reset status", "FIFO occupancy/free", "stream counters"],
+            },
+        ],
         "fsh_capabilities": [
             {
                 "id": "scheduler_dense_sweep",
@@ -1774,34 +1978,45 @@ def build_scheduler_scope_plan(args: argparse.Namespace) -> dict:
             "does not yet contain a validated MSO22 SCPI driver path for the FMCDAC bench."
         ),
         "recommended_channel_map": {
-            "CH1": "RF envelope detector, mixer IF, or representative digital timing marker",
-            "CH2": "scheduler-related strobe, external trigger, or reference timing edge",
+            "CH1": "RF envelope detector, mixer IF, or representative analog output timing observable",
+            "CH2": "marker_commit routed from awg_timed_ctrl; marker_start/marker_done are secondary checks",
+            "optional_refill_observable": "IRQ_LOW_WATERMARK or another stream refill-margin marker if routed",
+        },
+        "gating_prerequisite": {
+            "status": "must_verify_before_timing_measurements",
+            "required_hdl_outputs": ["marker_commit", "marker_start", "marker_done"],
+            "preferred_scope_cross_check": "marker_commit edge count versus STREAM_PUSHES and commit/fire counters",
         },
         "benchmarks": [
             {
                 "name": "epoch_to_first_event_latency",
                 "goal": "measure delay from scheduler epoch anchor to first observable output change",
-                "requires": ["repeatable trigger source", "observable event edge"],
+                "requires": ["repeatable trigger source", "marker_start or marker_commit", "observable event edge"],
             },
             {
                 "name": "event_to_event_switch_latency",
                 "goal": "measure retune latency between adjacent scheduled carrier events",
-                "requires": ["two-tone or frequency-hop sequence", "observable edge metric"],
+                "requires": ["two-tone or frequency-hop sequence", "marker_commit", "observable edge metric"],
             },
             {
                 "name": "minimum_stable_dwell_sweep",
-                "goal": "sweep programmed dwell width downward until output becomes unreliable",
-                "requires": ["scheduler batch runner", "stable trigger path"],
+                "goal": "target MIN_SPACING_TICKS=8 at sched_clk=245.76 MHz and verify IRQ_SPACING_VIOLATION below it",
+                "requires": ["scheduler batch runner", "stable trigger path", "IRQ/status readback"],
             },
             {
                 "name": "pulse_width_and_spacing_accuracy",
                 "goal": "compare actual pulse widths/spacing to programmed scheduler tick intervals",
-                "requires": ["observable pulse waveform or routed timing marker"],
+                "requires": ["observable pulse waveform or marker_commit"],
             },
             {
                 "name": "batch_boundary_gap",
-                "goal": "measure overhead inserted by host-side batching when event_count exceeds max_events",
+                "goal": "measure preload boundary overhead and compare against stream mode for schedules that fit both paths",
                 "requires": ["dense multi-batch schedule", "marker around batch transitions"],
+            },
+            {
+                "name": "stream_refill_margin_visualization",
+                "goal": "visualize LOW_WATERMARK/refill behavior while cross-checking register counters",
+                "requires": ["marker_commit", "IRQ_LOW_WATERMARK or equivalent refill observable"],
             },
             {
                 "name": "reinit_vs_no_reinit_visibility",
@@ -2033,14 +2248,71 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--scheduler-suite-profile",
-        choices=["dense", "sfdr", "fsh", "scope-plan", "all"],
+        choices=["dense", "sfdr", "fsh", "stream-bringup", "scope-plan", "all"],
         default="all",
         help=(
             "Choose which scheduler-native benchmark families to run. "
             "'dense' runs chunked stepped-tone FSH validation, 'sfdr' runs scheduler-held SFDR spots, "
-            "'fsh' runs both FSH families, 'scope-plan' only emits the MSO22 benchmark plan, "
-            "and 'all' runs the FSH families plus writes the scope plan."
+            "'fsh' runs both FSH families, 'stream-bringup' runs UARTLite stream correctness checks, "
+            "'scope-plan' only emits the MSO22 benchmark plan, and 'all' runs the FSH families plus writes the scope plan."
         ),
+    )
+    parser.add_argument(
+        "--scheduler-transport",
+        choices=["preload", "stream", "compare"],
+        default="preload",
+        help=(
+            "Scheduler execution transport. 'preload' uses LOADBIN/RUN, 'stream' uses STREAMHEX frames, "
+            "and 'compare' is reserved for schedules that fit both preload and stream."
+        ),
+    )
+    parser.add_argument(
+        "--scheduler-stream-depth-sentinel",
+        type=int,
+        default=511,
+        help="Expected STREAM_DEPTH register value for stream bring-up. Use a negative value to disable the sentinel.",
+    )
+    parser.add_argument(
+        "--scheduler-stream-frame-events",
+        type=int,
+        default=16,
+        help="Maximum AWG events per UARTLite STREAMHEX frame.",
+    )
+    parser.add_argument(
+        "--scheduler-stream-bringup-events",
+        type=int,
+        default=0,
+        help="Depth-plus refill event count for stream bring-up. Default uses STREAM_DEPTH+16 after reading hardware.",
+    )
+    parser.add_argument(
+        "--scheduler-stream-dwell-us",
+        type=int,
+        default=20_000,
+        help="Dwell per stream bring-up event. Default is slow enough for 115200-baud ASCII-hex UARTLite.",
+    )
+    parser.add_argument(
+        "--scheduler-stream-wait-timeout-s",
+        type=float,
+        default=120.0,
+        help="Timeout while waiting for stream EOF/done in correctness profiles.",
+    )
+    parser.add_argument(
+        "--scheduler-stream-status-poll-s",
+        type=float,
+        default=0.25,
+        help="Polling interval for STREAMSTATUS while waiting for EOF/done.",
+    )
+    parser.add_argument(
+        "--scheduler-stream-hex-line-chars",
+        type=int,
+        default=64,
+        help="Hex characters sent per UART write while sending STREAMHEX payloads.",
+    )
+    parser.add_argument(
+        "--scheduler-stream-hex-chunk-delay-s",
+        type=float,
+        default=0.002,
+        help="Delay between STREAMHEX payload chunks to avoid overrunning UARTLite console input.",
     )
     parser.add_argument(
         "--scheduler-suite-sfdr-dwell-us",
@@ -2430,8 +2702,13 @@ def ensure_args(args: argparse.Namespace) -> None:
     if scheduler_suite_mode:
         if args.run_full_integration:
             raise SystemExit("--run-scheduler-benchmark-suite cannot be combined with --run-full-integration")
-        if args.scheduler_suite_profile != "scope-plan" and not args.visa_resource:
-            raise SystemExit("--run-scheduler-benchmark-suite requires --visa-resource unless --scheduler-suite-profile=scope-plan")
+        if args.scheduler_suite_profile not in ("scope-plan", "stream-bringup") and not args.visa_resource:
+            raise SystemExit("--run-scheduler-benchmark-suite requires --visa-resource unless --scheduler-suite-profile=scope-plan or stream-bringup")
+        if args.scheduler_transport in ("stream", "compare") and args.scheduler_suite_profile in ("dense", "sfdr", "fsh"):
+            raise SystemExit(
+                "--scheduler-transport stream/compare is currently gated to --scheduler-suite-profile stream-bringup "
+                "or all; FSH dense/SFDR stream execution should be enabled after stream bring-up passes."
+            )
     if not args.serial_port and not (scheduler_suite_mode and args.scheduler_suite_profile == "scope-plan"):
         raise SystemExit("--serial-port is required for coordinated UART + analyzer operation")
     if args.sweep_count < 1:
@@ -2456,6 +2733,22 @@ def ensure_args(args: argparse.Namespace) -> None:
     )
     if args.scheduler_suite_sfdr_dwell_us < 1:
         raise SystemExit("--scheduler-suite-sfdr-dwell-us must be at least 1")
+    if args.scheduler_stream_depth_sentinel is not None and args.scheduler_stream_depth_sentinel < 0:
+        args.scheduler_stream_depth_sentinel = None
+    if args.scheduler_stream_frame_events < 1:
+        raise SystemExit("--scheduler-stream-frame-events must be at least 1")
+    if args.scheduler_stream_bringup_events < 0:
+        raise SystemExit("--scheduler-stream-bringup-events must be non-negative")
+    if args.scheduler_stream_dwell_us < 1:
+        raise SystemExit("--scheduler-stream-dwell-us must be at least 1")
+    if args.scheduler_stream_wait_timeout_s <= 0:
+        raise SystemExit("--scheduler-stream-wait-timeout-s must be greater than 0")
+    if args.scheduler_stream_status_poll_s <= 0:
+        raise SystemExit("--scheduler-stream-status-poll-s must be greater than 0")
+    if args.scheduler_stream_hex_line_chars < 2:
+        raise SystemExit("--scheduler-stream-hex-line-chars must be at least 2")
+    if args.scheduler_stream_hex_chunk_delay_s < 0:
+        raise SystemExit("--scheduler-stream-hex-chunk-delay-s must be >= 0")
     if args.sfdr_stop_hz <= args.sfdr_start_hz:
         raise SystemExit("--sfdr-stop-hz must be greater than --sfdr-start-hz")
     if args.sfdr_guard_hz <= 0:
@@ -2771,6 +3064,8 @@ def build_awg_scheduler_console_cflags(args: argparse.Namespace) -> str:
         defines.append(f"-DFMCDAC_AWG_SCHED_TICK_HZ={args.awg_sched_tick_hz}U")
     if args.awg_sched_timeout_ms is not None:
         defines.append(f"-DFMCDAC_AWG_SCHED_DONE_TIMEOUT_MS={args.awg_sched_timeout_ms}U")
+    if args.scheduler_transport in ("stream", "compare") or args.scheduler_suite_profile == "stream-bringup":
+        defines.append("-DFMCDAC_AWG_SCHED_STREAM=1")
     return " ".join(defines)
 
 
@@ -3327,6 +3622,153 @@ def execute_scheduler_sfdr_spot_suite(
     return summary
 
 
+def execute_scheduler_stream_bringup_suite(
+    uart: "UartCoordinator",
+    console_log: "ConsoleLog",
+    args: argparse.Namespace,
+    output_dir: Path,
+    info: Any,
+) -> dict:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    dds_clock_hz = info.dds_clock_hz or 983_056_640
+    dds_phase_dw = info.dds_phase_dw or 32
+    seq = 1
+
+    initial_status = query_awg_stream_status(uart, args, command="STREAMINFO")
+    assert_stream_bringup_identity(initial_status, args)
+    after_reset = reset_awg_stream_console(uart, args)
+    assert_stream_bringup_identity(after_reset, args)
+
+    before_bad_crc = query_awg_stream_status(uart, args)
+    bad_crc_frame = pack_stream_frame([], seq=seq, corrupt_crc=True)
+    bad_crc_result = send_awg_stream_frame_hex(
+        uart,
+        args,
+        bad_crc_frame,
+        expected_status=4,
+    )
+    seq += 1
+    after_bad_crc = query_awg_stream_status(uart, args)
+    if after_bad_crc.stream_pushes != before_bad_crc.stream_pushes:
+        raise RuntimeError(
+            "Bad CRC changed STREAM_PUSHES: "
+            f"before={before_bad_crc.stream_pushes} after={after_bad_crc.stream_pushes}"
+        )
+
+    after_bad_crc_reset = reset_awg_stream_console(uart, args)
+    finite_events = build_awg_sweep_events(
+        [200_000_000],
+        tick_hz=info.tick_hz,
+        dds_clock_hz=dds_clock_hz,
+        dds_phase_dw=dds_phase_dw,
+        tone=0,
+        scale_u=args.awg_sweep_scale_u or 700_000,
+        start_ticks=args.awg_sweep_start_ticks or 10_000,
+        dwell_us=args.scheduler_stream_dwell_us,
+    )
+    finite_frame = pack_stream_frame(
+        finite_events,
+        seq=seq,
+        open_stream=True,
+        close_with_eof=True,
+    )
+    finite_result = send_awg_stream_frame_hex(uart, args, finite_frame)
+    seq += 1
+    finite_done = wait_awg_stream_done(
+        uart,
+        args,
+        timeout_s=args.scheduler_stream_wait_timeout_s,
+    )
+
+    after_finite_reset = reset_awg_stream_console(uart, args)
+    refill_event_count = args.scheduler_stream_bringup_events
+    if refill_event_count <= 0:
+        refill_event_count = after_finite_reset.stream_depth + 16
+    refill_freqs = [200_000_000 + (idx * 100_000) for idx in range(refill_event_count)]
+    refill_events = build_awg_sweep_events(
+        refill_freqs,
+        tick_hz=info.tick_hz,
+        dds_clock_hz=dds_clock_hz,
+        dds_phase_dw=dds_phase_dw,
+        tone=0,
+        scale_u=args.awg_sweep_scale_u or 700_000,
+        start_ticks=args.awg_sweep_start_ticks or 10_000,
+        dwell_us=args.scheduler_stream_dwell_us,
+    )
+    frame_events = max(1, args.scheduler_stream_frame_events)
+    refill_results = []
+    for frame_index, offset in enumerate(range(0, len(refill_events), frame_events)):
+        chunk = refill_events[offset : offset + frame_events]
+        refill_frame = pack_stream_frame(
+            chunk,
+            seq=seq,
+            open_stream=(frame_index == 0),
+            close_with_eof=(offset + frame_events >= len(refill_events)),
+        )
+        refill_results.append(send_awg_stream_frame_hex(uart, args, refill_frame))
+        seq += 1
+    refill_done = wait_awg_stream_done(
+        uart,
+        args,
+        timeout_s=max(
+            args.scheduler_stream_wait_timeout_s,
+            (refill_event_count * args.scheduler_stream_dwell_us / 1_000_000.0) + 10.0,
+        ),
+    )
+    if refill_done.stream_pushes < refill_done.commit_count:
+        raise RuntimeError(
+            "Stream counter drift: STREAM_PUSHES is below commit count "
+            f"({refill_done.stream_pushes} < {refill_done.commit_count})"
+        )
+
+    final_status = query_awg_stream_status(uart, args)
+    stream_counter_check = {
+        "stream_pushes_minus_commit": refill_done.stream_pushes - refill_done.commit_count,
+        "final_free_space": refill_done.free_space,
+        "final_occupancy": refill_done.occupancy,
+        "free_space_plus_occupancy": refill_done.free_space + refill_done.occupancy,
+        "stream_depth": refill_done.stream_depth,
+        "free_space_occupancy_matches_depth": (
+            refill_done.free_space + refill_done.occupancy == refill_done.stream_depth
+        ),
+    }
+    summary = {
+        "mode": "scheduler_stream_bringup",
+        "transport_manifest": build_scheduler_transport_manifest(args),
+        "console_info_initial": asdict(info),
+        "dds_clock_hz_used": dds_clock_hz,
+        "dds_phase_dw_used": dds_phase_dw,
+        "initial_status": asdict(initial_status),
+        "after_reset": asdict(after_reset),
+        "bad_crc": {
+            "before": asdict(before_bad_crc),
+            "result": bad_crc_result,
+            "after": asdict(after_bad_crc),
+            "counter_unchanged": after_bad_crc.stream_pushes == before_bad_crc.stream_pushes,
+        },
+        "after_bad_crc_reset": asdict(after_bad_crc_reset),
+        "finite_eof": {
+            "events_requested": len(finite_events),
+            "result": finite_result,
+            "done_status": asdict(finite_done),
+        },
+        "after_finite_reset": asdict(after_finite_reset),
+        "depth_plus_refill": {
+            "events_requested": len(refill_events),
+            "frame_events": frame_events,
+            "frames": refill_results,
+            "done_status": asdict(refill_done),
+            "counter_check": stream_counter_check,
+        },
+        "final_status": asdict(final_status),
+        "uart_log": str(console_log.file_path.resolve()),
+    }
+    summary_path = output_dir / "scheduler_stream_bringup.json"
+    summary_path.write_text(json.dumps(summary, indent=2, default=json_default) + "\n", encoding="utf-8")
+    return summary
+
+
 def run_scheduler_benchmark_suite_mode(args: argparse.Namespace) -> int:
     script_dir = Path(__file__).resolve().parent
     output_dir = Path(args.output_dir) if args.output_dir else script_dir / "capture_runs" / utc_timestamp()
@@ -3351,15 +3793,18 @@ def run_scheduler_benchmark_suite_mode(args: argparse.Namespace) -> int:
     uart = None
     analyzer = None
     try:
-        analyzer = RohdeSchwarzFSH(args.visa_resource, args.visa_backend, args.analyzer_timeout)
-        print(f"[HOST] Analyzer connected: {analyzer.idn}")
-        if args.analyzer_preset != "off":
-            print(f"[HOST] Applying analyzer preset: {args.analyzer_preset}")
-            analyzer.apply_preset(args.analyzer_preset)
-            print("[HOST] Analyzer preset complete.")
+        analyzer_settings = None
+        sfdr_settings = None
+        if args.scheduler_suite_profile != "stream-bringup":
+            analyzer = RohdeSchwarzFSH(args.visa_resource, args.visa_backend, args.analyzer_timeout)
+            print(f"[HOST] Analyzer connected: {analyzer.idn}")
+            if args.analyzer_preset != "off":
+                print(f"[HOST] Applying analyzer preset: {args.analyzer_preset}")
+                analyzer.apply_preset(args.analyzer_preset)
+                print("[HOST] Analyzer preset complete.")
 
-        analyzer_settings = build_awg_scheduler_analyzer_settings(build_analyzer_settings(args))
-        sfdr_settings = build_sfdr_settings(args)
+            analyzer_settings = build_awg_scheduler_analyzer_settings(build_analyzer_settings(args))
+            sfdr_settings = build_sfdr_settings(args)
         uart = UartCoordinator(
             port=args.serial_port,
             baudrate=args.baudrate,
@@ -3408,14 +3853,34 @@ def run_scheduler_benchmark_suite_mode(args: argparse.Namespace) -> int:
         suite_summary = {
             "mode": "scheduler_benchmark_suite",
             "profile": args.scheduler_suite_profile,
+            "transport": args.scheduler_transport,
+            "transport_manifest": build_scheduler_transport_manifest(args),
+            "transport_execution_note": (
+                "FSH dense/SFDR profiles remain preload-based; stream transport currently gates "
+                "the stream_bringup profile before RF profiles are switched."
+            ),
             "catalog_path": str((output_dir / "scheduler_benchmark_catalog.json").resolve()),
             "scope_plan_path": str((output_dir / "scheduler_scope_plan.json").resolve()),
             "console_info_initial": asdict(info),
+            "stream_bringup": None,
             "dense_sweep": None,
             "sfdr_spot_set": None,
         }
 
+        if args.scheduler_suite_profile == "stream-bringup" or (
+            args.scheduler_suite_profile == "all" and args.scheduler_transport in ("stream", "compare")
+        ):
+            suite_summary["stream_bringup"] = execute_scheduler_stream_bringup_suite(
+                uart=uart,
+                console_log=console_log,
+                args=args,
+                output_dir=output_dir / "stream_bringup",
+                info=info,
+            )
+
         if args.scheduler_suite_profile in ("dense", "fsh", "all"):
+            if analyzer is None or analyzer_settings is None:
+                raise RuntimeError("FSH scheduler suite requires analyzer setup")
             suite_summary["dense_sweep"] = execute_scheduler_dense_fsh_suite(
                 uart=uart,
                 console_log=console_log,
@@ -3427,6 +3892,8 @@ def run_scheduler_benchmark_suite_mode(args: argparse.Namespace) -> int:
             )
 
         if args.scheduler_suite_profile in ("sfdr", "fsh", "all"):
+            if analyzer is None or analyzer_settings is None or sfdr_settings is None:
+                raise RuntimeError("SFDR scheduler suite requires analyzer setup")
             suite_summary["sfdr_spot_set"] = execute_scheduler_sfdr_spot_suite(
                 uart=uart,
                 console_log=console_log,

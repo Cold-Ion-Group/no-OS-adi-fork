@@ -1,4 +1,4 @@
-# AWG Scheduler Contract (v2)
+# AWG Scheduler Contract (v3)
 
 This document is the software<->HDL contract for the AWG timed-control
 peripheral used by `projects/fmcdac/src/app/awg_sched.{h,c}`.
@@ -7,24 +7,26 @@ All registers are 32-bit, little-endian at the CPU AXI4-Lite interface. All
 offsets are byte addresses relative to the peripheral base address.
 
 The register constants live in
-`projects/fmcdac/src/app/awg_sched_regs.h`. When a register-generation flow is
-adopted, that header must be regenerated from the same source as the HDL
-localparams.
+`projects/fmcdac/src/app/awg_sched_regs.h`. That header is currently mirrored
+byte-for-byte from `hdl-adi-fork/projects/awg/common/awg_sched_regs.h`.
+
+The current KCU116 AWG image exposes the scheduler at `0x44AA0000`, reports
+`IP_ID = 0x41574753`, and reports `IP_VERSION = 0x00010000`.
 
 ## Register Map
 
 | Offset | Name             | Access | Description |
 |--------|------------------|--------|-------------|
-| 0x00   | CTRL             | W      | Control strobe register |
+| 0x00   | CTRL             | W/R    | Control strobe register plus IRQ gate readback |
 | 0x04   | STATUS           | R      | Status and error-code register |
-| 0x08   | EVT_COUNT        | RW     | Number of loaded events |
-| 0x0C   | CUR_EVT          | R      | Index of currently executing event |
+| 0x08   | EVENT_COUNT      | RW     | Legacy fixed-length event count |
+| 0x0C   | CUR_EVENT        | R      | Index of currently executing event |
 | 0x10   | ERR_REG          | R      | Latched hardware error code |
 | 0x14   | IP_ID            | R      | IP magic word (`0x41574753`, `'AWGS'`) |
-| 0x18   | IP_VERSION       | R      | Major[31:16] / Minor[15:0] |
+| 0x18   | IP_VERSION       | R      | ABI version (`0x00010000`) |
 | 0x1C   | IP_CAPS          | R      | Capability word |
-| 0x20   | TIME_LO          | R      | Tick counter [31:0] |
-| 0x24   | TIME_HI          | R      | Tick counter [63:32] |
+| 0x20   | TIME_NOW_LO      | R      | Tick counter [31:0] |
+| 0x24   | TIME_NOW_HI      | R      | Tick counter [63:32] |
 | 0x28   | LAST_EXEC_LO     | R      | Last-dispatched event tick [31:0] |
 | 0x2C   | LAST_EXEC_HI     | R      | Last-dispatched event tick [63:32] |
 | 0x30   | COMMIT_COUNT     | R      | Total events dispatched since reset |
@@ -45,6 +47,13 @@ localparams.
 | 0x6C   | TIME_RELOAD_LO   | W      | Epoch reload value low word |
 | 0x70   | TIME_RELOAD_HI   | W      | Epoch reload value high word |
 | 0x74   | TIME_RELOAD_CTRL | W      | Epoch reload control strobe |
+| 0x78   | STREAM_CTRL      | RW/W1C | Stream mode control and stream sticky flags |
+| 0x7C   | OCCUPANCY        | R      | Stream FIFO occupancy in events |
+| 0x80   | FREE_SPACE       | R      | Stream FIFO free space in events |
+| 0x84   | LOW_WMARK        | RW     | Low-watermark threshold in events |
+| 0x88   | STREAM_DEPTH     | R      | Stream FIFO capacity in events |
+| 0x8C   | STREAM_PUSHES    | R      | Accepted stream pushes since reset |
+| 0x90   | STREAM_STALLS    | R      | Scheduler cycles spent waiting on an empty stream FIFO |
 
 ## CTRL Register Bits
 
@@ -52,8 +61,9 @@ localparams.
 |-----|------------|-------------|
 | 0   | RUN        | Start sequence execution |
 | 1   | ARM        | Arm hardware trigger gate |
-| 2   | STOP_REQ   | Request graceful stop after current event |
+| 2   | STOP       | Stop or abort execution; does not flush stream FIFO |
 | 3   | RESET_SOFT | Pulse to clear state |
+| 8   | IRQ_ENABLE | Top-level interrupt gate |
 
 Firmware emits ARM and RUN as separate AXI writes with a status round-trip in
 between. That avoids simultaneous-edge races in implementations that sample the
@@ -71,13 +81,30 @@ reload before `RUN`.
 
 ## STATUS Register Bits
 
+The Phase A ABI header defines the low-byte state bits as:
+
 | Bits | Name    | Description |
 |------|---------|-------------|
-| 0    | armed   | Hardware trigger gate is armed |
-| 1    | running | Sequence is currently executing |
-| 2    | done    | Sequence has completed |
-| 3    | error   | Hardware error latched |
+| 0    | idle    | Engine is idle |
+| 1    | armed   | Hardware trigger gate is armed |
+| 2    | running | Sequence is currently executing |
+| 3    | done    | Sequence has completed |
+| 4    | error   | Hardware error latched |
 | 15:8 | err_code| Latched error code |
+
+Current FMCDAC firmware decodes both this Phase A layout and the older
+pre-stream status snapshot layout (`armed/running/done/error` in bits `0..3`).
+That compatibility shim is intentional until all loaded XSAs are known to emit
+only the Phase A layout.
+
+Error codes:
+
+| Code | Name |
+|------|------|
+| 0x00 | NONE |
+| 0x01 | MISSED_DEADLINE |
+| 0x02 | SPACING_VIOLATION |
+| 0x03 | REINIT_SPACING |
 
 ## IP_CAPS Register
 
@@ -92,12 +119,33 @@ reload before `RUN`.
 
 | Bit | Name             | Description |
 |-----|------------------|-------------|
-| 0   | done_irq         | Sequence-done interrupt |
-| 1   | error_irq        | Error interrupt |
-| 2   | spacing_viol_irq | Timing-violation interrupt |
+| 0   | DONE             | Sequence-done interrupt |
+| 1   | ERROR            | Hard scheduler error |
+| 2   | SPACING_VIOLATION| Timing-violation interrupt |
+| 3   | UNDERRUN         | Missed-deadline companion IRQ |
+| 4   | LOW_WATERMARK    | Stream FIFO crossed downward to low watermark |
+| 5   | EMPTY_STALL      | Stream engine entered empty wait |
 
 `awg_sched_wait_done()` supports an IRQ-driven wait path when
 `FMCDAC_AWG_SCHED_USE_IRQ` is enabled. Otherwise firmware uses polling.
+
+`LOW_WATERMARK` is edge-like. Firmware must also use opportunistic and periodic
+refill paths because the IRQ may not retrigger while occupancy remains below
+the programmed threshold.
+
+## STREAM_CTRL Bits
+
+| Bit | Name      | Description |
+|-----|-----------|-------------|
+| 0   | MODE      | `0` = legacy fixed preload, `1` = stream FIFO mode |
+| 1   | OVERFLOW  | Stream push overflow sticky flag; write 1 to clear |
+| 2   | EOF_SEEN  | Read-only sticky indication that an EOF event fired |
+
+`STREAM_CTRL.MODE` is captured at ARM. Firmware must stop or reset before
+changing between legacy and stream execution.
+
+`CTRL.RESET_SOFT` flushes the stream FIFO, clears stream counters/sticky flags,
+and is the required stream recovery path.
 
 ## Event Format (v1, 256 bits / 32 bytes)
 
@@ -113,11 +161,33 @@ reload before `RUN`.
 
 Compile-time ABI guards enforce the offsets and `sizeof(awg_event_v1_t)==32`.
 
+Defined event flags:
+
+| Bit | Name |
+|-----|------|
+| 0   | PHASE_REINIT |
+| 1   | EOF |
+
+EOF is meaningful in stream mode. The EOF event is applied normally; after it
+fires and is popped, the engine transitions to DONE and sets `EOF_SEEN`.
+
 ## Event Write Sequence
+
+Legacy preload sequence:
 
 1. Write `EVT_WADDR = <index>`.
 2. Write `EVT_WDATA0..6`.
 3. Write `EVT_WCTRL = 1`.
+4. Write `EVENT_COUNT`.
+5. Arm and run with `STREAM_CTRL.MODE = 0`.
+
+Stream sequence:
+
+1. Set `STREAM_CTRL.MODE = 1` before ARM.
+2. Check `FREE_SPACE`.
+3. Write `EVT_WDATA0..6`.
+4. Write `EVT_WCTRL = 1`.
+5. Check `STREAM_CTRL.OVERFLOW`; if set, the event was refused.
 
 The current HDL does not expose an AXI-visible event-write acknowledge. Host
 and firmware therefore pace back-to-back commits conservatively during bring-up
@@ -148,11 +218,15 @@ maps as:
 `awg_sched_config()` performs an identity check before issuing soft reset:
 
 1. read `IP_ID`; fail with `-ENODEV` if not `'AWGS'`
-2. read `IP_VERSION`; fail with `-ENOTSUP` on major mismatch
+2. read `IP_VERSION`; fail with `-ENOTSUP` if not `0x00010000`
 3. read `IP_CAPS`; store event depth / payload bits / timestamp bits
 
 That lets firmware detect a mismatched or absent bitstream before touching the
 rest of the block.
+
+`awg_sched_stream_open()` repeats the `IP_ID` / `IP_VERSION` check and reads
+`STREAM_DEPTH`, because stream FIFO depth is not derived from legacy
+`IP_CAPS`.
 
 ## tick_hz
 
@@ -183,6 +257,49 @@ Expected console sequence:
 4. `[AWG-UART] LOADBIN COMMIT BEGIN ...`
 5. `[AWG-UART] LOADBIN OK ...`
 
+That console remains the active bench path for uploaded FSH scheduler sweeps
+and the preload side of the scheduler-native benchmark suite.
+
+The stream-mode parser now exists separately in
+`projects/fmcdac/src/app/awg_stream_proto.{c,h}`. Its frame format is:
+
+```text
+u32 magic      // 0x53415747
+u32 seq
+u16 n_events
+u16 flags      // bit0=open, bit1=close_with_eof
+awg_event_v1_t events[n_events]
+u32 crc32_ieee
+```
+
+Its ACK format is:
+
+```text
+u32 magic
+u32 seq_acked
+u32 ddr_free_events
+u32 status
+```
+
+The no-OS application also exposes a conservative UARTLite ASCII-hex stream
+smoke transport when built with `FMCDAC_AWG_SCHED_STREAM=1`:
+
+```text
+STREAMHEX <byte_count>
+<2 * byte_count ASCII hex characters>
+```
+
+The response is a machine-parsable line carrying the ACK fields plus firmware
+return code and frame metadata:
+
+```text
+[AWG-STREAM] ACK magic=0x53415747 seq=<n> ddr_free=<events> status=<code> ret=<ret> bytes=<frame_bytes> events=<n_events> flags=0x....
+```
+
+This is a correctness transport only. At `115200` baud, ASCII-hex stream mode
+is expected to sustain roughly `100-150 events/s`; dense throughput testing is
+deferred to UART16550 or Ethernet.
+
 ## Host Measured-AWG Policy
 
 The uploaded AWG path supports two host-side validation modes:
@@ -201,7 +318,7 @@ pre-run work such as link checks, DAC/GPIO setup, `set_nco`, and epoch reload.
 
 ## Event Depth Limitation
 
-The current KCU116 image reports `max_events=64`.
+The legacy fixed-length KCU116 image path reports `max_events=64`.
 
 That is enough for short deterministic sequences and coarse stepped sweeps, but
 not for dense one-shot benches such as `200-300 MHz` in `10 kHz` steps
@@ -209,7 +326,14 @@ not for dense one-shot benches such as `200-300 MHz` in `10 kHz` steps
 
 1. host-side batching across multiple scheduler runs
 2. a larger HDL event RAM
-3. or a future streamed / DMA-backed scheduler architecture
+3. or the new stream FIFO path after a byte transport and bench smoke are
+   added
+
+The stream-mode HDL FIFO exists in the Phase A image, and Phase B firmware can
+stage events in DDR and refill the HDL FIFO through AXI-Lite event pushes. The
+host now has a `stream-bringup` profile for parser/refill/EOF/reset smoke
+testing. FSH dense/SFDR profiles still use preload until that stream bring-up
+path is bench-validated.
 
 ## Artifact Dump
 
@@ -221,6 +345,7 @@ prefixed `[SCHED-ARTIFACT]`:
 [SCHED-ARTIFACT] event idx=0 ts=0x00000000_000003E8 ch=0 fl=0x0001 p0=0x00010000 p1=... p2=... p3=...
 [SCHED-ARTIFACT] status armed=1 running=0 done=1 error=0 err_code=0x00 current=4 loaded=4 commit=4 reinit=0 reinit_reject=0 irq=0x00000001
 [SCHED-ARTIFACT] time_now=0x00000000_00001388 last_exec=0x00000000_00000FA0
+[SCHED-ARTIFACT] stream depth=511 low_wmark=127 ctrl=0x00000005 occupancy=0 free_space=511 pushes=4 stalls=0 irq=0x00000001 err=0x00000000
 ```
 
 Current host policy treats `error=0` plus `commit_count >= loaded_events` as a
@@ -235,4 +360,12 @@ HDL, not an execution failure.
 
 ```sh
 make -C projects/fmcdac/tests run
+```
+
+On the current Windows host, plain `gcc` may be unavailable. The firmware was
+also build-checked with MicroBlaze GCC and full project links:
+
+```powershell
+make -C projects\fmcdac build SKIP_MANIFEST=1
+make -C projects\fmcdac build SKIP_MANIFEST=1 NEW_CFLAGS=-DFMCDAC_AWG_SCHED_STREAM=1
 ```

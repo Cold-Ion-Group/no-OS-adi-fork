@@ -7,13 +7,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from awg_sched_host import (
     AWG_EVENT_V1_SIZE,
     AWG_SCHED_FLAG_PHASE_REINIT,
+    AWG_STREAM_PROTO_MAGIC,
+    AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF,
+    AWG_STREAM_PROTO_FLAG_OPEN,
     AwgSchedEvent,
     build_awg_sweep_events,
     build_uniform_freq_list,
     pack_events,
+    pack_stream_frame,
     pack_awg_payload_v1,
     parse_info_line,
     parse_last_artifact_block,
+    parse_stream_ack_line,
+    parse_stream_status_line,
+    stream_crc32_ieee,
 )
 from run_nco_scope_test import build_scheduler_batch_specs, chunk_sequence
 
@@ -76,6 +83,60 @@ class AwgSchedHostTest(unittest.TestCase):
         self.assertTrue(artifact.status.done)
         self.assertEqual(artifact.status.commit_count, 1)
         self.assertIsNotNone(artifact.time)
+
+    def test_parse_stream_artifact_line(self) -> None:
+        text = "\n".join(
+            [
+                "[AWG-UART] ARTIFACT_BEGIN",
+                "[SCHED-ARTIFACT] stream depth=511 low_wmark=127 ctrl=0x00000005 occupancy=0 free_space=511 pushes=12 stalls=3 irq=0x00000011 err=0x00000000",
+                "[AWG-UART] ARTIFACT_END",
+            ]
+        )
+        artifact = parse_last_artifact_block(text)
+        self.assertIsNotNone(artifact.stream)
+        self.assertEqual(artifact.stream.stream_depth, 511)
+        self.assertEqual(artifact.stream.stream_pushes, 12)
+
+    def test_pack_stream_frame_crc(self) -> None:
+        event = AwgSchedEvent(
+            timestamp_ticks=1000,
+            channel=0,
+            flags=AWG_SCHED_FLAG_PHASE_REINIT,
+            payload_word0=0x12345678,
+            payload_word1=0,
+            payload_word2=0,
+            payload_word3=0,
+        )
+        frame = pack_stream_frame([event], seq=7, open_stream=True, close_with_eof=True)
+        self.assertEqual(len(frame), 12 + AWG_EVENT_V1_SIZE + 4)
+        self.assertEqual(int.from_bytes(frame[0:4], "little"), AWG_STREAM_PROTO_MAGIC)
+        self.assertEqual(int.from_bytes(frame[4:8], "little"), 7)
+        self.assertEqual(int.from_bytes(frame[8:10], "little"), 1)
+        flags = int.from_bytes(frame[10:12], "little")
+        self.assertEqual(flags, AWG_STREAM_PROTO_FLAG_OPEN | AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF)
+        self.assertEqual(
+            int.from_bytes(frame[-4:], "little"),
+            stream_crc32_ieee(frame[:-4]),
+        )
+
+    def test_parse_stream_ack_line(self) -> None:
+        ack = parse_stream_ack_line(
+            "[AWG-STREAM] ACK magic=0x53415747 seq=3 ddr_free=4096 status=0 ret=0 bytes=48 events=1 flags=0x0003"
+        )
+        self.assertEqual(ack.magic, AWG_STREAM_PROTO_MAGIC)
+        self.assertEqual(ack.seq_acked, 3)
+        self.assertEqual(ack.status_name, "ok")
+
+    def test_parse_stream_status_line(self) -> None:
+        status = parse_stream_status_line(
+            "[AWG-STREAM] STATUS tag=status ip_id=0x41574753 ip_version=0x00010000 "
+            "stream_depth=511 low_wmark=127 stream_ctrl=0x00000005 occupancy=0 free_space=511 "
+            "stream_pushes=12 stream_stalls=1 commit=12 err=0x00000000 irq=0x00000011 "
+            "hw_status=0x00000008 mode=1 overflow=0 eof_seen=1 running=0 done=1 error=0"
+        )
+        self.assertEqual(status.stream_depth, 511)
+        self.assertTrue(status.done)
+        self.assertTrue(status.eof_seen)
 
     def test_pack_awg_payload_v1_32bit(self) -> None:
         word0, word1, word2, word3 = pack_awg_payload_v1(

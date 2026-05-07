@@ -286,6 +286,7 @@ void awg_sched_stream_irq_handler(uint32_t irq_status);
 uint32_t awg_sched_stream_ddr_free_events(void);
 uint32_t awg_sched_stream_poll_interval_us(void);
 int awg_sched_stream_get_error_snapshot(awg_sched_stream_snapshot_t *snapshot);
+int awg_sched_stream_reset_soft(void);
 
 #ifdef __cplusplus
 }

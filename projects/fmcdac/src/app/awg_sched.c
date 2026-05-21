@@ -1191,6 +1191,7 @@ static int awg_stream_start_if_needed(void)
 {
 	awg_sched_status_t status;
 	uint32_t wait_us;
+	uint32_t attempt;
 	int ret;
 
 	if (g_awg_stream.started)
@@ -1214,23 +1215,44 @@ static int awg_stream_start_if_needed(void)
 	if (!(status.armed && !status.running))
 		return -ETIMEDOUT;
 
-	ret = awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_RUN);
-	if (ret)
-		return ret;
-
-	for (wait_us = 0U; wait_us < AWG_SCHED_START_RUN_WAIT_US; wait_us++) {
-		ret = awg_sched_get_status(&status);
+	for (attempt = 0U; attempt < AWG_SCHED_START_RUN_RETRIES; attempt++) {
+		ret = awg_sched_reg_write(AWG_SCHED_REG_CTRL, AWG_SCHED_CTRL_RUN);
 		if (ret)
 			return ret;
 
-		if (status.running || status.done || status.error) {
-			g_awg_stream.started = true;
-			return status.error ? -EIO : 0;
-		}
+		for (wait_us = 0U; wait_us < AWG_SCHED_START_RUN_WAIT_US; wait_us++) {
+			ret = awg_sched_get_status(&status);
+			if (ret)
+				return ret;
 
-		no_os_udelay(1U);
+			if (status.running || status.done || status.error) {
+				g_awg_stream.started = true;
+				return status.error ? -EIO : 0;
+			}
+
+			no_os_udelay(1U);
+		}
 	}
 
+	/*
+	 * In stream mode with future timestamps, some HDL revisions remain in an
+	 * armed/waiting state until the first event becomes due.  RUN has been
+	 * strobed; treat armed-without-error as accepted and let later status
+	 * polling surface missed deadlines or hard errors.
+	 */
+	if (status.armed && !status.error) {
+		AWG_LOG("[AWG-STREAM] start accepted pending timestamp status=0x%08lX current=%lu commit=%lu\n\r",
+			(unsigned long)status.hw_status_word,
+			(unsigned long)status.current_event,
+			(unsigned long)status.commit_count);
+		g_awg_stream.started = true;
+		return 0;
+	}
+
+	AWG_LOG("[AWG-STREAM] start failed status=0x%08lX current=%lu commit=%lu\n\r",
+		(unsigned long)status.hw_status_word,
+		(unsigned long)status.current_event,
+		(unsigned long)status.commit_count);
 	return -ETIMEDOUT;
 }
 

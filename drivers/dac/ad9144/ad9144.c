@@ -452,29 +452,53 @@ static int32_t ad9144_pll_setup(struct ad9144_dev *dev,
 
 	ret = ad9144_wait_dacpll_lock(dev, 100, &pll_status);
 	if (ret == -1) {
-		uint8_t ldiv = 0, refdiv = 0, bcnt = 0, pll_cntrl = 0;
+		uint8_t pwr = 0, clkcfg = 0, ldiv = 0, refdiv = 0, bcnt = 0;
+		uint8_t pll_cntrl = 0, lf1 = 0, lf2 = 0, lf3 = 0, cp = 0;
+		uint8_t t5 = 0, tb = 0, td = 0, t17 = 0, t18 = 0;
+		uint8_t clk_test = 0, aspi_clksrc = 0;
+		ad9144_spi_read(dev, REG_PWRCNTRL0, &pwr);
+		ad9144_spi_read(dev, REG_CLKCFG0, &clkcfg);
 		ad9144_spi_read(dev, REG_DACLOGENCNTRL, &ldiv);
 		ad9144_spi_read(dev, REG_DACLDOCNTRL1, &refdiv);
 		ad9144_spi_read(dev, REG_DACINTEGERWORD0, &bcnt);
 		ad9144_spi_read(dev, REG_DACPLLCNTRL, &pll_cntrl);
+		ad9144_spi_read(dev, REG_DACLOOPFILT1, &lf1);
+		ad9144_spi_read(dev, REG_DACLOOPFILT2, &lf2);
+		ad9144_spi_read(dev, REG_DACLOOPFILT3, &lf3);
+		ad9144_spi_read(dev, REG_DACCPCNTRL, &cp);
+		ad9144_spi_read(dev, REG_DACPLLT5, &t5);
+		ad9144_spi_read(dev, REG_DACPLLTB, &tb);
+		ad9144_spi_read(dev, REG_DACPLLTD, &td);
+		ad9144_spi_read(dev, REG_DACPLLT17, &t17);
+		ad9144_spi_read(dev, REG_DACPLLT18, &t18);
+		ad9144_spi_read(dev, REG_CLK_TEST, &clk_test);
+		ad9144_spi_read(dev, REG_ASPI_CLKSRC, &aspi_clksrc);
 		printf("%s : DAC PLL NOT locked! status=0x%02X (cal_valid=%u lock=%u lock_alt=%u over_lo=%u over_hi=%u) lo_div=0x%02X ref_div=0x%02X bcount=0x%02X ctrl=0x%02X\n",
 		       __func__, pll_status, !!(pll_status & 0x20),
 		       !!(pll_status & 0x02), !!(pll_status & 0x10),
 		       !!(pll_status & 0x40),
 		       !!(pll_status & 0x80), ldiv, refdiv, bcnt, pll_cntrl);
-		if (pll_status & 0xC0) {
-			/* If calibration hit band edge, try a re-calibration */
-			ad9144_spi_write(dev, REG_DACPLLCNTRL, 0x10);
-			no_os_mdelay(1);
-			ad9144_spi_write(dev, REG_DACPLLCNTRL, 0x90);
-			no_os_mdelay(5);
-			ret = ad9144_wait_dacpll_lock(dev, 100, &pll_status);
-			if (ret == -1) {
-				printf("%s : DAC PLL re-cal failed, status=0x%02X (cal_valid=%u lock=%u lock_alt=%u over_lo=%u over_hi=%u)\n",
-				       __func__, pll_status, !!(pll_status & 0x20),
-				       !!(pll_status & 0x02), !!(pll_status & 0x10),
-				       !!(pll_status & 0x40), !!(pll_status & 0x80));
-			}
+		printf("[AD9144][PLL-DIAG] pwr=0x%02X clkcfg=0x%02X lf={0x%02X,0x%02X,0x%02X} cp=0x%02X pll_t={t5=0x%02X tb=0x%02X td=0x%02X t17=0x%02X t18=0x%02X} clk_test=0x%02X aspi_clksrc=0x%02X\n",
+		       pwr, clkcfg, lf1, lf2, lf3, cp, t5, tb, td, t17, t18,
+		       clk_test, aspi_clksrc);
+
+		/* Pulse DAC PLL calibration even when status is 0x00. Some failures
+		 * do not report band-edge bits but still recover on explicit re-cal. */
+		printf("%s : forcing DAC PLL re-calibration after lock failure\n",
+		       __func__);
+		ad9144_spi_write(dev, REG_DACPLLCNTRL, 0x10);
+		no_os_mdelay(1);
+		ad9144_spi_write(dev, REG_DACPLLCNTRL, 0x90);
+		no_os_mdelay(10);
+		ret = ad9144_wait_dacpll_lock(dev, 250, &pll_status);
+		if (ret == -1) {
+			ad9144_spi_read(dev, REG_DACPLLCNTRL, &pll_cntrl);
+			ad9144_spi_read(dev, REG_DACPLLSTATUS, &pll_status);
+			printf("%s : DAC PLL re-cal failed, status=0x%02X (cal_valid=%u lock=%u lock_alt=%u over_lo=%u over_hi=%u) ctrl=0x%02X\n",
+			       __func__, pll_status, !!(pll_status & 0x20),
+			       !!(pll_status & 0x02), !!(pll_status & 0x10),
+			       !!(pll_status & 0x40), !!(pll_status & 0x80),
+			       pll_cntrl);
 		}
 
 	}

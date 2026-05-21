@@ -93,7 +93,7 @@ static enum fmcdac_clock_mode g_clk_mode = FMCDAC_CLK_DISTRIBUTE;
 #endif
 
 #ifndef FMCDAC_AWG_SCHED_TICK_HZ
-#define FMCDAC_AWG_SCHED_TICK_HZ 100000000U
+#define FMCDAC_AWG_SCHED_TICK_HZ 245760000U
 #endif
 
 #ifndef FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS
@@ -395,6 +395,8 @@ static void fmcdac_hold_for_probe(const char *reason);
 static void fmcdac_ad9516_signature_toggle(struct fmcdac_dev *dev);
 static void fmcdac_ad9144_jesd_sanity(struct ad9144_dev *dev,
 				      const struct ad9144_init_param *init_param);
+static void fmcdac_ad9144_pll_failure_dump(struct fmcdac_dev *dev,
+					   const char *tag);
 static void fmcdac_sysref_verify(struct fmcdac_dev *dev);
 static void fmcdac_sysref_snapshot(struct fmcdac_dev *dev, const char *tag);
 static int fmcdac_sysref_tune(struct fmcdac_dev *dev);
@@ -1217,6 +1219,79 @@ static void fmcdac_ad9516_dump_regs(struct ad9516_dev *dev)
 	}
 }
 
+static void fmcdac_ad9144_pll_failure_dump(struct fmcdac_dev *dev,
+					   const char *tag)
+{
+	const struct {
+		uint16_t reg;
+		const char *name;
+	} dac_regs[] = {
+		{ REG_PWRCNTRL0, "PWRCNTRL0" },
+		{ REG_CLKCFG0, "CLKCFG0" },
+		{ REG_DACPLLCNTRL, "DACPLLCNTRL" },
+		{ REG_DACPLLSTATUS, "DACPLLSTATUS" },
+		{ REG_DACINTEGERWORD0, "DACINTEGERWORD0" },
+		{ REG_DACLOOPFILT1, "DACLOOPFILT1" },
+		{ REG_DACLOOPFILT2, "DACLOOPFILT2" },
+		{ REG_DACLOOPFILT3, "DACLOOPFILT3" },
+		{ REG_DACCPCNTRL, "DACCPCNTRL" },
+		{ REG_DACLOGENCNTRL, "DACLOGENCNTRL" },
+		{ REG_DACLDOCNTRL1, "DACLDOCNTRL1" },
+		{ REG_DACPLLT5, "DACPLLT5" },
+		{ REG_DACPLLTB, "DACPLLTB" },
+		{ REG_DACPLLTD, "DACPLLTD" },
+		{ REG_DACPLLT17, "DACPLLT17" },
+		{ REG_DACPLLT18, "DACPLLT18" },
+		{ REG_CLK_TEST, "CLK_TEST" },
+		{ REG_ASPI_CLKSRC, "ASPI_CLKSRC" },
+	};
+	const struct {
+		uint32_t reg;
+		const char *name;
+	} clk_regs[] = {
+		{ AD9516_REG_PLL_READBACK, "PLL_RB" },
+		{ AD9516_REG_INPUT_CLKS, "INPUT_CLKS" },
+		{ AD9516_REG_LVPECL_OUT1, "OUT1" },
+		{ AD9516_REG_LVDS_CMOS_OUT6, "OUT6" },
+		{ AD9516_REG_LVDS_CMOS_OUT7, "OUT7" },
+		{ AD9516_REG_LVDS_CMOS_OUT9, "OUT9" },
+		{ AD9516_REG_LVDS_CMOS_DIVIDER_3_3, "DIV3_3" },
+		{ AD9516_REG_LVDS_CMOS_DIVIDER_4_3, "DIV4_3" },
+	};
+	uint32_t i;
+
+	xil_printf("[DACPLL-DIAG] tag=%s rate_option=%lu clk_mode=%lu\n\r",
+		   tag ? tag : "unknown",
+		   (unsigned long)FMCDAC_DEFAULT_RATE_OPTION,
+		   (unsigned long)g_clk_mode);
+
+	if (dev && dev->ad9144_device) {
+		for (i = 0; i < NO_OS_ARRAY_SIZE(dac_regs); i++) {
+			uint8_t val = 0;
+			int ret = ad9144_spi_read(dev->ad9144_device,
+						  dac_regs[i].reg, &val);
+			xil_printf("[DACPLL-DIAG] AD9144 %s(0x%03lX)=%s0x%02X\n\r",
+				   dac_regs[i].name,
+				   (unsigned long)dac_regs[i].reg,
+				   ret ? "ERR:" : "",
+				   val);
+		}
+	}
+
+	if (dev && dev->ad9516_dev) {
+		for (i = 0; i < NO_OS_ARRAY_SIZE(clk_regs); i++) {
+			uint32_t val = 0;
+			int ret = ad9516_read(dev->ad9516_dev,
+					      clk_regs[i].reg, &val);
+			xil_printf("[DACPLL-DIAG] AD9516 %s(0x%04lX)=%s0x%02lX\n\r",
+				   clk_regs[i].name,
+				   (unsigned long)(clk_regs[i].reg & 0xFFFF),
+				   ret ? "ERR:" : "",
+				   (unsigned long)val);
+		}
+	}
+}
+
 static void fmcdac_apply_clock_mode(struct ad9144_init_param *p_ad9144_param,
 				    struct ad9516_platform_data *p_ad9516_param)
 {
@@ -1378,6 +1453,7 @@ static int fmcdac_hex_nibble_value(int c)
 static int fmcdac_read_exact_hex(uint8_t *buf, size_t len)
 {
 	size_t pos = 0;
+	size_t nibble_count = 0;
 	int c;
 	int hi_nibble = -1;
 
@@ -1385,16 +1461,20 @@ static int fmcdac_read_exact_hex(uint8_t *buf, size_t len)
 		return -1;
 
 	while (pos < len) {
-		fmcdac_awg_stream_poll();
 		c = getc(stdin);
-		if (c == EOF)
+		if (c == EOF) {
+			fmcdac_awg_stream_poll();
 			continue;
+		}
 		if (c == '\r' || c == '\n' || c == ' ' || c == '\t')
 			continue;
 
 		c = fmcdac_hex_nibble_value(c);
 		if (c < 0)
 			return -1;
+		nibble_count++;
+		if ((nibble_count & 0x3FU) == 0U)
+			fmcdac_awg_stream_poll();
 
 		if (hi_nibble < 0) {
 			hi_nibble = c;
@@ -3699,6 +3779,24 @@ static int fmcdac_awg_stream_console_streamhex(struct fmcdac_dev *dev,
 					    frame_bytes,
 					    &stream_cfg,
 					    &ack);
+	if (ret != 0) {
+		awg_sched_stream_snapshot_t snapshot;
+
+		if (awg_sched_stream_get_error_snapshot(&snapshot) == 0) {
+			xil_printf("[AWG-STREAM] ERROR_SNAPSHOT ret=%d status=0x%08lX "
+				   "err=0x%08lX irq=0x%08lX occupancy=%lu free_space=%lu "
+				   "stream_ctrl=0x%08lX pushes=%lu stalls=%lu\n\r",
+				   ret,
+				   (unsigned long)snapshot.status,
+				   (unsigned long)snapshot.err_reg,
+				   (unsigned long)snapshot.irq_status,
+				   (unsigned long)snapshot.occupancy,
+				   (unsigned long)snapshot.free_space,
+				   (unsigned long)snapshot.stream_ctrl,
+				   (unsigned long)snapshot.stream_pushes,
+				   (unsigned long)snapshot.stream_stalls);
+		}
+	}
 	fmcdac_awg_stream_console_emit_ack(&ack, ret, frame_bytes,
 					   n_events, flags);
 	return ret;
@@ -3936,9 +4034,30 @@ static int fmcdac_awg_sched_console_status(void)
 	return 0;
 }
 
+static uint32_t fmcdac_awg_sched_console_run_timeout_ms(void)
+{
+	uint64_t last_timestamp = 0U;
+	uint64_t timeout_ms;
+	uint32_t i;
+
+	for (i = 0U; i < g_fmcdac_sched_console_loaded_count; i++) {
+		if (g_fmcdac_sched_console_events[i].timestamp_ticks > last_timestamp)
+			last_timestamp = g_fmcdac_sched_console_events[i].timestamp_ticks;
+	}
+
+	timeout_ms = ((last_timestamp * 1000ULL) / FMCDAC_AWG_SCHED_TICK_HZ) + 2000ULL;
+	if (timeout_ms < FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS)
+		timeout_ms = FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS;
+	if (timeout_ms > UINT32_MAX)
+		timeout_ms = UINT32_MAX;
+
+	return (uint32_t)timeout_ms;
+}
+
 static int fmcdac_awg_sched_console_run(struct fmcdac_dev *dev)
 {
 	awg_sched_status_t status;
+	uint32_t timeout_ms;
 	int ret;
 
 	if (!g_fmcdac_sched_console_configured) {
@@ -3981,14 +4100,16 @@ static int fmcdac_awg_sched_console_run(struct fmcdac_dev *dev)
 		return ret;
 	}
 
-	ret = awg_sched_wait_done(FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS, &status);
+	timeout_ms = fmcdac_awg_sched_console_run_timeout_ms();
+	ret = awg_sched_wait_done(timeout_ms, &status);
 	if (ret != 0) {
 		(void)awg_sched_get_status(&status);
 		fmcdac_awg_sched_console_dump(&status);
-		xil_printf("[AWG-UART] ERROR reason=wait_done_failed status=%d "
+		xil_printf("[AWG-UART] ERROR reason=wait_done_failed status=%d timeout_ms=%lu "
 			   "err_code=0x%02lX current=%lu loaded=%lu commit=%lu "
 			   "reinit=%lu reinit_reject=%lu irq=0x%08lX hw_status=0x%08lX\n\r",
 			   ret,
+			   (unsigned long)timeout_ms,
 			   (unsigned long)status.err_code,
 			   (unsigned long)status.current_event,
 			   (unsigned long)status.loaded_events,
@@ -5197,8 +5318,19 @@ static int fmcdac_setup(struct fmcdac_dev *dev,
 	xil_printf("[SETUP] Configuring AD9144 (legacy mode)...\n\r");
 	status = ad9144_setup_legacy(&dev->ad9144_device, &dev_init->ad9144_param);
 	if (status != 0) {
-		xil_printf("error: ad9144_setup_legacy() failed\n");
-		return status;
+		fmcdac_ad9144_pll_failure_dump(dev, "first_fail");
+		xil_printf("[WARN] ad9144_setup_legacy() failed (%d); toggling DAC reset and retrying once\n\r",
+			   status);
+		no_os_gpio_set_value(dev->gpio_dac_reset, NO_OS_GPIO_LOW);
+		no_os_mdelay(10);
+		no_os_gpio_set_value(dev->gpio_dac_reset, NO_OS_GPIO_HIGH);
+		no_os_mdelay(100);
+		status = ad9144_setup_legacy(&dev->ad9144_device, &dev_init->ad9144_param);
+		if (status != 0) {
+			fmcdac_ad9144_pll_failure_dump(dev, "retry_fail");
+			xil_printf("error: ad9144_setup_legacy() failed\n");
+			return status;
+		}
 	}
 	fmcdac_ad9144_jesd_sanity(dev->ad9144_device, &dev_init->ad9144_param);
 	

@@ -1,6 +1,6 @@
 # Scheduler Handoff Status
 
-Date: 2026-05-07
+Date: 2026-05-20
 
 ## Purpose
 
@@ -16,6 +16,27 @@ It answers five questions:
 3. what the latest archived runs prove
 4. what remains implemented-but-unvalidated versus blocked
 5. what the next engineering tasks are
+
+## Current Update Snapshot
+
+The previous handoff archived `manual_awg_run` as the first scheduler-native
+evidence. The current status has advanced:
+
+1. The active scheduler tick rate is `245760000`, not the older `100000000`
+   value shown in early artifacts.
+2. UARTLite stream bring-up is now bench-smoked for correctness:
+   `STREAM_DEPTH=511`, bad CRC rejected, one-event EOF completes, and a
+   32-event refill run reaches `STREAM_PUSHES=32` and `commit=32`.
+3. FSH8 full-sweep `maxhold` is implemented but not accepted as RF evidence on
+   the current FSH8 `V1.58` unit. Trace export fails and marker fallback can
+   read flat floor values; the host marks these bins
+   `marker_flatline_untrusted`.
+4. The current accepted scheduler RF coverage smoke is preload/per-step FSH:
+   `200-210 MHz @ 1 MHz`, `10 s` dwell, `scale_u=1200000`,
+   `RBW/VBW=10 kHz`, FSH preamp on, and enforced RF quality with relaxed
+   peak-vs-marker delta. Result: `loaded=11`, `commit=11`, `done=1`,
+   `error=0`, `rf_quality.passed=true`, max frequency error about `495 kHz`,
+   flatness about `2.98 dB`, and max peak-vs-marker delta about `9.85 dB`.
 
 ## Final Intended Outcome
 
@@ -95,7 +116,7 @@ hardware.
 The active image reports:
 
 1. `max_events = 64`
-2. `tick_hz = 100000000`
+2. `tick_hz = 245760000`
 
 As a result, dense sweeps such as `200 MHz` to `300 MHz` in `10 kHz` steps do
 not fit in one hardware preload table. Today they still require host-side
@@ -128,6 +149,19 @@ This handoff uses these archived runs as the latest concrete evidence:
    - [scheduler_benchmark_suite.json](/C:/Users/fpga_/yr/tmp/no-OS-adi-fork/projects/fmcdac/capture_runs/manual_awg_run/scheduler_benchmark_suite.json)
    - [scheduler_dense_sweep.json](/C:/Users/fpga_/yr/tmp/no-OS-adi-fork/projects/fmcdac/capture_runs/manual_awg_run/dense_sweep/scheduler_dense_sweep.json)
    - [scheduler_sfdr_spot_set.json](/C:/Users/fpga_/yr/tmp/no-OS-adi-fork/projects/fmcdac/capture_runs/manual_awg_run/sfdr_spots/scheduler_sfdr_spot_set.json)
+3. stream correctness smoke:
+   - [scheduler_benchmark_suite.json](../capture_runs/stream_bringup/scheduler_benchmark_suite.json)
+4. current accepted preload/per-step RF smoke:
+   - [scheduler_benchmark_suite.json](../capture_runs/fsh_scheduler_preload_perstep_200_210_rf_enforced/scheduler_benchmark_suite.json)
+5. RF power correction support:
+   - host accepts `--rf-power-correction-db` and
+     `--rf-power-calibration-csv`
+   - artifacts preserve raw analyzer dBm and add corrected power fields when
+     correction is enabled
+6. finite stream-backed per-step dense FSH host path:
+   - implemented for `--scheduler-transport stream`
+   - next required bench result is comparison against the accepted preload
+     `200-210 MHz` smoke
 
 ### 1. Legacy dense DDS run: `matrix12_dense_dds_sparse_sfdr_phase`
 
@@ -159,14 +193,17 @@ What it does not prove:
 1. it does not validate the scheduler path
 2. it does not validate deterministic scheduler-driven event timing
 3. it does not remove host command overhead from the dense sweep mechanism
+4. it is not an absolute-power calibrated artifact unless an RF path correction
+   table and analyzer level check are attached
 
 This run is therefore best treated as the legacy RF characterization baseline,
 not as evidence that the scheduler mission is complete.
 
 ### 2. Scheduler-native run: `manual_awg_run`
 
-This is the latest scheduler-native benchmark archive and the best current
-evidence for the new path.
+This is the first scheduler-native benchmark archive. It remains useful
+history, but it has been superseded by the later stream smoke and enforced
+preload/per-step RF smoke described in the update snapshot above.
 
 Top-level configuration:
 
@@ -175,7 +212,8 @@ Top-level configuration:
 3. scheduler console info:
    - `base_addr = 0x44AA0000`
    - `max_events = 64`
-   - `tick_hz = 100000000`
+   - `tick_hz = 100000000` in this historical artifact
+   - current active builds use `tick_hz = 245760000`
    - `timeout_ms = 2000`
    - `dds_clock_hz = 983056640`
    - `dds_phase_dw = 32`
@@ -298,32 +336,39 @@ These claims are supported by archived runs:
 3. scheduler-native dense stepped FSH validation for a small multi-event batch
 4. scheduler-held single-event RF spot execution for SFDR-style captures
 5. host-side batching over the current `64`-event preload limit
+6. UARTLite stream correctness smoke for parser, bad CRC, EOF, refill, and
+   soft-reset reuse
+7. enforced preload/per-step FSH RF coverage smoke over `200-210 MHz`
 
 ## What Is Implemented But Not Yet Fully Bench-Validated
 
 These capabilities exist in code or firmware structure, but should not yet be
 described as fully validated:
 
-1. Phase B scheduler stream parser, UARTLite ingress, and refill logic
-2. stream bring-up profile on the active bench image
-3. dense large-range scheduler-native benchmarking without preload batch
+1. dense large-range scheduler-native benchmarking without preload batch
    boundaries
-4. scheduler-driven precision SFDR methodology
-5. scope-driven latency and pulse-width measurements
+2. scheduler-driven precision SFDR methodology
+3. scope-driven latency and pulse-width measurements
+4. automated stream regressions for level-sensitive low-watermark re-trigger,
+   mode-lock while armed/running, prefetch/hold reset flush, and late-event
+   underrun/error recovery
 
 ## What Is Still Blocking the Final Intended Suite
 
-### A. Stream validation blocker
+### A. Dense stream characterization blocker
 
-The active RF benchmark transport is still preload `LOADBIN/RUN`. UARTLite
-`STREAMHEX` exists but is not yet bench-proven as the RF benchmark path.
+The preload `LOADBIN/RUN` path remains the regression oracle. UARTLite
+`STREAMHEX` is bench-proven as a correctness path, and coarse per-step stream
+RF has passed over `200-210 MHz` in `1 MHz` steps, but it is not yet the dense
+`10 kHz` RF characterization or throughput path.
 
 What this means:
 
-1. very dense sweeps still incur host reload boundaries
+1. very dense preload sweeps still incur host reload boundaries
 2. preload-batch gap characterization is still relevant
-3. stream bring-up must pass before dense RF profiles switch from preload to
-   stream
+3. stream RF profiles should be expanded from coarse smoke to dense
+   characterization only after trace-capable readout or a credible marker-scan
+   substitute exists
 4. UARTLite stream results should record wall-clock-per-frame and
    wall-clock-per-event for future UART16550/Ethernet comparison
 
@@ -370,31 +415,31 @@ The canonical scope/register cross-check is `marker_commit` edge count versus
 Another agent should start from these assumptions:
 
 1. the scheduler is real, functional, and already useful for RF benchmarking
-2. the current best scheduler benchmark evidence is the `manual_awg_run`
-   archive
-3. the scheduler-native host suite is real but still uses preload batching
-4. stream-mode now has a UARTLite bring-up implementation, but it is not yet
-   the validated dense RF path
+2. the current best scheduler RF evidence is
+   `fsh_scheduler_preload_perstep_200_210_rf_enforced`
+3. the scheduler-native host suite is real and supports preload as the
+   regression oracle plus stream for coarse RF smoke
+4. stream-mode now has UARTLite correctness bench evidence and coarse RF smoke,
+   but it is not yet the validated dense `10 kHz` RF characterization path
 5. the MSO22 suite is still a planned implementation area, not a completed one
 
 ## Exact Next Engineering Tasks
 
 Priority order:
 
-1. build firmware with `FMCDAC_AWG_SCHED_STREAM=1` and run the
-   `stream-bringup` profile
-2. archive stream-specific metrics: bad CRC behavior, EOF/done, reset state,
+1. keep archiving stream-specific metrics: bad CRC behavior, EOF/done, reset state,
    low-watermark behavior, `STREAM_STALLS`, `IRQ_UNDERRUN`,
    `IRQ_EMPTY_STALL`, wall-clock-per-frame, and wall-clock-per-event
-3. add the missing low-watermark re-trigger, mode-locked, and reset-held-event
+2. add the missing low-watermark re-trigger, mode-locked, and reset-held-event
    hardware regressions to the automated stream profile
-4. switch dense FSH profiles to stream mode only after stream bring-up passes
-5. verify marker routing for `marker_commit`, `marker_start`, and `marker_done`
+3. expand dense FSH stream coverage beyond the accepted coarse RF smoke only
+   after trace-capable readout or a credible marker-scan substitute exists
+4. verify marker routing for `marker_commit`, `marker_start`, and `marker_done`
    before implementing MSO22 timing automation
-6. build scope-side benchmarks for first-event latency, event-to-event
+5. build scope-side benchmarks for first-event latency, event-to-event
    switching latency, minimum stable dwell, pulse width, pulse spacing, and
    preload-batch boundary gap
-7. tighten the FSH scheduler-held SFDR method so it becomes analytically
+6. tighten the FSH scheduler-held SFDR method so it becomes analytically
    defensible rather than just mechanically runnable
 
 ## Current One-Line Status
@@ -402,5 +447,6 @@ Priority order:
 The project has moved past "can the scheduler run?" and into "how do we turn
 it into the final deterministic benchmark engine?" The preload-batched
 scheduler-plus-FSH path is already real and bench-validated in limited form;
-UARTLite stream bring-up is implemented but still needs bench proof; dense
-stream RF and MSO22 timing automation are the remaining major steps.
+UARTLite stream bring-up now has correctness bench proof, and coarse stream RF
+smoke has passed. Dense `10 kHz` stream RF characterization and MSO22 timing
+automation are the remaining major steps.

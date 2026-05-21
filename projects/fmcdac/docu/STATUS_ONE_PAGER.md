@@ -1,6 +1,6 @@
 # FMCDAC One-Page Status
 
-Date: 2026-04-23
+Date: 2026-05-20
 
 ## Goal
 
@@ -33,6 +33,8 @@ What is settled:
    [`sfdr_rerun`](../capture_runs/sfdr_rerun/), but still below the long-term
    target.
 3. Throughput and UART RTT baselines exist and are stable enough to keep.
+4. The AWG scheduler preload path is now a usable deterministic bench engine
+   for coarse RF coverage smoke tests.
 
 ## Current Best Results
 
@@ -59,6 +61,20 @@ UART RTT:
 2. avg `3455.8 us`
 3. max `5125.6 us`
 
+Scheduler:
+
+1. preload scheduler RF smoke over `200-210 MHz @ 1 MHz` passes the current
+   per-step FSH quality gate
+2. latest accepted smoke:
+   - `loaded=11`, `commit=11`, `done=1`, `error=0`
+   - max frequency error about `495 kHz`
+   - flatness about `2.98 dB`
+   - max peak-vs-marker delta about `9.85 dB`
+3. UARTLite stream correctness smoke passes with `STREAM_DEPTH=511`, bad CRC
+   rejection, EOF completion, and a 32-event refill run
+4. full-sweep FSH max-hold is implemented but not accepted as RF evidence on
+   the current FSH8 `V1.58` because marker fallback can flatline at the floor
+
 ## Closed Questions
 
 Closed positive:
@@ -69,6 +85,8 @@ Closed positive:
 4. throughput baseline
 5. UART RTT baseline
 6. reduced close-in phase-noise offset survey on the FSH8
+7. scheduler preload control-plane and coarse RF coverage smoke
+8. UARTLite stream correctness smoke
 
 Closed negative:
 
@@ -135,17 +153,22 @@ Meaning:
 
 ## TODOs / Blockers
 
-1. FSH8 trace curve: ask R&S for `V1.58` trace-export syntax or upgrade the
+1. Dense stream RF characterization: coarse stream RF smoke has passed, but
+   dense `10 kHz` characterization still needs trace-capable readout or a
+   credible marker-scan substitute.
+2. MSO22 timing: verify marker routing for `marker_commit`, `marker_start`,
+   and `marker_done`, then implement scope-side latency/pulse measurements.
+3. FSH8 trace curve: ask R&S for `V1.58` trace-export syntax or upgrade the
    FSH8 firmware, then rerun `fsh_trace_probe.py`.
-2. Paper-grade phase noise: replace the current marker-only offset survey with
+4. Paper-grade phase noise: replace the current marker-only offset survey with
    a dense close-in trace workflow once trace export is fixed.
-3. Dynamic settling: redesign capture around a synchronized/gated measurement
+5. Dynamic settling: redesign capture around a synchronized/gated measurement
    method; do not use more asynchronous max-hold reruns as closure evidence.
-4. Low steady-state SFDR: root-cause the persistent spur families before
+6. Low steady-state SFDR: root-cause the persistent spur families before
    claiming acceptance-grade spectral performance.
-5. Clean init / deterministic latency: revisit SYSREF/init policy only if that
+7. Clean init / deterministic latency: revisit SYSREF/init policy only if that
    claim remains required; the current build is closed negative.
-6. Channel coherence: move to a multi-channel RF measurement setup.
+8. Channel coherence: move to a multi-channel RF measurement setup.
 
 ## Primary Artifacts
 

@@ -12,6 +12,7 @@ The current primary workflow is DDS-focused:
 5. `THROUGHPUT` firmware update-rate baselines
 6. `UART-RTT` host latency baselines
 7. optional uploaded `AWG-SCHED` measured sweep pass
+8. optional scheduler-native benchmark suite pass
 
 `NCO-TEST` still exists in the firmware, but it is now optional and skipped by
 default.
@@ -46,6 +47,12 @@ Separate scheduler path:
    - host-built event table
    - dedicated scheduler UART console
    - optional per-step analyzer validation
+2. scheduler-native benchmark suite
+   - bypasses the legacy paused benchmark prompts entirely
+   - reuses the AWG scheduler console across multiple `LOADBIN/RUN` batches
+   - can run UARTLite stream correctness checks through `STREAMHEX`
+   - emits RF-quality summaries for dense FSH steps
+   - writes a concrete `scheduler_scope_plan.json` for MSO22 timing work
 
 ## Measurement Policy
 
@@ -68,7 +75,31 @@ Current limitations:
 2. dense one-shot sweeps such as `200-300 MHz` in `10 kHz` steps do not fit in
    one scheduler load
 3. those dense sweeps therefore require batching across multiple runs or a
-   larger event RAM in HDL
+   larger event RAM in HDL when using the legacy UART preload console
+4. the Phase A HDL stream FIFO and Phase B firmware refill path now exist, but
+   stream RF has only been accepted as a coarse per-step smoke path so far
+
+### Scheduler-native benchmark suite
+
+`run_nco_scope_test.py --run-scheduler-benchmark-suite` is the new path for
+using the uploaded scheduler as the timing engine instead of the paused legacy
+prompt flow.
+
+Current first-phase coverage:
+
+1. FSH dense stepped sweep with host-side batching
+2. enforced/advisory dense RF quality summaries
+3. FSH scheduler-held SFDR spot set
+4. UARTLite stream bring-up profile
+5. full-sweep max-hold artifact path with FSH8 marker-flatline rejection
+6. exported MSO22 benchmark plan for latency / pulse-width / batch-gap work
+
+This suite still uses the legacy uploaded scheduler console as the preload
+regression oracle. It is "scheduler-native" relative to the paused DDS/SFDR
+prompts. The stream API is correctness-smoked over UARTLite, and coarse
+per-step stream RF over `200-210 MHz` in `1 MHz` steps has passed. Dense
+`10 kHz` stream RF characterization remains a future step because the current
+FSH8 marker path is not a scalable full-trace readout.
 
 ### DDS-band
 
@@ -392,19 +423,43 @@ and worst-spur marker summary.
 2. Use direct coax and `50 ohm` input.
 3. Start with the conservative analyzer settings listed above.
 4. Keep attenuation and reference level documented for each run.
+5. Record RF path calibration explicitly. Use `--rf-power-correction-db` for
+   fixed path loss and `--rf-power-calibration-csv` for
+   `frequency_hz,correction_db` tables. Artifacts preserve raw power and add
+   corrected power fields when correction is enabled.
+6. Do not call the current FSH8 output absolute-power calibrated unless the
+   correction table, cable/attenuator state, reference level, preamp, and
+   analyzer level check are captured with the run.
 
 ## Current Architectural Gap
 
 The uploaded scheduler path is now suitable for deterministic coarse stepped
-RF validation, but it is not yet the benchmark engine for the whole suite.
+RF validation, and the host now has a scheduler-native benchmark suite path
+that avoids the paused DDS/SFDR prompt flow.
 
-If the goal is scheduler-native dense sweeps, switching-latency work, or
-minimum pulse-width characterization, the next work is:
+What is already in place:
 
-1. a scheduler-native benchmark suite with no paused legacy prompt flow
-2. host-side batching or larger HDL event depth for dense `10 kHz` stepping
-3. a scope-driven scheduler latency / pulse-width workflow separate from the
-   FSH sweep workflow
+1. scheduler-native host execution with no paused legacy prompt dependency
+2. host-side batching over the current `max_events=64` preload limit
+3. FSH dense sweep and scheduler-held SFDR spot families
+4. UARTLite stream correctness smoke with `STREAM_DEPTH=511`, bad CRC, EOF,
+   reset reuse, and 32-event refill coverage
+5. accepted preload/per-step RF smoke over `200-210 MHz` with enforced RF
+   quality thresholds
+6. RF power correction provenance fields in scheduler FSH artifacts
+7. finite stream-backed per-step dense FSH execution for the next RF smoke
+
+What is still missing:
+
+1. the active RF bench transport is still legacy preload via `LOADBIN/RUN`
+2. stream-backed dense RF profiles need bench acceptance and comparison against
+   the preload/per-step baseline
+3. there is still no MSO22 automation path in this repo
+4. scope timing benchmarks still need a validated observable path such as a
+   routed timing marker, trigger output, or suitable envelope/detector signal
+   instead of direct RF-truth use of the `200 MHz` scope
+5. a documented absolute RF path calibration table and analyzer level-check
+   artifact for paper-grade power claims
 
 ## TODOs
 

@@ -1,6 +1,6 @@
 # Streaming Scheduler Phase B Firmware Status
 
-Date: 2026-05-07
+Date: 2026-05-20
 
 This document records the current firmware state for the Phase A HDL
 stream-mode scheduler. Phase A HDL is treated as frozen. Phase B firmware is
@@ -37,13 +37,35 @@ Default behavior:
 5. UARTLite stream mode is a correctness/observability transport, not a
    throughput target
 
+Bench status:
+
+1. The active refreshed HDL reports `STREAM_DEPTH = 511`, and the host
+   `stream-bringup` profile asserts this as the off-by-one regression
+   sentinel.
+2. UARTLite `STREAMHEX` has passed the current correctness smoke:
+   - bad CRC returns a non-OK ACK and leaves accepted counters unchanged
+   - a one-event EOF stream reaches `STREAM_PUSHES=1`, `commit=1`,
+     `eof_seen=1`, `done=1`, `error=0`
+   - a 32-event refill run reaches `STREAM_PUSHES=32`, `commit=32`,
+     `free_space=511`, and `free_space + occupancy == STREAM_DEPTH`
+3. UARTLite throughput observed during these smoke frames is only a few
+   events/s because the console path is intentionally conservative and
+   line-delayed for reliability. Treat it as correctness evidence only.
+4. Dense RF benchmarking has not moved to stream transport yet; the accepted
+   RF coverage smoke still uses preload `LOADBIN/RUN`.
+
 Build verification performed:
 
 1. `make -C projects\fmcdac build SKIP_MANIFEST=1`
-2. `make -C projects\fmcdac build SKIP_MANIFEST=1 NEW_CFLAGS=-DFMCDAC_AWG_SCHED_STREAM=1`
+2. `make -C projects\fmcdac scheduler-stream SKIP_MANIFEST=1`
 3. MicroBlaze GCC focused compiles for `awg_sched.c` stream-off and stream-on
 4. MicroBlaze GCC focused compile for `awg_stream_proto.c`
 5. `.venv\Scripts\python.exe projects\fmcdac\tests\awg_sched_host_test.py`
+
+The project Makefile exposes stream/preload profiles directly. Use
+`make scheduler-stream` for AWG UART console plus stream support, or copy
+`fmcdac_build.env.example` to `fmcdac_build.env` and set
+`FMCDAC_AWG_PROFILE := scheduler-stream` for persistent local builds.
 
 Known verification caveat:
 
@@ -60,8 +82,9 @@ Still not implemented in this phase:
 3. raw binary UARTLite byte-stream binding for `awg_stream_proto`
 4. DMA refill into the scheduler
 5. FSH dense/SFDR profiles running through stream mode
-6. bench proof of `IRQ_DONE`, `EOF_SEEN`, low-watermark refill, and reset
-   recovery on hardware
+6. automated hardware regressions for level-sensitive low-watermark re-trigger,
+   mode-lock while armed/running, prefetch/hold reset flush, and late-event
+   underrun/error recovery
 
 ## Phase A ABI Status
 
@@ -412,6 +435,14 @@ Already build-checked:
 - stream-enabled firmware build
 - parser compile
 - existing host scheduler tests
+
+Already bench-smoked:
+
+- legacy preload scheduler execution with `STREAM_CTRL.MODE = 0`
+- stream bad-CRC rejection
+- finite stream EOF completion
+- stream depth-plus refill with `STREAM_PUSHES == commit_count == 32`
+- soft reset restoring empty FIFO/free-space/counter state before reuse
 
 ## Bench Bring-Up Checklist
 

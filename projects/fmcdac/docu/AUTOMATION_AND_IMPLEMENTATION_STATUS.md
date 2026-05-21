@@ -1,6 +1,6 @@
 # Automation And Implementation Status
 
-Date: 2026-04-05
+Date: 2026-05-20
 
 This note captures the current implementation state of the firmware diagnostics
 and the host automation used to benchmark the FMCDAC platform.
@@ -94,10 +94,19 @@ Implemented:
    - dynamic retune bursts
    - throughput collection
    - UART RTT collection
-7. two-pass `--run-full-integration` wrapper:
+7. scheduler-native benchmark suite path:
+   - `--run-scheduler-benchmark-suite`
+   - host-side batching over the current scheduler event-depth limit
+   - FSH dense stepped-sweep validation
+   - dense RF quality summaries and optional enforcement
+   - FSH scheduler-held SFDR spot validation
+   - full-sweep max-hold artifact generation with FSH8 V1.58 guard rails
+   - UARTLite `stream-bringup` correctness profile
+   - emitted `scheduler_scope_plan.json` for future MSO22 timing execution
+8. two-pass `--run-full-integration` wrapper:
    - pass 1: measured uploaded AWG scheduler sweep
    - pass 2: legacy paused DDS-band / SFDR / dynamic / throughput / UART-RTT suite
-8. artifact generation into `capture_runs/<timestamp>/`
+9. artifact generation into `capture_runs/<timestamp>/`
 
 ### Current role of `capture_boot_repeatability.py`
 
@@ -150,8 +159,36 @@ Current scheduler limitation:
 1. the current KCU116 image reports `max_events=64`
 2. dense one-shot sweeps such as `200-300 MHz` in `10 kHz` steps do not fit in
    one uploaded schedule
-3. those benches therefore require host-side batching, larger event RAM, or a
-   streamed scheduler architecture
+3. those benches currently use host-side batching through the legacy scheduler
+   UART preload console
+4. Phase A HDL stream FIFO support and Phase B firmware DDR-staged refill now
+   exist behind `FMCDAC_AWG_SCHED_STREAM`
+5. UARTLite `STREAMHEX` has passed correctness smoke, including bad CRC,
+   finite EOF, reset reuse, `STREAM_DEPTH=511`, and a 32-event refill run
+6. the host benchmark suite can now run finite stream-backed per-step dense
+   FSH sweeps; bench acceptance of that path is the next run
+
+Current accepted scheduler RF smoke:
+
+1. path: scheduler-native preload `LOADBIN/RUN` plus per-step FSH8 captures
+2. artifact:
+   [fsh_scheduler_preload_perstep_200_210_rf_enforced](../capture_runs/fsh_scheduler_preload_perstep_200_210_rf_enforced/)
+3. sweep: `200-210 MHz` in `1 MHz` steps
+4. result: `loaded=11`, `commit=11`, `done=1`, `error=0`
+5. RF quality: pass with max frequency error about `495 kHz`, flatness about
+   `2.98 dB`, and max peak-vs-marker delta about `9.85 dB`
+6. power calibration status: artifacts can record/apply fixed or
+   frequency-dependent RF path correction, but current accepted smoke should
+   still be treated as coarse relative RF evidence unless a calibration table
+   and analyzer level-check artifact are supplied
+
+Current FSH8 limitation:
+
+1. full-sweep `maxhold` path is implemented and writes complete artifacts
+2. on the current FSH8 `V1.58`, trace export fails and marker fallback can
+   return floor-level flatlines
+3. the host therefore marks those max-hold bins `marker_flatline_untrusted`
+   and does not treat them as RF evidence
 
 ### Current measurement strategy
 

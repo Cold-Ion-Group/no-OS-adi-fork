@@ -129,9 +129,10 @@ Error codes:
 `awg_sched_wait_done()` supports an IRQ-driven wait path when
 `FMCDAC_AWG_SCHED_USE_IRQ` is enabled. Otherwise firmware uses polling.
 
-`LOW_WATERMARK` is edge-like. Firmware must also use opportunistic and periodic
-refill paths because the IRQ may not retrigger while occupancy remains below
-the programmed threshold.
+`LOW_WATERMARK` is intended to behave as a level-sensitive refill request in
+the refreshed Phase A HDL. Firmware still uses opportunistic and periodic
+refill paths because redundant `drain_step()` calls are harmless and no stream
+design should depend on a single IRQ edge for progress.
 
 ## STREAM_CTRL Bits
 
@@ -234,7 +235,9 @@ rest of the block.
 expose tick rate through `IP_CAPS`, so firmware and host must agree on it
 explicitly.
 
-For the current KCU116 image the working value is `100000000`.
+For the current KCU116 AWG image the working value is `245760000`, matching
+the scheduler clock domain. Older captures and logs may show `100000000`; do
+not use that stale value for new host-generated event timestamps.
 
 ## Optional Load Readback Verification
 
@@ -332,8 +335,12 @@ not for dense one-shot benches such as `200-300 MHz` in `10 kHz` steps
 The stream-mode HDL FIFO exists in the Phase A image, and Phase B firmware can
 stage events in DDR and refill the HDL FIFO through AXI-Lite event pushes. The
 host now has a `stream-bringup` profile for parser/refill/EOF/reset smoke
-testing. FSH dense/SFDR profiles still use preload until that stream bring-up
-path is bench-validated.
+testing. That profile has passed the current UARTLite correctness smoke with
+`STREAM_DEPTH=511`, bad-CRC rejection, finite EOF completion, and a 32-event
+refill run. Scheduler dense per-step FSH has also passed a coarse stream RF
+smoke over `200-210 MHz` in `1 MHz` steps. That is not yet a dense `10 kHz`
+RF characterization or transport-throughput result; those remain gated on
+trace-capable readout and/or UART16550/Ethernet.
 
 ## Artifact Dump
 
@@ -341,7 +348,7 @@ path is bench-validated.
 prefixed `[SCHED-ARTIFACT]`:
 
 ```text
-[SCHED-ARTIFACT] config base=0x44AA0000 max_events=64 tick_hz=100000000 timeout_ms=2000
+[SCHED-ARTIFACT] config base=0x44AA0000 max_events=64 tick_hz=245760000 timeout_ms=2000
 [SCHED-ARTIFACT] event idx=0 ts=0x00000000_000003E8 ch=0 fl=0x0001 p0=0x00010000 p1=... p2=... p3=...
 [SCHED-ARTIFACT] status armed=1 running=0 done=1 error=0 err_code=0x00 current=4 loaded=4 commit=4 reinit=0 reinit_reject=0 irq=0x00000001
 [SCHED-ARTIFACT] time_now=0x00000000_00001388 last_exec=0x00000000_00000FA0

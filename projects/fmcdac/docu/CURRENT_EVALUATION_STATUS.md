@@ -1,6 +1,6 @@
 # FMCDAC Current Evaluation Status
 
-Date: 2026-04-05
+Date: 2026-05-20
 
 ## Purpose
 
@@ -20,6 +20,8 @@ The detail has been split into supporting notes so this file stays readable:
 4. [Automation And Implementation Status](./AUTOMATION_AND_IMPLEMENTATION_STATUS.md)
 5. [Prior Explorations And Architectural Options](./PRIOR_EXPLORATIONS_AND_ARCH_OPTIONS.md)
 6. [FSH8 DDS Benchmark Automation](./NCO_SCOPE_AUTOMATION.md)
+7. [Scheduler Benchmark Suite](./SCHEDULER_BENCHMARK_SUITE.md)
+8. [Scheduler Handoff Status](./SCHEDULER_HANDOFF_STATUS.md)
 
 ## Ultimate Goals
 
@@ -127,6 +129,44 @@ The main conclusion has changed since the early scope-based investigation.
      result, not frozen as a strong settling baseline
 8. NCO is no longer a gating diagnostic. The evaluation focus is now full DDS
    plus the remaining paper-grade blockers.
+
+## Scheduler Update
+
+The scheduler path has moved from bring-up into bench-smoke validation:
+
+1. Active AWG scheduler identity:
+   - base `0x44AA0000`
+   - `IP_ID = 0x41574753`
+   - `IP_VERSION = 0x00010000`
+   - `max_events = 64`
+   - `tick_hz = 245760000`
+2. UARTLite stream correctness smoke has passed:
+   - `STREAM_DEPTH = 511`
+   - bad CRC rejected without changing accepted counters
+   - finite EOF stream completes with `eof_seen=1`, `done=1`, `error=0`
+   - 32-event refill run reaches `STREAM_PUSHES=32`, `commit=32`
+   - host support is now in place for finite stream-backed per-step FSH dense
+     RF smoke; bench result is still pending
+3. Full-sweep FSH `maxhold` is implemented but not accepted as RF proof on
+   the current FSH8 `V1.58` firmware because trace export fails and marker
+   fallback can flatline at the floor.
+4. Current accepted scheduler RF coverage smoke:
+   - artifact:
+     [fsh_scheduler_preload_perstep_200_210_rf_enforced](../capture_runs/fsh_scheduler_preload_perstep_200_210_rf_enforced/)
+   - transport: preload `LOADBIN/RUN`
+   - sweep: `200-210 MHz` in `1 MHz` steps
+   - `loaded=11`, `commit=11`, `done=1`, `error=0`
+   - `rf_quality.passed=true`
+   - max frequency error about `495 kHz`
+   - flatness about `2.98 dB`
+   - max peak-vs-marker delta about `9.85 dB`
+   - power readings are raw FSH8 dBm unless a run supplies
+     `--rf-power-correction-db` or `--rf-power-calibration-csv`
+
+Interpretation: the preload scheduler plus per-step FSH path is accepted as a
+coarse RF coverage smoke. It is not precision spectral validation, and it is
+not an absolute-power calibrated claim until an RF path correction table and
+analyzer level-check artifact are attached to the run.
 
 ## Baseline Of Record
 
@@ -243,20 +283,34 @@ Implemented in firmware:
 4. paused `DYNAMIC-SFDR` retune-burst diagnostic
 5. firmware-side throughput benchmark
 6. UART ping/pong RTT service
+7. legacy AWG scheduler preload API and UART console
+8. gated Phase B AWG stream scheduler API:
+   - DDR staging ring
+   - opportunistic / IRQ-hint / periodic refill paths
+   - transport-neutral frame parser
+   - default disabled with `FMCDAC_AWG_SCHED_STREAM=0`
 
 Implemented in host tooling:
 
 1. direct `make run` orchestration from `projects/fmcdac`
 2. UART prompt handling for DDS-band, SFDR, dynamic retune, throughput, and RTT
 3. uploaded AWG scheduler console flow with measured per-step FSH8 validation
-4. two-pass full-integration wrapper: measured AWG scheduler pass plus legacy suite rerun
-5. FSH8 DDS-band measurement
-6. FSH8 SFDR measurement using segmented spur sweeps
-7. close-in carrier trace capture during selected SFDR steps
-8. dynamic retune burst capture with intended-tone windows plus guarded spur search
-9. boot-repeatability capture via
+4. scheduler-native benchmark suite foundation:
+   - host-side batching over current scheduler event depth
+   - FSH dense-sweep validation
+   - dense RF quality summaries and optional enforcement
+   - FSH scheduler-held SFDR spot validation
+   - UARTLite stream correctness profile
+   - full-sweep max-hold artifact path with FSH8 marker-flatline guard
+   - emitted MSO22 timing benchmark plan
+5. two-pass full-integration wrapper: measured AWG scheduler pass plus legacy suite rerun
+6. FSH8 DDS-band measurement
+7. FSH8 SFDR measurement using segmented spur sweeps
+8. close-in carrier trace capture during selected SFDR steps
+9. dynamic retune burst capture with intended-tone windows plus guarded spur search
+10. boot-repeatability capture via
    [`capture_boot_repeatability.py`](../capture_boot_repeatability.py)
-10. artifact generation:
+11. artifact generation:
    - `summary.json`
    - `awg_scheduler_run.json`
    - per-step CSV/JSON
@@ -267,6 +321,31 @@ Implemented in host tooling:
    - `uart_rtt.json`
    - `boot_repeatability.json`
    - `boot_repeatability.csv`
+
+## Scheduler Benchmark Blocker Map
+
+What is no longer blocking the FSH-side scheduler benchmark path:
+
+1. uploaded scheduler control-plane validation
+2. measured per-step FSH validation on the preload console path
+3. scheduler-native host batching over the current event-depth limit
+4. scheduler-held SFDR spot execution on the preload console path
+5. UARTLite stream parser/refill correctness smoke
+
+What still blocks the full intended scheduler validation suite:
+
+1. stream transport is now a coarse RF smoke path, not yet the dense RF
+   characterization path
+   - scheduler dense per-step FSH has passed a stream RF smoke over
+     `200-210 MHz` in `1 MHz` steps
+   - UARTLite `STREAMHEX` is correctness-proven but too slow for throughput
+   - dense `10 kHz` RF characterization still needs trace-capable readout or a
+     practical marker-scan substitute
+2. there is no MSO22 automation path in this repo yet
+   - the host emits a scope plan, not instrument commands
+3. the MSO22 timing suite still needs a validated observable signal
+   - routed timing marker, trigger output, or detector/envelope path
+   - direct RF truth above `200 MHz` is explicitly not the role of this scope
 
 Earlier explorations that are now tracked separately:
 

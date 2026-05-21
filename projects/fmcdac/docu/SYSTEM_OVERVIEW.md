@@ -129,6 +129,17 @@ main()
 - SFDR baseline via FSH8 (50–400 MHz, segmented spur search, confirmed by rerun)
 - Firmware throughput benchmarks (AXI MMIO: ~737K ops/s, SPI: ~6K ops/s, DDS: ~838 ops/s)
 - Host UART RTT baseline (~3.5 ms average round-trip)
+- AWG scheduler preload execution at `0x44AA0000`
+  - active scheduler tick rate `245.76 MHz`
+  - current preload console depth `max_events=64`
+  - accepted scheduler RF smoke: preload/per-step FSH over `200-210 MHz`
+    in `1 MHz` steps with `rf_quality.passed=true`
+- Phase B stream firmware correctness path
+  - `STREAM_DEPTH=511` sentinel validated
+  - UARTLite `STREAMHEX` smoke covers bad CRC, EOF completion, soft-reset
+    reuse, and 32-event refill
+  - coarse per-step stream RF smoke has passed over `200-210 MHz` in `1 MHz`
+    steps
 - Stable-after-tune restart behavior across 5 power cycles
 - Manifest-checked builds (`gen_manifest.ps1` tracks XSA + firmware commit)
 - Host automation via `run_nco_scope_test.py` (DDS-band, SFDR, marker-only phase-noise offsets, dynamic retune bursts, throughput, UART RTT)
@@ -148,6 +159,16 @@ main()
     the asynchronous FSH8 max-hold method
 - Channel skew / coherence evidence under simultaneous updates
   - deferred while the bench only has a single-input FSH8
+- Dense stream RF characterization
+  - UARTLite stream is correctness/observability only at `115200` baud
+  - coarse RF smoke has passed, but `10 kHz` dense characterization is still
+    gated on trace-capable readout or a credible marker-scan substitute
+  - throughput stress is deferred to UART16550, Ethernet, or another higher-rate
+    transport
+- MSO22 timing automation
+  - scope plan artifacts exist
+  - marker routing for `marker_commit`, `marker_start`, and `marker_done`
+    still needs physical validation before timing measurements are promised
 - PHY-level PRBS (needs HDL changes for GTH raw PRBS generation)
 
 ## 7. Key Files
@@ -166,10 +187,16 @@ main()
 
 For the current measurement campaign, use this blocker-closure order first:
 
-1. FSH8 trace-export resolution for a dense phase-noise curve
-2. synchronized/gated dynamic settling capture if a strong retune claim is
+1. Keep scheduler preload/per-step RF smoke as the current deterministic
+   scheduler coverage path.
+2. Keep preload as the regression oracle; expand stream RF from coarse smoke to
+   dense characterization only after trace-capable readout or a credible
+   marker-scan substitute exists.
+3. FSH8 trace-export resolution for a dense phase-noise curve.
+4. Verify physical marker routing, then implement MSO22 timing automation.
+5. Synchronized/gated dynamic settling capture if a strong retune claim is
    still required
-3. defer channel skew / coherence until a multi-channel RF instrument is
+6. Defer channel skew / coherence until a multi-channel RF instrument is
    available
 
 1. **SFDR refinement** — improve measurement confidence; determine how much of the

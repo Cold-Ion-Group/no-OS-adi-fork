@@ -355,6 +355,50 @@ Interpretation:
 1. typical RTT is roughly low-single-digit milliseconds
 2. the later run looks like the cleaner baseline to keep
 
+## Scheduler Benchmark Summary
+
+### Stream correctness smoke
+
+Artifact:
+[stream_bringup](../capture_runs/stream_bringup/)
+
+Result:
+
+1. `STREAM_DEPTH = 511`
+2. bad CRC rejected without changing accepted stream counters
+3. one-event EOF stream reached `STREAM_PUSHES=1`, `commit=1`, `eof_seen=1`,
+   `done=1`, `error=0`
+4. 32-event refill run reached `STREAM_PUSHES=32`, `commit=32`,
+   `free_space=511`, and `free_space + occupancy == STREAM_DEPTH`
+
+Interpretation:
+
+1. UARTLite stream mode is bench-smoked as a correctness and observability
+   transport
+2. UARTLite is not a throughput transport; dense-stream stress remains deferred
+   to UART16550, Ethernet, or another higher-rate path
+
+### Scheduler preload RF smoke
+
+Artifact:
+[fsh_scheduler_preload_perstep_200_210_rf_enforced](../capture_runs/fsh_scheduler_preload_perstep_200_210_rf_enforced/)
+
+Result:
+
+1. scheduler execution: `loaded=11`, `commit=11`, `done=1`, `error=0`
+2. RF quality: `passed=true`
+3. max frequency error: about `495 kHz`
+4. flatness: about `2.98 dB`
+5. max peak-vs-marker delta: about `9.85 dB`
+
+Interpretation:
+
+1. preload scheduler plus per-step FSH8 measurement is now the accepted
+   scheduler RF coverage smoke path
+2. this is coarse RF coverage evidence, not precision spectral validation
+3. full-sweep FSH max-hold remains an artifact path only on FSH8 `V1.58`,
+   because trace export fails and marker fallback can flatline at the floor
+
 ## Current Historical Conclusion
 
 Across the current measurement history:
@@ -375,3 +419,7 @@ Across the current measurement history:
 8. channel skew/coherence remains open and out of scope on the single-input
    FSH8
 9. NCO has become secondary to the main DDS evaluation path
+10. scheduler preload execution, UARTLite stream correctness, and coarse
+    stream RF smoke are now bench-smoked; dense `10 kHz` stream RF
+    characterization and MSO22 timing automation are the next scheduler
+    milestones

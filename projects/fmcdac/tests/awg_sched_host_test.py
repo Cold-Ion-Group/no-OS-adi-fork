@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 import sys
+import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -22,7 +23,21 @@ from awg_sched_host import (
     parse_stream_status_line,
     stream_crc32_ieee,
 )
-from run_nco_scope_test import build_scheduler_batch_specs, chunk_sequence
+from run_nco_scope_test import (
+    RfPowerCalibration,
+    SpectrumMetrics,
+    apply_scheduler_fsh_marker_flatline_guard,
+    apply_scheduler_fsh_missing_thresholds,
+    apply_spectrum_power_calibration,
+    build_scheduler_batch_specs,
+    chunk_sequence,
+    extract_maxhold_bins_from_trace,
+    interpolate_rf_power_correction,
+    resolve_scheduler_fsh_capture_geometry,
+    select_scheduler_fsh_calibration_candidate,
+    summarize_scheduler_dense_rf_quality,
+    write_scheduler_fsh_maxhold_plot_svg,
+)
 
 
 class AwgSchedHostTest(unittest.TestCase):
@@ -163,6 +178,262 @@ class AwgSchedHostTest(unittest.TestCase):
         self.assertEqual(specs[1].start_index, 2)
         self.assertEqual(specs[2].start_index, 4)
         self.assertEqual(specs[2].freqs_hz, [204_000_000.0])
+
+    def test_scheduler_fsh_geometry_defaults(self) -> None:
+        geometry = resolve_scheduler_fsh_capture_geometry(
+            [200_000_000.0, 201_000_000.0, 202_000_000.0],
+            rbw_hz=100_000.0,
+            span_pad_hz=None,
+            bin_window_hz=None,
+        )
+        self.assertEqual(geometry.span_left_hz, 198_000_000.0)
+        self.assertEqual(geometry.span_right_hz, 204_000_000.0)
+        self.assertEqual(geometry.bin_half_width_hz, 450_000.0)
+
+    def test_extract_maxhold_bins_from_trace(self) -> None:
+        bins = extract_maxhold_bins_from_trace(
+            [199_900_000.0, 200_010_000.0, 201_020_000.0, 202_500_000.0],
+            [-80.0, -10.0, -11.5, -65.0],
+            [200_000_000.0, 201_000_000.0, 202_000_000.0],
+            100_000.0,
+            missing_relative_db=30.0,
+        )
+        self.assertFalse(bins[0]["missing"])
+        self.assertFalse(bins[1]["missing"])
+        self.assertTrue(bins[2]["missing"])
+
+    def test_maxhold_bins_mark_outside_frequency_missing(self) -> None:
+        bins = [
+            {
+                "index": 1,
+                "expected_hz": 200_000_000.0,
+                "left_hz": 199_750_000.0,
+                "right_hz": 200_250_000.0,
+                "power_dbm": -20.0,
+                "power_freq_hz": 208_822_222.22,
+                "freq_error_hz": 8_822_222.22,
+                "missing": False,
+                "missing_reason": "",
+            }
+        ]
+        apply_scheduler_fsh_missing_thresholds(
+            bins,
+            min_power_dbm=None,
+            missing_relative_db=30.0,
+        )
+        self.assertTrue(bins[0]["missing"])
+        self.assertIn("outside_bin", bins[0]["missing_reason"])
+
+    def test_maxhold_bins_mark_nonfinite_power_missing(self) -> None:
+        bins = [
+            {
+                "index": 1,
+                "expected_hz": 200_000_000.0,
+                "left_hz": 199_750_000.0,
+                "right_hz": 200_250_000.0,
+                "power_dbm": float("nan"),
+                "power_freq_hz": 200_000_000.0,
+                "freq_error_hz": 0.0,
+                "missing": False,
+                "missing_reason": "",
+            }
+        ]
+
+        apply_scheduler_fsh_missing_thresholds(
+            bins,
+            min_power_dbm=None,
+            missing_relative_db=30.0,
+        )
+        self.assertTrue(bins[0]["missing"])
+        self.assertIn("nonfinite_power", bins[0]["missing_reason"])
+
+    def test_maxhold_bins_mark_fsh_invalid_power_sentinel_missing(self) -> None:
+        bins = [
+            {
+                "index": 1,
+                "expected_hz": 200_000_000.0,
+                "left_hz": 199_750_000.0,
+                "right_hz": 200_250_000.0,
+                "power_dbm": 9.91e37,
+                "power_freq_hz": 200_000_000.0,
+                "freq_error_hz": 0.0,
+                "missing": False,
+                "missing_reason": "",
+            }
+        ]
+
+        apply_scheduler_fsh_missing_thresholds(
+            bins,
+            min_power_dbm=None,
+            missing_relative_db=30.0,
+        )
+        self.assertTrue(bins[0]["missing"])
+        self.assertIn("invalid_power_sentinel", bins[0]["missing_reason"])
+
+    def test_maxhold_plot_handles_identical_powers(self) -> None:
+        bins = [
+            {
+                "index": 1,
+                "expected_hz": 200_000_000.0,
+                "power_dbm": -87.64,
+                "missing": False,
+            },
+            {
+                "index": 2,
+                "expected_hz": 201_000_000.0,
+                "power_dbm": -87.64,
+                "missing": False,
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plot.svg"
+            write_scheduler_fsh_maxhold_plot_svg(path, bins, "identical")
+            text = path.read_text(encoding="utf-8")
+        self.assertIn("<svg", text)
+        self.assertIn("identical", text)
+
+    def test_marker_flatline_guard_marks_floor_readout_missing(self) -> None:
+        bins = [
+            {
+                "index": index,
+                "expected_hz": 200_000_000.0 + index * 1_000_000.0,
+                "power_dbm": -84.27,
+                "freq_error_hz": 0.0,
+                "missing": False,
+                "missing_reason": "",
+                "readout_mode": "marker",
+            }
+            for index in range(1, 5)
+        ]
+
+        changed = apply_scheduler_fsh_marker_flatline_guard(
+            bins,
+            floor_power_dbm=-60.0,
+            epsilon_db=0.02,
+        )
+        self.assertTrue(changed)
+        self.assertTrue(all(item["missing"] for item in bins))
+        self.assertTrue(all("marker_flatline_untrusted" in item["missing_reason"] for item in bins))
+
+    def test_marker_flatline_guard_allows_strong_flat_readout(self) -> None:
+        bins = [
+            {
+                "index": index,
+                "expected_hz": 200_000_000.0 + index * 1_000_000.0,
+                "power_dbm": -10.0,
+                "freq_error_hz": 0.0,
+                "missing": False,
+                "missing_reason": "",
+                "readout_mode": "marker",
+            }
+            for index in range(1, 5)
+        ]
+
+        changed = apply_scheduler_fsh_marker_flatline_guard(
+            bins,
+            floor_power_dbm=-60.0,
+            epsilon_db=0.02,
+        )
+        self.assertFalse(changed)
+        self.assertTrue(all(not item["missing"] for item in bins))
+
+    def test_scheduler_dense_rf_quality_flags_peak_marker_delta(self) -> None:
+        class Metrics:
+            power_dbm = -80.0
+            marker_power_dbm = -95.0
+            nearest_error_hz = 10_000.0
+
+        class Summary:
+            name = "step"
+            expected_freq_hz = [200_000_000.0]
+            metrics = Metrics()
+
+        summary = summarize_scheduler_dense_rf_quality(
+            [Summary()],
+            max_freq_error_hz=500_000.0,
+            min_power_dbm=None,
+            max_flatness_db=6.0,
+            max_peak_marker_delta_db=6.0,
+        )
+        self.assertFalse(summary["passed"])
+        self.assertEqual(summary["failures"][0]["criterion"], "max_peak_marker_delta_db")
+
+    def test_rf_power_correction_interpolates_and_marks_metrics(self) -> None:
+        calibration = RfPowerCalibration(
+            enabled=True,
+            fixed_correction_db=1.0,
+            table_path="",
+            table_points=[(100.0, 2.0), (200.0, 4.0)],
+            label="bench",
+            note="unit test",
+        )
+        self.assertAlmostEqual(interpolate_rf_power_correction(calibration.table_points, 150.0), 3.0)
+        metrics = SpectrumMetrics(
+            trace_points=1,
+            center_hz=150.0,
+            span_hz=10.0,
+            search_left_hz=145.0,
+            search_right_hz=155.0,
+            rbw_hz=1.0,
+            vbw_hz=1.0,
+            sweep_count=1,
+            trace_mode="clearwrite",
+            detector="positive",
+            reference_level_dbm=0.0,
+            display_range_db=80.0,
+            attenuation_auto=True,
+            preamp_on=False,
+            impedance_ohms=50,
+            power_dbm=-20.0,
+            power_freq_hz=150.0,
+            marker_power_dbm=-21.0,
+            marker_freq_hz=150.0,
+            trace_peak_power_dbm=-20.0,
+            trace_peak_freq_hz=150.0,
+            nearest_expected_hz=150.0,
+            nearest_error_hz=0.0,
+        )
+        apply_spectrum_power_calibration(metrics, calibration)
+        self.assertAlmostEqual(metrics.power_correction_db, 4.0)
+        self.assertAlmostEqual(metrics.corrected_power_dbm, -16.0)
+
+    def test_scheduler_dense_rf_quality_uses_corrected_power_when_present(self) -> None:
+        class Metrics:
+            power_dbm = -80.0
+            corrected_power_dbm = -70.0
+            power_correction_db = 10.0
+            marker_power_dbm = -85.0
+            corrected_marker_power_dbm = -75.0
+            marker_power_correction_db = 10.0
+            nearest_error_hz = 10_000.0
+
+        class Summary:
+            name = "step"
+            expected_freq_hz = [200_000_000.0]
+            metrics = Metrics()
+
+        summary = summarize_scheduler_dense_rf_quality(
+            [Summary()],
+            max_freq_error_hz=500_000.0,
+            min_power_dbm=-75.0,
+            max_flatness_db=6.0,
+            max_peak_marker_delta_db=6.0,
+        )
+        self.assertTrue(summary["passed"])
+        self.assertEqual(summary["rows"][0]["power_dbm"], -70.0)
+        self.assertEqual(summary["rows"][0]["raw_power_dbm"], -80.0)
+
+    def test_select_scheduler_fsh_calibration_candidate(self) -> None:
+        selected = select_scheduler_fsh_calibration_candidate(
+            [
+                {"candidate_index": 1, "passed": False, "estimated_seconds": 1.0, "rbw_hz": 30_000.0},
+                {"candidate_index": 2, "passed": True, "estimated_seconds": 5.0, "rbw_hz": 100_000.0},
+                {"candidate_index": 3, "passed": True, "estimated_seconds": 2.0, "rbw_hz": 300_000.0},
+            ]
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["candidate_index"], 3)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ from awg_sched_host import (
     AWG_STREAM_PROTO_MAGIC,
     AWG_STREAM_READY_MARKER,
     AWG_STREAM_RX_BEGIN_MARKER,
+    AWG_STREAM_STATUS_PREFIX,
     AWG_STREAM_UART_EXPECTED_EVENTS_PER_S,
     AWG_STREAM_UART_HEX_BYTES_PER_EVENT,
     AWG_STREAM_UART_RAW_BAUD,
@@ -118,6 +119,8 @@ AWG_SWEEP_ANALYZER_MIN_SETTLE_S = 0.005
 AWG_SWEEP_ANALYZER_MAX_SETTLE_S = 0.050
 AWG_SWEEP_MEASURE_MIN_SPAN_HZ = 500_000.0
 AWG_SWEEP_MEASURE_MAX_SPAN_HZ = 1_000_000.0
+AWG_SCHED_STALE_TICK_HZ = 100_000_000
+AWG_SCHED_DEFAULT_SCHED_CLK_HZ = 245_760_000
 DEFAULT_FREQ_SETTLE_TIMEOUT_S = 5.0
 DEFAULT_FREQ_SETTLE_ERROR_HZ = 500_000.0
 HOST_POLL_SLEEP_S = 0.01
@@ -148,6 +151,51 @@ LEGACY_SFDR_FREQS_HZ = [
     350_000_000.0,
     400_000_000.0,
 ]
+
+
+def is_valid_analyzer_power_dbm(value: Any) -> bool:
+    try:
+        power_dbm = float(value)
+    except (TypeError, ValueError):
+        return False
+    # R&S SCPI returns very large finite sentinels for invalid marker power on
+    # some FSH8 V1.58 paths. Keep the bound intentionally broad for real RF use.
+    return math.isfinite(power_dbm) and -1000.0 <= power_dbm <= 1000.0
+
+
+def infer_awg_scheduler_tick_hz_from_info(info: Any) -> Optional[int]:
+    dds_clock_hz = getattr(info, "dds_clock_hz", 0) or 0
+    if dds_clock_hz <= 0:
+        return None
+
+    # Current KCU116 AWG routes scheduler time from the DAC/link clock domain.
+    # The stream FIFO timestamp comparator advances at the quarter-rate sched_clk.
+    return max(1, int(round(float(dds_clock_hz) / 4.0)))
+
+
+def resolve_awg_scheduler_tick_hz(args: argparse.Namespace, info: Any) -> int:
+    if args.awg_sched_tick_hz is not None:
+        return int(args.awg_sched_tick_hz)
+
+    console_tick_hz = int(getattr(info, "tick_hz", 0) or 0)
+    inferred_tick_hz = infer_awg_scheduler_tick_hz_from_info(info)
+
+    if console_tick_hz == AWG_SCHED_STALE_TICK_HZ and inferred_tick_hz:
+        print(
+            "[HOST] WARNING: firmware reports scheduler tick_hz=100000000, "
+            f"but current AWG HDL uses sched_clk; using dds_clock_hz/4={inferred_tick_hz} "
+            "for event timestamps. Rebuild with FMCDAC_AWG_SCHED_TICK_HZ=245760000U "
+            "or pass --awg-sched-tick-hz explicitly."
+        )
+        return inferred_tick_hz
+
+    if console_tick_hz > 0:
+        return console_tick_hz
+
+    if inferred_tick_hz:
+        return inferred_tick_hz
+
+    return AWG_SCHED_DEFAULT_SCHED_CLK_HZ
 
 
 @dataclass(frozen=True)
@@ -329,8 +377,17 @@ class SpectrumMetrics:
     reference_step_name: Optional[str] = None
     reference_power_dbm: Optional[float] = None
     power_delta_db: Optional[float] = None
+    corrected_power_delta_db: Optional[float] = None
     trace_capture_degraded: bool = False
     trace_capture_error: Optional[str] = None
+    power_correction_db: Optional[float] = None
+    corrected_power_dbm: Optional[float] = None
+    marker_power_correction_db: Optional[float] = None
+    corrected_marker_power_dbm: Optional[float] = None
+    trace_peak_power_correction_db: Optional[float] = None
+    corrected_trace_peak_power_dbm: Optional[float] = None
+    reference_power_correction_db: Optional[float] = None
+    corrected_reference_power_dbm: Optional[float] = None
 
 
 @dataclass
@@ -346,11 +403,41 @@ class StepCaptureSummary:
 
 
 @dataclass(frozen=True)
+class RfPowerCalibration:
+    enabled: bool
+    fixed_correction_db: float
+    table_path: str
+    table_points: List[Tuple[float, float]]
+    label: str
+    note: str
+
+
+@dataclass(frozen=True)
 class SchedulerBatchSpec:
     batch_index: int
     total_batches: int
     start_index: int
     freqs_hz: List[float]
+
+
+@dataclass(frozen=True)
+class SchedulerFshCaptureGeometry:
+    center_hz: float
+    span_hz: float
+    span_left_hz: float
+    span_right_hz: float
+    span_pad_hz: float
+    bin_half_width_hz: float
+
+
+@dataclass(frozen=True)
+class SchedulerFshCalibrationCandidate:
+    index: int
+    rbw_hz: float
+    vbw_hz: float
+    dwell_us: int
+    repeats: int
+    estimated_seconds: float
 
 
 NCO_STEP_SPECS = [
@@ -455,6 +542,556 @@ def build_scheduler_batch_specs(freqs_hz: Sequence[float], max_events: int) -> L
         )
         start_index += len(chunk)
     return specs
+
+
+def min_positive_spacing_hz(freqs_hz: Sequence[float]) -> Optional[float]:
+    unique = sorted(set(float(item) for item in freqs_hz))
+    spacings = [
+        unique[index + 1] - unique[index]
+        for index in range(len(unique) - 1)
+        if unique[index + 1] > unique[index]
+    ]
+    return min(spacings) if spacings else None
+
+
+def resolve_scheduler_fsh_capture_geometry(
+    freqs_hz: Sequence[float],
+    *,
+    rbw_hz: float,
+    span_pad_hz: Optional[float],
+    bin_window_hz: Optional[float],
+) -> SchedulerFshCaptureGeometry:
+    if not freqs_hz:
+        raise ValueError("at least one frequency is required")
+    if rbw_hz <= 0:
+        raise ValueError("rbw_hz must be greater than 0")
+
+    pad_hz = float(span_pad_hz) if span_pad_hz is not None else max(2_000_000.0, 5.0 * rbw_hz)
+    if pad_hz < 0:
+        raise ValueError("span pad must be non-negative")
+
+    spacing_hz = min_positive_spacing_hz(freqs_hz)
+    default_half_width_hz = max(5.0 * rbw_hz, 250_000.0)
+    if spacing_hz is not None:
+        default_half_width_hz = min(spacing_hz * 0.45, default_half_width_hz)
+    half_width_hz = float(bin_window_hz) if bin_window_hz is not None else default_half_width_hz
+    if half_width_hz <= 0:
+        raise ValueError("bin window must be greater than 0")
+
+    span_left_hz = max(0.0, min(freqs_hz) - pad_hz)
+    span_right_hz = max(freqs_hz) + pad_hz
+    center_hz = (span_left_hz + span_right_hz) / 2.0
+    span_hz = max(1.0, span_right_hz - span_left_hz)
+    return SchedulerFshCaptureGeometry(
+        center_hz=center_hz,
+        span_hz=span_hz,
+        span_left_hz=span_left_hz,
+        span_right_hz=span_right_hz,
+        span_pad_hz=pad_hz,
+        bin_half_width_hz=half_width_hz,
+    )
+
+
+def extract_maxhold_bins_from_trace(
+    trace_freqs_hz: Sequence[float],
+    trace_levels_dbm: Sequence[float],
+    expected_freqs_hz: Sequence[float],
+    bin_half_width_hz: float,
+    *,
+    min_power_dbm: Optional[float] = None,
+    missing_relative_db: Optional[float] = None,
+    readout_mode: str = "trace",
+) -> List[dict]:
+    bins: List[dict] = []
+    pairs = list(zip(trace_freqs_hz, trace_levels_dbm))
+    for index, expected_hz in enumerate(expected_freqs_hz, start=1):
+        left_hz = expected_hz - bin_half_width_hz
+        right_hz = expected_hz + bin_half_width_hz
+        window = [(freq_hz, level_dbm) for freq_hz, level_dbm in pairs if left_hz <= freq_hz <= right_hz]
+        if window:
+            power_freq_hz, power_dbm = max(window, key=lambda item: item[1])
+            freq_error_hz: Optional[float] = power_freq_hz - expected_hz
+            missing = False
+            missing_reason = ""
+        else:
+            power_freq_hz = None
+            power_dbm = None
+            freq_error_hz = None
+            missing = True
+            missing_reason = "no_trace_points_in_bin"
+        bins.append(
+            {
+                "index": index,
+                "expected_hz": expected_hz,
+                "left_hz": left_hz,
+                "right_hz": right_hz,
+                "power_dbm": power_dbm,
+                "power_freq_hz": power_freq_hz,
+                "freq_error_hz": freq_error_hz,
+                "missing": missing,
+                "missing_reason": missing_reason,
+                "readout_mode": readout_mode,
+            }
+        )
+
+    apply_scheduler_fsh_missing_thresholds(
+        bins,
+        min_power_dbm=min_power_dbm,
+        missing_relative_db=missing_relative_db,
+    )
+    return bins
+
+
+def apply_scheduler_fsh_missing_thresholds(
+    bins: List[dict],
+    *,
+    min_power_dbm: Optional[float],
+    missing_relative_db: Optional[float],
+) -> None:
+    present_powers = [
+        float(item["power_dbm"])
+        for item in bins
+        if item.get("power_dbm") is not None
+        and not item.get("missing")
+        and is_valid_analyzer_power_dbm(item["power_dbm"])
+    ]
+    max_power_dbm = max(present_powers) if present_powers else None
+    for item in bins:
+        reasons: List[str] = []
+        freq_error = item.get("freq_error_hz")
+        half_width = None
+        if item.get("left_hz") is not None and item.get("right_hz") is not None:
+            half_width = (float(item["right_hz"]) - float(item["left_hz"])) / 2.0
+        if freq_error is not None:
+            freq_error_f = float(freq_error)
+            if not math.isfinite(freq_error_f):
+                reasons.append("nonfinite_frequency")
+            elif half_width is not None and abs(freq_error_f) > half_width:
+                reasons.append("outside_bin")
+        if item.get("power_dbm") is None:
+            if reasons:
+                item["missing"] = True
+                existing = item.get("missing_reason", "")
+                item["missing_reason"] = "+".join(part for part in (existing, *reasons) if part)
+            continue
+        power_dbm = float(item["power_dbm"])
+        if not math.isfinite(power_dbm):
+            reasons.append("nonfinite_power")
+        elif not is_valid_analyzer_power_dbm(power_dbm):
+            reasons.append("invalid_power_sentinel")
+        if min_power_dbm is not None and power_dbm < min_power_dbm:
+            reasons.append("below_min_power")
+        if (
+            missing_relative_db is not None
+            and max_power_dbm is not None
+            and power_dbm < (max_power_dbm - missing_relative_db)
+        ):
+            reasons.append("below_relative_power")
+        if reasons:
+            item["missing"] = True
+            item["missing_reason"] = "+".join(reasons)
+
+
+def apply_scheduler_fsh_marker_flatline_guard(
+    bins: List[dict],
+    *,
+    floor_power_dbm: Optional[float],
+    epsilon_db: float,
+) -> bool:
+    marker_bins = [
+        item
+        for item in bins
+        if (
+            item.get("readout_mode") == "marker"
+            and not item.get("missing")
+            and item.get("power_dbm") is not None
+            and is_valid_analyzer_power_dbm(item["power_dbm"])
+        )
+    ]
+    if len(marker_bins) < 3:
+        return False
+
+    powers = [float(item["power_dbm"]) for item in marker_bins]
+    spread_db = max(powers) - min(powers)
+    if spread_db > epsilon_db:
+        return False
+    if floor_power_dbm is not None and max(powers) > floor_power_dbm:
+        return False
+
+    reason = "marker_flatline_untrusted"
+    for item in marker_bins:
+        existing = item.get("missing_reason", "")
+        item["missing"] = True
+        item["missing_reason"] = "+".join(part for part in (existing, reason) if part)
+    return True
+
+
+def scheduler_fsh_bin_plot_power_dbm(item: dict) -> Optional[float]:
+    corrected = item.get("corrected_power_dbm")
+    if corrected is not None:
+        return float(corrected)
+    raw = item.get("power_dbm")
+    return None if raw is None else float(raw)
+
+
+def summarize_scheduler_fsh_bins(bins: Sequence[dict]) -> dict:
+    present = [
+        item
+        for item in bins
+        if (
+            not item.get("missing")
+            and item.get("power_dbm") is not None
+            and is_valid_analyzer_power_dbm(item["power_dbm"])
+        )
+    ]
+    missing = [item for item in bins if item.get("missing")]
+    powers = [power for item in present if (power := scheduler_fsh_bin_plot_power_dbm(item)) is not None]
+    freq_errors = [
+        abs(float(item["freq_error_hz"]))
+        for item in present
+        if item.get("freq_error_hz") is not None and math.isfinite(float(item["freq_error_hz"]))
+    ]
+    return {
+        "expected_count": len(bins),
+        "present_count": len(present),
+        "missing_count": len(missing),
+        "missing_indices": [item["index"] for item in missing],
+        "min_power_dbm": min(powers) if powers else None,
+        "max_power_dbm": max(powers) if powers else None,
+        "mean_power_dbm": (sum(powers) / len(powers)) if powers else None,
+        "power_flatness_db": (max(powers) - min(powers)) if powers else None,
+        "max_abs_freq_error_hz": max(freq_errors) if freq_errors else None,
+    }
+
+
+def apply_scheduler_fsh_bin_power_calibration(
+    bins: Sequence[dict],
+    calibration: RfPowerCalibration,
+) -> None:
+    if not calibration.enabled:
+        return
+    for item in bins:
+        freq_hz = item.get("power_freq_hz")
+        correction_db = rf_power_correction_for(calibration, freq_hz)
+        item["power_correction_db"] = correction_db
+        item["corrected_power_dbm"] = corrected_power_value(item.get("power_dbm"), correction_db)
+
+
+def load_rf_power_calibration_table(path: Path) -> List[Tuple[float, float]]:
+    points: List[Tuple[float, float]] = []
+    with path.open("r", encoding="utf-8", newline="") as fp:
+        reader = csv.reader(fp)
+        for line_no, row in enumerate(reader, start=1):
+            if not row or all(not item.strip() for item in row):
+                continue
+            if len(row) < 2:
+                raise ValueError(f"{path}:{line_no}: expected frequency_hz,correction_db")
+            try:
+                freq_hz = float(row[0].strip())
+                correction_db = float(row[1].strip())
+            except ValueError:
+                if line_no == 1:
+                    continue
+                raise ValueError(f"{path}:{line_no}: invalid frequency_hz,correction_db") from None
+            if freq_hz < 0 or not math.isfinite(freq_hz) or not math.isfinite(correction_db):
+                raise ValueError(f"{path}:{line_no}: invalid finite calibration value")
+            points.append((freq_hz, correction_db))
+    points.sort(key=lambda item: item[0])
+    return points
+
+
+def build_rf_power_calibration(args: argparse.Namespace) -> RfPowerCalibration:
+    table_path = str(getattr(args, "rf_power_calibration_csv", "") or "")
+    table_points: List[Tuple[float, float]] = []
+    if table_path:
+        table_points = load_rf_power_calibration_table(Path(table_path))
+        if not table_points:
+            raise ValueError(f"RF power calibration table is empty: {table_path}")
+    fixed_correction_db = float(getattr(args, "rf_power_correction_db", 0.0) or 0.0)
+    enabled = bool(table_points) or fixed_correction_db != 0.0
+    return RfPowerCalibration(
+        enabled=enabled,
+        fixed_correction_db=fixed_correction_db,
+        table_path=table_path,
+        table_points=table_points,
+        label=str(getattr(args, "rf_power_calibration_label", "") or ""),
+        note=str(getattr(args, "rf_power_calibration_note", "") or ""),
+    )
+
+
+def interpolate_rf_power_correction(points: Sequence[Tuple[float, float]], freq_hz: float) -> float:
+    if not points:
+        return 0.0
+    if freq_hz <= points[0][0]:
+        return points[0][1]
+    if freq_hz >= points[-1][0]:
+        return points[-1][1]
+    for left, right in zip(points, points[1:]):
+        left_freq, left_corr = left
+        right_freq, right_corr = right
+        if left_freq <= freq_hz <= right_freq:
+            if right_freq == left_freq:
+                return right_corr
+            ratio = (freq_hz - left_freq) / (right_freq - left_freq)
+            return left_corr + (ratio * (right_corr - left_corr))
+    return points[-1][1]
+
+
+def rf_power_correction_for(calibration: RfPowerCalibration, freq_hz: Optional[float]) -> Optional[float]:
+    if not calibration.enabled or freq_hz is None or not math.isfinite(float(freq_hz)):
+        return None
+    return calibration.fixed_correction_db + interpolate_rf_power_correction(
+        calibration.table_points,
+        float(freq_hz),
+    )
+
+
+def corrected_power_value(power_dbm: Optional[float], correction_db: Optional[float]) -> Optional[float]:
+    if power_dbm is None or correction_db is None:
+        return None
+    if not is_valid_analyzer_power_dbm(power_dbm):
+        return None
+    return float(power_dbm) + float(correction_db)
+
+
+def apply_spectrum_power_calibration(metrics: SpectrumMetrics, calibration: RfPowerCalibration) -> None:
+    if not calibration.enabled:
+        return
+    metrics.power_correction_db = rf_power_correction_for(calibration, metrics.power_freq_hz)
+    metrics.corrected_power_dbm = corrected_power_value(metrics.power_dbm, metrics.power_correction_db)
+
+    metrics.marker_power_correction_db = rf_power_correction_for(calibration, metrics.marker_freq_hz)
+    metrics.corrected_marker_power_dbm = corrected_power_value(
+        metrics.marker_power_dbm,
+        metrics.marker_power_correction_db,
+    )
+
+    metrics.trace_peak_power_correction_db = rf_power_correction_for(calibration, metrics.trace_peak_freq_hz)
+    metrics.corrected_trace_peak_power_dbm = corrected_power_value(
+        metrics.trace_peak_power_dbm,
+        metrics.trace_peak_power_correction_db,
+    )
+
+    if metrics.reference_power_dbm is not None:
+        metrics.reference_power_correction_db = metrics.power_correction_db
+        metrics.corrected_reference_power_dbm = corrected_power_value(
+            metrics.reference_power_dbm,
+            metrics.reference_power_correction_db,
+        )
+
+
+def spectrum_primary_power(metrics: Any) -> Optional[float]:
+    corrected = getattr(metrics, "corrected_power_dbm", None)
+    if corrected is not None:
+        return corrected
+    return getattr(metrics, "power_dbm", None)
+
+
+def spectrum_marker_power(metrics: Any) -> Optional[float]:
+    corrected = getattr(metrics, "corrected_marker_power_dbm", None)
+    if corrected is not None:
+        return corrected
+    return getattr(metrics, "marker_power_dbm", None)
+
+
+def summarize_scheduler_dense_rf_quality(
+    steps: Sequence[Any],
+    *,
+    max_freq_error_hz: Optional[float],
+    min_power_dbm: Optional[float],
+    max_flatness_db: Optional[float],
+    max_peak_marker_delta_db: Optional[float],
+) -> dict:
+    rows = []
+    for step in steps:
+        metrics = getattr(step, "metrics", None)
+        if metrics is None:
+            continue
+        expected_freqs = getattr(step, "expected_freq_hz", None)
+        expected = expected_freqs[0] if expected_freqs else None
+        step_name = getattr(step, "name", "")
+        power = spectrum_primary_power(metrics)
+        marker_power = spectrum_marker_power(metrics)
+        freq_error = getattr(metrics, "nearest_error_hz", None)
+        peak_marker_delta = None
+        if (
+            power is not None
+            and marker_power is not None
+            and is_valid_analyzer_power_dbm(power)
+            and is_valid_analyzer_power_dbm(marker_power)
+        ):
+            peak_marker_delta = float(power) - float(marker_power)
+        rows.append(
+            {
+                "step_name": step_name,
+                "expected_freq_hz": expected,
+                "power_dbm": power,
+                "raw_power_dbm": getattr(metrics, "power_dbm", None),
+                "power_correction_db": getattr(metrics, "power_correction_db", None),
+                "marker_power_dbm": marker_power,
+                "raw_marker_power_dbm": getattr(metrics, "marker_power_dbm", None),
+                "marker_power_correction_db": getattr(metrics, "marker_power_correction_db", None),
+                "freq_error_hz": freq_error,
+                "peak_marker_delta_db": peak_marker_delta,
+            }
+        )
+
+    valid_powers = [
+        float(item["power_dbm"])
+        for item in rows
+        if item.get("power_dbm") is not None and is_valid_analyzer_power_dbm(item["power_dbm"])
+    ]
+    valid_freq_errors = [
+        abs(float(item["freq_error_hz"]))
+        for item in rows
+        if item.get("freq_error_hz") is not None and math.isfinite(float(item["freq_error_hz"]))
+    ]
+    valid_peak_marker_deltas = [
+        float(item["peak_marker_delta_db"])
+        for item in rows
+        if item.get("peak_marker_delta_db") is not None and math.isfinite(float(item["peak_marker_delta_db"]))
+    ]
+
+    failures = []
+    if max_freq_error_hz is not None and valid_freq_errors:
+        offenders = [
+            item
+            for item in rows
+            if item.get("freq_error_hz") is not None and abs(float(item["freq_error_hz"])) > max_freq_error_hz
+        ]
+        if offenders:
+            failures.append(
+                {
+                    "criterion": "max_freq_error_hz",
+                    "threshold": max_freq_error_hz,
+                    "count": len(offenders),
+                    "step_names": [item["step_name"] for item in offenders],
+                }
+            )
+    if min_power_dbm is not None and valid_powers:
+        offenders = [
+            item
+            for item in rows
+            if item.get("power_dbm") is not None and float(item["power_dbm"]) < min_power_dbm
+        ]
+        if offenders:
+            failures.append(
+                {
+                    "criterion": "min_power_dbm",
+                    "threshold": min_power_dbm,
+                    "count": len(offenders),
+                    "step_names": [item["step_name"] for item in offenders],
+                }
+            )
+    flatness_db = (max(valid_powers) - min(valid_powers)) if valid_powers else None
+    if max_flatness_db is not None and flatness_db is not None and flatness_db > max_flatness_db:
+        failures.append(
+            {
+                "criterion": "max_flatness_db",
+                "threshold": max_flatness_db,
+                "observed": flatness_db,
+            }
+        )
+    if max_peak_marker_delta_db is not None and valid_peak_marker_deltas:
+        offenders = [
+            item
+            for item in rows
+            if item.get("peak_marker_delta_db") is not None
+            and float(item["peak_marker_delta_db"]) > max_peak_marker_delta_db
+        ]
+        if offenders:
+            failures.append(
+                {
+                    "criterion": "max_peak_marker_delta_db",
+                    "threshold": max_peak_marker_delta_db,
+                    "count": len(offenders),
+                    "step_names": [item["step_name"] for item in offenders],
+                }
+            )
+
+    thresholds = {
+        "max_freq_error_hz": max_freq_error_hz,
+        "min_power_dbm": min_power_dbm,
+        "max_flatness_db": max_flatness_db,
+        "max_peak_marker_delta_db": max_peak_marker_delta_db,
+    }
+    return {
+        "kind": "scheduler_dense_rf_quality",
+        "thresholds": thresholds,
+        "passed": not failures,
+        "failures": failures,
+        "measured_count": len(rows),
+        "max_abs_freq_error_hz": max(valid_freq_errors) if valid_freq_errors else None,
+        "min_power_dbm": min(valid_powers) if valid_powers else None,
+        "max_power_dbm": max(valid_powers) if valid_powers else None,
+        "power_flatness_db": flatness_db,
+        "max_peak_marker_delta_db": max(valid_peak_marker_deltas) if valid_peak_marker_deltas else None,
+        "rows": rows,
+    }
+
+
+def parse_float_csv_list(text: str, *, label: str) -> List[float]:
+    values: List[float] = []
+    for raw in text.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        try:
+            values.append(float(item))
+        except ValueError as exc:
+            raise ValueError(f"{label} contains non-numeric value {item!r}") from exc
+    if not values:
+        raise ValueError(f"{label} must contain at least one value")
+    return values
+
+
+def parse_int_csv_list(text: str, *, label: str) -> List[int]:
+    values = [int(round(item)) for item in parse_float_csv_list(text, label=label)]
+    if any(item < 1 for item in values):
+        raise ValueError(f"{label} values must be at least 1")
+    return values
+
+
+def build_scheduler_fsh_calibration_candidates(
+    *,
+    event_count: int,
+    rbw_values_hz: Sequence[float],
+    vbw_ratios: Sequence[float],
+    dwell_values_us: Sequence[int],
+    repeat_values: Sequence[int],
+) -> List[SchedulerFshCalibrationCandidate]:
+    candidates: List[SchedulerFshCalibrationCandidate] = []
+    index = 1
+    for rbw_hz in rbw_values_hz:
+        for vbw_ratio in vbw_ratios:
+            for dwell_us in dwell_values_us:
+                for repeats in repeat_values:
+                    candidates.append(
+                        SchedulerFshCalibrationCandidate(
+                            index=index,
+                            rbw_hz=rbw_hz,
+                            vbw_hz=rbw_hz * vbw_ratio,
+                            dwell_us=dwell_us,
+                            repeats=repeats,
+                            estimated_seconds=(event_count * dwell_us * repeats) / 1_000_000.0,
+                        )
+                    )
+                    index += 1
+    return candidates
+
+
+def select_scheduler_fsh_calibration_candidate(results: Sequence[dict]) -> Optional[dict]:
+    passing = [item for item in results if item.get("passed")]
+    if not passing:
+        return None
+    return min(
+        passing,
+        key=lambda item: (
+            float(item.get("estimated_seconds", 0.0)),
+            float(item.get("rbw_hz", 0.0)),
+            int(item.get("candidate_index", 0)),
+        ),
+    )
 
 
 def build_scheduler_dense_step_specs(
@@ -1063,6 +1700,77 @@ class RohdeSchwarzFSH:
         self._write("CALC:MARK1 ON")
         self._write("INIT;*WAI")
 
+    def configure_maxhold_capture(
+        self,
+        center_hz: float,
+        span_hz: float,
+        settings: AnalyzerSettings,
+    ) -> None:
+        self._write("*CLS")
+        if not self.legacy_firmware:
+            self._write("UNIT:POW DBM")
+            self._write("DISP:TRAC:Y:SPAC LOG")
+            self._write(f"DISP:TRAC:Y {settings.display_range_db}dB")
+            self._write(f"INP:IMP {settings.impedance_ohms}")
+            self._write("DET:AUTO OFF")
+            self._write("CALC:MARK1:FREQ:MODE FREQ")
+        self._write(f"DISP:TRAC:Y:RLEV {settings.reference_level_dbm}dBm")
+        self._write(f"INP:ATT:AUTO {'ON' if settings.attenuation_auto else 'OFF'}")
+        self._write(f"INP:GAIN:STAT {'ON' if settings.preamp_on else 'OFF'}")
+        self._write("BAND:AUTO OFF")
+        self._write(f"BAND {settings.rbw_hz}")
+        self._write("BAND:VID:AUTO OFF")
+        self._write(f"BAND:VID {settings.vbw_hz}")
+        self._write("SWE:TIME:AUTO ON")
+        self._write(f"SWE:COUN {max(1, settings.sweep_count)}")
+        self._write(f"DET {DETECTOR_TOKENS[settings.detector]}")
+        self._write(f"FREQ:CENT {center_hz}")
+        self._write(f"FREQ:SPAN {span_hz}")
+        self._write("INIT:CONT OFF")
+        self._write("DISP:WIND:TRAC:MODE WRIT")
+        self._write("DISP:WIND:TRAC:MODE MAXH")
+        self._write("CALC:MARK1 ON")
+        self._write("INIT:CONT OFF")
+
+    def start_maxhold_capture(self) -> None:
+        self._write("INIT:CONT ON")
+        self._write("INIT")
+
+    def stop_maxhold_capture(self) -> None:
+        try:
+            self._write("INIT:CONT OFF")
+        finally:
+            try:
+                self._write("ABOR")
+            except Exception:
+                pass
+
+    def capture_current_trace_data(
+        self,
+        center_hz: float,
+        span_hz: float,
+    ) -> Tuple[List[float], List[float]]:
+        return self._capture_trace_data(center_hz, span_hz)
+
+    def query_marker_window(
+        self,
+        left_hz: float,
+        right_hz: float,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        return self._query_marker_in_window(left_hz, right_hz)
+
+    def query_marker_at_frequency_current_trace(
+        self,
+        freq_hz: float,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        self._write(f"CALC:MARK1:X {freq_hz}")
+        power_dbm = self._query_float("CALC:MARK1:Y?")
+        try:
+            marker_freq_hz = self._query_float("CALC:MARK1:X?")
+        except Exception:
+            marker_freq_hz = freq_hz
+        return power_dbm, marker_freq_hz
+
     def _capture_peak_for_span(
         self,
         center_hz: float,
@@ -1400,12 +2108,140 @@ def save_trace_csv(path: Path, freqs_hz: Sequence[float], levels_dbm: Sequence[f
             writer.writerow([f"{freq_hz:.6f}", f"{level_dbm:.6f}"])
 
 
+def write_scheduler_fsh_bins_csv(path: Path, bins: Sequence[dict]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.writer(fp)
+        writer.writerow(
+            [
+                "index",
+                "expected_hz",
+                "power_dbm",
+                "power_correction_db",
+                "corrected_power_dbm",
+                "power_freq_hz",
+                "freq_error_hz",
+                "missing",
+                "missing_reason",
+                "readout_mode",
+            ]
+        )
+        for item in bins:
+            writer.writerow(
+                [
+                    item.get("index"),
+                    f"{float(item.get('expected_hz', 0.0)):.6f}",
+                    "" if item.get("power_dbm") is None else f"{float(item['power_dbm']):.6f}",
+                    "" if item.get("power_correction_db") is None else f"{float(item['power_correction_db']):.6f}",
+                    "" if item.get("corrected_power_dbm") is None else f"{float(item['corrected_power_dbm']):.6f}",
+                    "" if item.get("power_freq_hz") is None else f"{float(item['power_freq_hz']):.6f}",
+                    "" if item.get("freq_error_hz") is None else f"{float(item['freq_error_hz']):.6f}",
+                    str(bool(item.get("missing"))).lower(),
+                    item.get("missing_reason", ""),
+                    item.get("readout_mode", ""),
+                ]
+            )
+
+
+def write_scheduler_fsh_maxhold_plot_svg(path: Path, bins: Sequence[dict], title: str) -> None:
+    present = [
+        item
+        for item in bins
+        if item.get("power_dbm") is not None and is_valid_analyzer_power_dbm(item["power_dbm"])
+    ]
+    width = 960
+    height = 420
+    margin_left = 72
+    margin_right = 24
+    margin_top = 48
+    margin_bottom = 56
+    if not present:
+        path.write_text(
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">'
+            f'<text x="24" y="36">{title}: no bins</text></svg>\n',
+            encoding="utf-8",
+        )
+        return
+
+    expected_freqs = [
+        float(item["expected_hz"])
+        for item in bins
+        if item.get("expected_hz") is not None and math.isfinite(float(item["expected_hz"]))
+    ]
+    if not expected_freqs:
+        expected_freqs = [float(index) for index, _item in enumerate(present)]
+    min_freq = min(expected_freqs)
+    max_freq = max(expected_freqs)
+    plot_powers = [scheduler_fsh_bin_plot_power_dbm(item) for item in present]
+    plot_powers = [item for item in plot_powers if item is not None]
+    min_power = min(plot_powers)
+    max_power = max(plot_powers)
+    if not math.isfinite(min_freq) or not math.isfinite(max_freq) or math.isclose(min_freq, max_freq):
+        min_freq -= 1.0
+        max_freq += 1.0
+    if not math.isfinite(min_power) or not math.isfinite(max_power) or math.isclose(min_power, max_power):
+        min_power -= 1.0
+        max_power += 1.0
+    freq_span = max_freq - min_freq
+    power_span = max_power - min_power
+    if not math.isfinite(freq_span) or freq_span <= 0.0:
+        freq_span = 1.0
+    if not math.isfinite(power_span) or power_span <= 0.0:
+        power_span = 1.0
+    plot_w = width - margin_left - margin_right
+    plot_h = height - margin_top - margin_bottom
+
+    def x_for(freq_hz: float) -> float:
+        return margin_left + ((freq_hz - min_freq) / freq_span * plot_w)
+
+    def y_for(power_dbm: float) -> float:
+        return margin_top + ((max_power - power_dbm) / power_span * plot_h)
+
+    points = []
+    circles = []
+    for item in bins:
+        if item.get("power_dbm") is None or not is_valid_analyzer_power_dbm(item["power_dbm"]):
+            continue
+        expected_hz = float(item.get("expected_hz", len(points)))
+        if not math.isfinite(expected_hz):
+            continue
+        x = x_for(expected_hz)
+        plot_power_dbm = scheduler_fsh_bin_plot_power_dbm(item)
+        if plot_power_dbm is None:
+            continue
+        y = y_for(plot_power_dbm)
+        color = "#c43c39" if item.get("missing") else "#1f6f8b"
+        points.append(f"{x:.2f},{y:.2f}")
+        circles.append(
+            f'<circle cx="{x:.2f}" cy="{y:.2f}" r="4" fill="{color}">'
+            f'<title>{expected_hz / 1e6:.6f} MHz: {plot_power_dbm:.2f} dBm</title>'
+            "</circle>"
+        )
+
+    polyline = " ".join(points)
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#f8f5ee"/>',
+        f'<text x="{margin_left}" y="28" font-family="Arial" font-size="18" fill="#1b1b1b">{title}</text>',
+        f'<line x1="{margin_left}" y1="{height - margin_bottom}" x2="{width - margin_right}" y2="{height - margin_bottom}" stroke="#333"/>',
+        f'<line x1="{margin_left}" y1="{margin_top}" x2="{margin_left}" y2="{height - margin_bottom}" stroke="#333"/>',
+        f'<text x="{margin_left}" y="{height - 16}" font-family="Arial" font-size="12">{min_freq / 1e6:.3f} MHz</text>',
+        f'<text x="{width - margin_right - 92}" y="{height - 16}" font-family="Arial" font-size="12">{max_freq / 1e6:.3f} MHz</text>',
+        f'<text x="12" y="{margin_top + 8}" font-family="Arial" font-size="12">{max_power:.1f} dBm</text>',
+        f'<text x="12" y="{height - margin_bottom}" font-family="Arial" font-size="12">{min_power:.1f} dBm</text>',
+        f'<polyline fill="none" stroke="#1f6f8b" stroke-width="2" points="{polyline}"/>',
+        *circles,
+        "</svg>",
+    ]
+    path.write_text("\n".join(svg) + "\n", encoding="utf-8")
+
+
 def print_step_summary(step: StepSpec, metrics: SpectrumMetrics) -> None:
     freq_text = f"{metrics.power_freq_hz / 1e6:.6f} MHz"
     err_text = ""
     delta_text = ""
     marker_text = ""
     spur_text = ""
+    cal_text = ""
 
     if metrics.nearest_expected_hz is not None and metrics.nearest_error_hz is not None:
         err_text = (
@@ -1428,10 +2264,15 @@ def print_step_summary(step: StepSpec, metrics: SpectrumMetrics) -> None:
             f"{metrics.spur_freq_hz / 1e6:.6f} MHz"
             f", SFDR={metrics.sfdr_db:.3f} dBc"
         )
+    if metrics.corrected_power_dbm is not None and metrics.power_correction_db is not None:
+        cal_text = (
+            f", CorrectedPower={metrics.corrected_power_dbm:.3f} dBm"
+            f" ({metrics.power_correction_db:+.3f} dB)"
+        )
 
     print(
         f"[HOST] {step.name}: Power={metrics.power_dbm:.3f} dBm, "
-        f"Freq={freq_text}{err_text}{delta_text}{marker_text}{spur_text}"
+        f"Freq={freq_text}{err_text}{delta_text}{marker_text}{spur_text}{cal_text}"
     )
 
 
@@ -1643,6 +2484,410 @@ def build_awg_scheduler_analyzer_settings(base: AnalyzerSettings) -> AnalyzerSet
     )
 
 
+def override_analyzer_settings(
+    base: AnalyzerSettings,
+    *,
+    rbw_hz: Optional[float] = None,
+    vbw_hz: Optional[float] = None,
+    sweep_count: Optional[int] = None,
+    trace_mode: Optional[str] = None,
+    capture_trace: Optional[bool] = None,
+) -> AnalyzerSettings:
+    return AnalyzerSettings(
+        rbw_hz=base.rbw_hz if rbw_hz is None else rbw_hz,
+        vbw_hz=base.vbw_hz if vbw_hz is None else vbw_hz,
+        sweep_count=base.sweep_count if sweep_count is None else sweep_count,
+        trace_mode=base.trace_mode if trace_mode is None else trace_mode,
+        detector=base.detector,
+        reference_level_dbm=base.reference_level_dbm,
+        display_range_db=base.display_range_db,
+        attenuation_auto=base.attenuation_auto,
+        preamp_on=base.preamp_on,
+        impedance_ohms=base.impedance_ohms,
+        capture_trace=base.capture_trace if capture_trace is None else capture_trace,
+    )
+
+
+def build_scheduler_fsh_maxhold_settings(base: AnalyzerSettings) -> AnalyzerSettings:
+    return override_analyzer_settings(
+        base,
+        sweep_count=max(1, base.sweep_count),
+        trace_mode="maxhold",
+        capture_trace=True,
+    )
+
+
+def estimate_stream_frames_send_seconds(
+    frames: Sequence[bytes],
+    args: argparse.Namespace,
+) -> float:
+    chunk_chars = max(2, int(args.scheduler_stream_hex_line_chars))
+    if chunk_chars % 2:
+        chunk_chars -= 1
+    total_s = 0.0
+    for frame in frames:
+        hex_chars = len(frame) * 2
+        chunks = max(1, math.ceil(hex_chars / float(chunk_chars)))
+        chars_per_chunk = min(chunk_chars, hex_chars) + 1
+        wire_time_s = (chars_per_chunk * 10.0) / max(1.0, float(args.baudrate))
+        total_s += chunks * max(args.scheduler_stream_hex_chunk_delay_s, wire_time_s * 1.5)
+    return total_s
+
+
+def build_scheduler_fsh_events(
+    freqs_hz: Sequence[float],
+    *,
+    args: argparse.Namespace,
+    info: Any,
+    tick_hz: int,
+    dds_clock_hz: int,
+    dds_phase_dw: int,
+    dwell_us: int,
+    start_ticks: int = 0,
+) -> List[Any]:
+    return build_awg_sweep_events(
+        [int(round(item)) for item in freqs_hz],
+        tick_hz=tick_hz,
+        dds_clock_hz=dds_clock_hz,
+        dds_phase_dw=dds_phase_dw,
+        tone=args.awg_sweep_tone if args.awg_sweep_tone is not None else 0,
+        scale_u=args.awg_sweep_scale_u if args.awg_sweep_scale_u is not None else 700000,
+        start_ticks=start_ticks,
+        dwell_us=dwell_us,
+    )
+
+
+def run_preload_scheduler_event_batches(
+    uart: "UartCoordinator",
+    args: argparse.Namespace,
+    *,
+    info: Any,
+    freqs_hz: Sequence[float],
+    tick_hz: int,
+    dds_clock_hz: int,
+    dds_phase_dw: int,
+    dwell_us: int,
+    repeats: int,
+    before_run: Optional[Any] = None,
+    after_run: Optional[Any] = None,
+) -> List[dict]:
+    run_records: List[dict] = []
+    batch_specs = build_scheduler_batch_specs(freqs_hz, info.max_events)
+    for repeat_index in range(1, repeats + 1):
+        for batch in batch_specs:
+            events = build_scheduler_fsh_events(
+                batch.freqs_hz,
+                args=args,
+                info=info,
+                tick_hz=tick_hz,
+                dds_clock_hz=dds_clock_hz,
+                dds_phase_dw=dds_phase_dw,
+                dwell_us=dwell_us,
+            )
+            load_summary = load_awg_scheduler_events_into_console(uart, args, events)
+            run_start_s = time.monotonic()
+            if before_run:
+                before_run()
+            uart.send_line("RUN")
+            try:
+                matched = uart.wait_for(
+                    AWG_CONSOLE_RUN_DONE_MARKER,
+                    args.uart_timeout,
+                    extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+                )
+                if matched == AWG_CONSOLE_ERROR_MARKER:
+                    raise RuntimeError("Scheduler console reported an error during maxhold preload RUN.")
+            finally:
+                if after_run:
+                    after_run()
+            run_elapsed_s = time.monotonic() - run_start_s
+            run_records.append(
+                {
+                    "transport": "preload",
+                    "repeat_index": repeat_index,
+                    "batch_index": batch.batch_index,
+                    "total_batches": batch.total_batches,
+                    "start_index": batch.start_index,
+                    "event_count": len(events),
+                    "freq_start_hz": batch.freqs_hz[0] if batch.freqs_hz else None,
+                    "freq_stop_hz": batch.freqs_hz[-1] if batch.freqs_hz else None,
+                    "load_summary": load_summary,
+                    "run_done_marker": matched,
+                    "run_elapsed_s": run_elapsed_s,
+                }
+            )
+    return run_records
+
+
+def run_stream_scheduler_events(
+    uart: "UartCoordinator",
+    args: argparse.Namespace,
+    *,
+    freqs_hz: Sequence[float],
+    tick_hz: int,
+    dds_clock_hz: int,
+    dds_phase_dw: int,
+    dwell_us: int,
+    repeats: int,
+    before_wait: Optional[Any] = None,
+    after_wait: Optional[Any] = None,
+) -> List[dict]:
+    records: List[dict] = []
+    frame_events = max(1, args.scheduler_stream_frame_events)
+    for repeat_index in range(1, repeats + 1):
+        reset_status = reset_awg_stream_console(uart, args)
+        provisional_events = build_scheduler_fsh_events(
+            freqs_hz,
+            args=args,
+            info=None,
+            tick_hz=tick_hz,
+            dds_clock_hz=dds_clock_hz,
+            dds_phase_dw=dds_phase_dw,
+            dwell_us=dwell_us,
+            start_ticks=max(1, int(tick_hz)),
+        )
+        provisional_frames = [
+            pack_stream_frame(
+                provisional_events[offset : offset + frame_events],
+                seq=1 + (offset // frame_events),
+                open_stream=(offset == 0),
+                close_with_eof=(offset + frame_events >= len(provisional_events)),
+            )
+            for offset in range(0, len(provisional_events), frame_events)
+        ]
+        upload_margin_s = max(
+            5.0,
+            estimate_stream_frames_send_seconds(provisional_frames, args) + 3.0,
+            estimate_uartlite_stream_seconds(len(provisional_events)) + 3.0,
+        )
+        start_ticks = args.awg_sweep_start_ticks or int(upload_margin_s * tick_hz)
+        events = build_scheduler_fsh_events(
+            freqs_hz,
+            args=args,
+            info=None,
+            tick_hz=tick_hz,
+            dds_clock_hz=dds_clock_hz,
+            dds_phase_dw=dds_phase_dw,
+            dwell_us=dwell_us,
+            start_ticks=start_ticks,
+        )
+        frames = [
+            pack_stream_frame(
+                events[offset : offset + frame_events],
+                seq=repeat_index * 1000 + (offset // frame_events) + 1,
+                open_stream=(offset == 0),
+                close_with_eof=(offset + frame_events >= len(events)),
+            )
+            for offset in range(0, len(events), frame_events)
+        ]
+        frame_results = []
+        for frame in frames:
+            frame_results.append(send_awg_stream_frame_hex(uart, args, frame))
+        if before_wait:
+            before_wait()
+        try:
+            done_status = wait_awg_stream_done(
+                uart,
+                args,
+                timeout_s=max(
+                    args.scheduler_stream_wait_timeout_s,
+                    upload_margin_s + (len(events) * dwell_us / 1_000_000.0) + 10.0,
+                ),
+            )
+        finally:
+            if after_wait:
+                after_wait()
+        records.append(
+            {
+                "transport": "stream",
+                "repeat_index": repeat_index,
+                "event_count": len(events),
+                "frame_count": len(frames),
+                "frame_events": frame_events,
+                "start_ticks": start_ticks,
+                "upload_margin_s": upload_margin_s,
+                "reset_status": asdict(reset_status),
+                "frames": frame_results,
+                "done_status": asdict(done_status),
+            }
+        )
+    return records
+
+
+def upload_stream_scheduler_event_batch(
+    uart: "UartCoordinator",
+    args: argparse.Namespace,
+    *,
+    freqs_hz: Sequence[float],
+    tick_hz: int,
+    dds_clock_hz: int,
+    dds_phase_dw: int,
+    dwell_us: int,
+    seq_base: int,
+) -> Tuple[List[Any], str, float, dict]:
+    reset_status = reset_awg_stream_console(uart, args)
+    frame_events = max(1, args.scheduler_stream_frame_events)
+    provisional_events = build_scheduler_fsh_events(
+        freqs_hz,
+        args=args,
+        info=None,
+        tick_hz=tick_hz,
+        dds_clock_hz=dds_clock_hz,
+        dds_phase_dw=dds_phase_dw,
+        dwell_us=dwell_us,
+        start_ticks=max(1, int(tick_hz)),
+    )
+    provisional_frames = [
+        pack_stream_frame(
+            provisional_events[offset : offset + frame_events],
+            seq=seq_base + (offset // frame_events),
+            open_stream=(offset == 0),
+            close_with_eof=(offset + frame_events >= len(provisional_events)),
+        )
+        for offset in range(0, len(provisional_events), frame_events)
+    ]
+    upload_margin_s = max(
+        5.0,
+        estimate_stream_frames_send_seconds(provisional_frames, args) + 3.0,
+        estimate_uartlite_stream_seconds(len(provisional_events)) + 3.0,
+    )
+    start_ticks = args.awg_sweep_start_ticks or int(upload_margin_s * tick_hz)
+    events = build_scheduler_fsh_events(
+        freqs_hz,
+        args=args,
+        info=None,
+        tick_hz=tick_hz,
+        dds_clock_hz=dds_clock_hz,
+        dds_phase_dw=dds_phase_dw,
+        dwell_us=dwell_us,
+        start_ticks=start_ticks,
+    )
+    frames = [
+        pack_stream_frame(
+            events[offset : offset + frame_events],
+            seq=seq_base + (offset // frame_events),
+            open_stream=(offset == 0),
+            close_with_eof=(offset + frame_events >= len(events)),
+        )
+        for offset in range(0, len(events), frame_events)
+    ]
+
+    frame_results = []
+    first_ack_monotonic_s: Optional[float] = None
+    for frame in frames:
+        result = send_awg_stream_frame_hex(uart, args, frame)
+        if first_ack_monotonic_s is None:
+            first_ack_monotonic_s = float(result["wire_stats"].get("ack_monotonic_s", time.monotonic()))
+        frame_results.append(result)
+
+    if first_ack_monotonic_s is None:
+        first_ack_monotonic_s = time.monotonic()
+    anchor_line = (
+        f"[HOST-STREAM-ANCHOR] first_ack_monotonic_s={first_ack_monotonic_s:.6f} "
+        f"start_ticks={start_ticks} upload_margin_s={upload_margin_s:.6f}"
+    )
+    record = {
+        "transport": "stream",
+        "event_count": len(events),
+        "frame_count": len(frames),
+        "frame_events": frame_events,
+        "start_ticks": start_ticks,
+        "upload_margin_s": upload_margin_s,
+        "reset_status": asdict(reset_status),
+        "frames": frame_results,
+        "epoch_anchor": {
+            "source": "first_stream_ack",
+            "line": anchor_line,
+            "monotonic_s": first_ack_monotonic_s,
+        },
+    }
+    return events, anchor_line, first_ack_monotonic_s, record
+
+
+def read_scheduler_fsh_maxhold_bins(
+    analyzer: RohdeSchwarzFSH,
+    *,
+    expected_freqs_hz: Sequence[float],
+    geometry: SchedulerFshCaptureGeometry,
+    readout_mode: str,
+    min_power_dbm: Optional[float],
+    missing_relative_db: Optional[float],
+    allow_marker_flatline: bool,
+    marker_flatline_floor_dbm: Optional[float],
+    marker_flatline_epsilon_db: float,
+) -> Tuple[List[dict], List[float], List[float], str, Optional[str]]:
+    trace_freqs_hz: List[float] = []
+    trace_levels_dbm: List[float] = []
+    trace_error: Optional[str] = None
+    effective_readout = readout_mode
+
+    if readout_mode in ("trace", "hybrid"):
+        try:
+            trace_freqs_hz, trace_levels_dbm = analyzer.capture_current_trace_data(
+                geometry.center_hz,
+                geometry.span_hz,
+            )
+            bins = extract_maxhold_bins_from_trace(
+                trace_freqs_hz,
+                trace_levels_dbm,
+                expected_freqs_hz,
+                geometry.bin_half_width_hz,
+                min_power_dbm=min_power_dbm,
+                missing_relative_db=missing_relative_db,
+                readout_mode="trace",
+            )
+            return bins, trace_freqs_hz, trace_levels_dbm, "trace", None
+        except Exception as exc:
+            trace_error = str(exc)
+            if readout_mode == "trace":
+                raise
+            effective_readout = "marker"
+
+    bins = []
+    for index, expected_hz in enumerate(expected_freqs_hz, start=1):
+        left_hz = expected_hz - geometry.bin_half_width_hz
+        right_hz = expected_hz + geometry.bin_half_width_hz
+        try:
+            # FSH8 V1.58 accepts the marker window SCPI but does not reliably
+            # constrain CALC:MARK1:MAX to that window. Read the max-held trace
+            # at the expected frequency instead; the bin validator still checks
+            # the returned marker coordinate is inside the bin.
+            power_dbm, power_freq_hz = analyzer.query_marker_at_frequency_current_trace(expected_hz)
+        except Exception as exc:
+            power_dbm = None
+            power_freq_hz = None
+            missing_reason = f"marker_query_failed:{exc}"
+        else:
+            missing_reason = ""
+        freq_error_hz = None if power_freq_hz is None else power_freq_hz - expected_hz
+        bins.append(
+            {
+                "index": index,
+                "expected_hz": expected_hz,
+                "left_hz": left_hz,
+                "right_hz": right_hz,
+                "power_dbm": power_dbm,
+                "power_freq_hz": power_freq_hz,
+                "freq_error_hz": freq_error_hz,
+                "missing": power_dbm is None or power_freq_hz is None,
+                "missing_reason": missing_reason if power_dbm is None or power_freq_hz is None else "",
+                "readout_mode": "marker",
+            }
+        )
+    apply_scheduler_fsh_missing_thresholds(
+        bins,
+        min_power_dbm=min_power_dbm,
+        missing_relative_db=missing_relative_db,
+    )
+    if effective_readout == "marker" and not allow_marker_flatline:
+        apply_scheduler_fsh_marker_flatline_guard(
+            bins,
+            floor_power_dbm=marker_flatline_floor_dbm,
+            epsilon_db=marker_flatline_epsilon_db,
+        )
+    return bins, trace_freqs_hz, trace_levels_dbm, effective_readout, trace_error
+
+
 def resolve_awg_sweep_dwell_us(args: argparse.Namespace, *, analyzer_enabled: bool) -> int:
     if args.awg_sweep_dwell_us is not None:
         dwell_us = args.awg_sweep_dwell_us
@@ -1728,6 +2973,7 @@ def send_awg_stream_frame_hex(
     frame: bytes,
     *,
     expected_status: Optional[int] = 0,
+    tolerated_statuses: Optional[Iterable[int]] = None,
 ) -> dict:
     payload_hex = frame.hex()
     command_start_s = time.monotonic()
@@ -1753,15 +2999,23 @@ def send_awg_stream_frame_hex(
     if chunk_chars % 2:
         chunk_chars -= 1
     for offset in range(0, len(payload_hex), chunk_chars):
-        uart.send(payload_hex[offset : offset + chunk_chars])
-        if args.scheduler_stream_hex_chunk_delay_s > 0:
-            time.sleep(args.scheduler_stream_hex_chunk_delay_s)
-    uart.send_line()
+        chunk = payload_hex[offset : offset + chunk_chars]
+        uart.send_line(chunk)
+        wire_time_s = ((len(chunk) + 1) * 10.0) / max(1.0, float(args.baudrate))
+        delay_s = max(args.scheduler_stream_hex_chunk_delay_s, wire_time_s * 1.5)
+        if delay_s > 0:
+            time.sleep(delay_s)
 
-    ack_line, ack_time_s = uart.wait_for_line_containing_timed(
-        AWG_STREAM_ACK_PREFIX,
-        args.uart_timeout,
-    )
+    try:
+        ack_line, ack_time_s = uart.wait_for_line_containing_timed(
+            AWG_STREAM_ACK_PREFIX,
+            args.uart_timeout,
+        )
+    except TimeoutError:
+        # If UARTLite drops a byte, firmware remains in the exact hex reader.
+        # A non-hex byte forces payload_read_failed and returns it to command mode.
+        uart.send_line("X")
+        raise
     ack = parse_stream_ack_line(ack_line)
     elapsed_s = max(0.0, ack_time_s - command_start_s)
     stats = stream_frame_wire_stats(frame, elapsed_s=elapsed_s)
@@ -1770,10 +3024,13 @@ def send_awg_stream_frame_hex(
         stats["wall_clock_per_event_s"] = elapsed_s / event_count
         stats["effective_events_per_s"] = event_count / elapsed_s
     stats["ack_latency_s"] = elapsed_s
+    stats["command_start_monotonic_s"] = command_start_s
+    stats["ack_monotonic_s"] = ack_time_s
 
     if ack.magic != AWG_STREAM_PROTO_MAGIC:
         raise RuntimeError(f"Stream ACK magic mismatch: 0x{ack.magic:08X}")
-    if expected_status is not None and ack.status != expected_status:
+    tolerated = set(tolerated_statuses or [])
+    if expected_status is not None and ack.status != expected_status and ack.status not in tolerated:
         raise RuntimeError(
             f"Stream ACK status mismatch: expected {expected_status}, got {ack.status} ({ack.status_name})"
         )
@@ -1805,6 +3062,7 @@ def wait_awg_stream_done(
 
 
 def build_scheduler_transport_manifest(args: argparse.Namespace) -> dict:
+    rf_power_calibration = build_rf_power_calibration(args)
     return {
         "selected_transport": args.scheduler_transport,
         "preload_limit_events": 256,
@@ -1825,6 +3083,20 @@ def build_scheduler_transport_manifest(args: argparse.Namespace) -> dict:
             "throughput_claims_deferred_until": ["UART16550", "Ethernet"],
         },
         "stream_depth_sentinel": args.scheduler_stream_depth_sentinel,
+        "fsh_capture": {
+            "mode": args.scheduler_fsh_capture_mode,
+            "maxhold_repeats": args.scheduler_fsh_maxhold_repeats,
+            "readout": args.scheduler_fsh_readout,
+            "span_pad_hz": args.scheduler_fsh_span_pad_hz,
+            "bin_window_hz": args.scheduler_fsh_bin_window_hz,
+            "min_power_dbm": args.scheduler_fsh_min_power_dbm,
+            "missing_relative_db": args.scheduler_fsh_missing_relative_db,
+            "allow_marker_flatline": args.scheduler_fsh_allow_marker_flatline,
+            "marker_flatline_floor_dbm": args.scheduler_fsh_marker_flatline_floor_dbm,
+            "marker_flatline_epsilon_db": args.scheduler_fsh_marker_flatline_epsilon_db,
+            "calibrate_capture": args.scheduler_fsh_calibrate_capture,
+        },
+        "rf_power_calibration": asdict(rf_power_calibration),
     }
 
 
@@ -1924,6 +3196,16 @@ def build_scheduler_benchmark_catalog() -> dict:
                     "steady-state carrier power",
                     "strongest spur within configured search band",
                     "SFDR at scheduler-held tones",
+                ],
+            },
+            {
+                "id": "scheduler_full_sweep_maxhold",
+                "kind": "implemented",
+                "measures": [
+                    "whole-sweep tone coverage",
+                    "max-held power flatness",
+                    "legacy FSH marker-window fallback",
+                    "RBW/VBW/dwell/repeat calibration",
                 ],
             },
             {
@@ -2227,6 +3509,30 @@ def parse_args() -> argparse.Namespace:
         help="FSH8 input impedance setting",
     )
     parser.add_argument(
+        "--rf-power-correction-db",
+        type=float,
+        default=0.0,
+        help=(
+            "Fixed RF path correction added to analyzer dBm readings. "
+            "Use a positive value for cable/attenuator loss between DUT and analyzer."
+        ),
+    )
+    parser.add_argument(
+        "--rf-power-calibration-csv",
+        default="",
+        help="Optional CSV table of frequency_hz,correction_db added to --rf-power-correction-db.",
+    )
+    parser.add_argument(
+        "--rf-power-calibration-label",
+        default="",
+        help="Human-readable RF power calibration identifier written into artifacts.",
+    )
+    parser.add_argument(
+        "--rf-power-calibration-note",
+        default="",
+        help="Free-form RF power calibration note written into artifacts.",
+    )
+    parser.add_argument(
         "--capture-trace",
         action="store_true",
         help="Also read back TRAC:DATA? TRACE1 for DDS-band and optional NCO steps. SFDR uses segmented marker sweeps to avoid FSH8 trace-transfer timeouts.",
@@ -2245,6 +3551,14 @@ def parse_args() -> argparse.Namespace:
         "--run-scheduler-benchmark-suite",
         action="store_true",
         help="Run the scheduler-native benchmark suite instead of the legacy prompt-driven analyzer flow.",
+    )
+    parser.add_argument(
+        "--scheduler-keep-console-open",
+        action="store_true",
+        help=(
+            "Leave the AWG scheduler UART console running after a scheduler benchmark suite. "
+            "Use this for repeated --skip-make-run bench iterations."
+        ),
     )
     parser.add_argument(
         "--scheduler-suite-profile",
@@ -2267,6 +3581,141 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--scheduler-fsh-capture-mode",
+        choices=["per-step", "maxhold"],
+        default="per-step",
+        help="FSH scheduler capture mode. per-step preserves the existing one-capture-per-tone path; maxhold captures the whole sweep at once.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-maxhold-repeats",
+        type=int,
+        default=1,
+        help="Number of scheduler sweep repetitions accumulated in one FSH max-hold capture.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-span-pad-hz",
+        type=float,
+        default=None,
+        help="Full-sweep max-hold span padding on each side. Default is max(2 MHz, 5*RBW).",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-bin-window-hz",
+        type=float,
+        default=None,
+        help="Half-width of each expected-tone bin for full-sweep readout. Default avoids overlap and is RBW-aware.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-readout",
+        choices=["hybrid", "marker", "trace"],
+        default="hybrid",
+        help="Full-sweep max-hold readout mode. hybrid tries trace export first and falls back to marker-window scans.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-min-power-dbm",
+        type=float,
+        default=None,
+        help="Optional absolute minimum bin power; bins below this are marked missing.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-missing-relative-db",
+        type=float,
+        default=30.0,
+        help="Mark bins more than this many dB below the strongest bin as missing. Use a negative value to disable.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-allow-marker-flatline",
+        action="store_true",
+        help="Do not reject marker-fallback max-hold bins when all bins read the same floor-level power.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-marker-flatline-floor-dbm",
+        type=float,
+        default=-60.0,
+        help="Maximum power for treating identical marker-fallback bins as an untrusted floor readout.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-marker-flatline-epsilon-db",
+        type=float,
+        default=0.02,
+        help="Power spread threshold for detecting untrusted flat marker-fallback readout.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-calibrate-capture",
+        choices=["off", "quick", "exhaustive"],
+        default="off",
+        help="Run an FSH max-hold capture calibration before the real run.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-cal-rbw-hz-list",
+        default="30000,100000,300000",
+        help="Comma-separated RBW candidates for FSH capture calibration.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-cal-vbw-ratio-list",
+        default="1.0,0.3",
+        help="Comma-separated VBW/RBW ratios for FSH capture calibration.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-cal-dwell-us-list",
+        default="500000,1000000,2000000,5000000,10000000",
+        help="Comma-separated scheduler dwell candidates in microseconds for FSH capture calibration.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-cal-repeats-list",
+        default="1,2",
+        help="Comma-separated repeat-count candidates for FSH capture calibration.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-cal-max-minutes",
+        type=float,
+        default=60.0,
+        help="Safety cap for estimated FSH calibration runtime.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-cal-force",
+        action="store_true",
+        help="Allow FSH calibration to exceed --scheduler-fsh-cal-max-minutes.",
+    )
+    parser.add_argument(
+        "--scheduler-fsh-cal-max-repeat-spread-db",
+        type=float,
+        default=1.5,
+        help="Maximum allowed per-bin repeat power spread for a calibration candidate.",
+    )
+    parser.add_argument(
+        "--scheduler-dense-rf-max-freq-error-hz",
+        type=float,
+        default=500_000.0,
+        help="Advisory dense RF quality limit for absolute peak frequency error. Use a negative value to disable.",
+    )
+    parser.add_argument(
+        "--scheduler-dense-rf-min-power-dbm",
+        type=float,
+        default=None,
+        help="Optional advisory dense RF quality minimum peak power.",
+    )
+    parser.add_argument(
+        "--scheduler-dense-rf-max-flatness-db",
+        type=float,
+        default=6.0,
+        help="Advisory dense RF quality limit for peak-power flatness. Use a negative value to disable.",
+    )
+    parser.add_argument(
+        "--scheduler-dense-rf-max-peak-marker-delta-db",
+        type=float,
+        default=6.0,
+        help=(
+            "Advisory dense RF quality limit for peak power minus marker-at-expected power. "
+            "Large values usually mean the peak finder found noise/spur away from the intended tone. "
+            "Use a negative value to disable."
+        ),
+    )
+    parser.add_argument(
+        "--scheduler-dense-rf-enforce",
+        action="store_true",
+        help="Fail the scheduler dense suite if advisory RF quality checks fail.",
+    )
+    parser.add_argument(
         "--scheduler-stream-depth-sentinel",
         type=int,
         default=511,
@@ -2282,7 +3731,11 @@ def parse_args() -> argparse.Namespace:
         "--scheduler-stream-bringup-events",
         type=int,
         default=0,
-        help="Depth-plus refill event count for stream bring-up. Default uses STREAM_DEPTH+16 after reading hardware.",
+        help=(
+            "Refill event count for stream bring-up. Default is a UARTLite-safe "
+            "two-frame run; use STREAM_DEPTH+16 only with a faster transport or "
+            "a suitably large --awg-sweep-start-ticks margin."
+        ),
     )
     parser.add_argument(
         "--scheduler-stream-dwell-us",
@@ -2305,14 +3758,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scheduler-stream-hex-line-chars",
         type=int,
-        default=64,
+        default=16,
         help="Hex characters sent per UART write while sending STREAMHEX payloads.",
     )
     parser.add_argument(
         "--scheduler-stream-hex-chunk-delay-s",
         type=float,
-        default=0.002,
-        help="Delay between STREAMHEX payload chunks to avoid overrunning UARTLite console input.",
+        default=0.01,
+        help=(
+            "Minimum delay between STREAMHEX payload chunks. The host also enforces "
+            "a baud-derived delay, so this is a floor to avoid overrunning UARTLite input."
+        ),
     )
     parser.add_argument(
         "--scheduler-suite-sfdr-dwell-us",
@@ -2704,11 +4160,17 @@ def ensure_args(args: argparse.Namespace) -> None:
             raise SystemExit("--run-scheduler-benchmark-suite cannot be combined with --run-full-integration")
         if args.scheduler_suite_profile not in ("scope-plan", "stream-bringup") and not args.visa_resource:
             raise SystemExit("--run-scheduler-benchmark-suite requires --visa-resource unless --scheduler-suite-profile=scope-plan or stream-bringup")
-        if args.scheduler_transport in ("stream", "compare") and args.scheduler_suite_profile in ("dense", "sfdr", "fsh"):
+        if (
+            args.scheduler_transport == "compare"
+            and args.scheduler_suite_profile in ("dense", "sfdr", "fsh")
+            and args.scheduler_fsh_capture_mode != "maxhold"
+        ):
             raise SystemExit(
-                "--scheduler-transport stream/compare is currently gated to --scheduler-suite-profile stream-bringup "
-                "or all; FSH dense/SFDR stream execution should be enabled after stream bring-up passes."
+                "--scheduler-transport compare for FSH requires --scheduler-fsh-capture-mode maxhold. "
+                "Per-step compare is not implemented."
             )
+        if args.scheduler_transport == "stream" and args.scheduler_suite_profile == "sfdr":
+            raise SystemExit("Scheduler SFDR spot mode is preload-only; use --scheduler-transport preload.")
     if not args.serial_port and not (scheduler_suite_mode and args.scheduler_suite_profile == "scope-plan"):
         raise SystemExit("--serial-port is required for coordinated UART + analyzer operation")
     if args.sweep_count < 1:
@@ -2731,6 +4193,13 @@ def ensure_args(args: argparse.Namespace) -> None:
         args.awg_sweep_step_hz,
         "AWG-sweep",
     )
+    if not math.isfinite(args.rf_power_correction_db):
+        raise SystemExit("--rf-power-correction-db must be finite")
+    if args.rf_power_calibration_csv:
+        try:
+            build_rf_power_calibration(args)
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"Invalid --rf-power-calibration-csv: {exc}") from exc
     if args.scheduler_suite_sfdr_dwell_us < 1:
         raise SystemExit("--scheduler-suite-sfdr-dwell-us must be at least 1")
     if args.scheduler_stream_depth_sentinel is not None and args.scheduler_stream_depth_sentinel < 0:
@@ -2749,6 +4218,41 @@ def ensure_args(args: argparse.Namespace) -> None:
         raise SystemExit("--scheduler-stream-hex-line-chars must be at least 2")
     if args.scheduler_stream_hex_chunk_delay_s < 0:
         raise SystemExit("--scheduler-stream-hex-chunk-delay-s must be >= 0")
+    if args.scheduler_fsh_maxhold_repeats < 1:
+        raise SystemExit("--scheduler-fsh-maxhold-repeats must be at least 1")
+    if args.scheduler_fsh_span_pad_hz is not None and args.scheduler_fsh_span_pad_hz < 0:
+        raise SystemExit("--scheduler-fsh-span-pad-hz must be non-negative")
+    if args.scheduler_fsh_bin_window_hz is not None and args.scheduler_fsh_bin_window_hz <= 0:
+        raise SystemExit("--scheduler-fsh-bin-window-hz must be greater than 0")
+    if args.scheduler_fsh_missing_relative_db is not None and args.scheduler_fsh_missing_relative_db < 0:
+        args.scheduler_fsh_missing_relative_db = None
+    if args.scheduler_fsh_marker_flatline_epsilon_db < 0:
+        raise SystemExit("--scheduler-fsh-marker-flatline-epsilon-db must be non-negative")
+    if args.scheduler_fsh_cal_max_minutes <= 0:
+        raise SystemExit("--scheduler-fsh-cal-max-minutes must be greater than 0")
+    if args.scheduler_fsh_cal_max_repeat_spread_db < 0:
+        raise SystemExit("--scheduler-fsh-cal-max-repeat-spread-db must be non-negative")
+    if args.scheduler_dense_rf_max_freq_error_hz is not None and args.scheduler_dense_rf_max_freq_error_hz < 0:
+        args.scheduler_dense_rf_max_freq_error_hz = None
+    if args.scheduler_dense_rf_max_flatness_db is not None and args.scheduler_dense_rf_max_flatness_db < 0:
+        args.scheduler_dense_rf_max_flatness_db = None
+    if (
+        args.scheduler_dense_rf_max_peak_marker_delta_db is not None
+        and args.scheduler_dense_rf_max_peak_marker_delta_db < 0
+    ):
+        args.scheduler_dense_rf_max_peak_marker_delta_db = None
+    for label, text in (
+        ("--scheduler-fsh-cal-rbw-hz-list", args.scheduler_fsh_cal_rbw_hz_list),
+        ("--scheduler-fsh-cal-vbw-ratio-list", args.scheduler_fsh_cal_vbw_ratio_list),
+        ("--scheduler-fsh-cal-dwell-us-list", args.scheduler_fsh_cal_dwell_us_list),
+        ("--scheduler-fsh-cal-repeats-list", args.scheduler_fsh_cal_repeats_list),
+    ):
+        try:
+            values = parse_float_csv_list(text, label=label)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if any(item <= 0 for item in values):
+            raise SystemExit(f"{label} values must be greater than 0")
     if args.sfdr_stop_hz <= args.sfdr_start_hz:
         raise SystemExit("--sfdr-stop-hz must be greater than --sfdr-start-hz")
     if args.sfdr_guard_hz <= 0:
@@ -3069,6 +4573,47 @@ def build_awg_scheduler_console_cflags(args: argparse.Namespace) -> str:
     return " ".join(defines)
 
 
+def wait_for_awg_scheduler_console_info(
+    uart: "UartCoordinator",
+    args: argparse.Namespace,
+    *,
+    ready_timeout_s: Optional[float] = None,
+) -> Any:
+    if ready_timeout_s is None:
+        ready_timeout_s = args.uart_timeout
+
+    resync_needed = False
+    try:
+        matched = uart.wait_for(
+            AWG_CONSOLE_READY_MARKER,
+            ready_timeout_s,
+            extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+        )
+        if matched == AWG_CONSOLE_ERROR_MARKER:
+            raise RuntimeError("Scheduler console reported an error before ready.")
+    except TimeoutError:
+        print("[HOST] Scheduler console ready banner not seen; sending INFO resync probe.")
+        resync_needed = True
+
+    if resync_needed:
+        uart.send_line("X")
+        time.sleep(0.1)
+    uart.send_line("INFO")
+    try:
+        info_line = uart.wait_for_line_containing(AWG_CONSOLE_INFO_PREFIX, args.uart_timeout)
+    except TimeoutError as exc:
+        raise TimeoutError(
+            "Timed out waiting for scheduler INFO response. If uart.log is empty, "
+            "verify COM port and board state. If the previous suite printed "
+            "'[AWG-UART] Bye.' or 'FMCDAC Application Completed Success', relaunch "
+            "the ELF or rerun without --skip-make-run; use --scheduler-keep-console-open "
+            "for repeated bench iterations. Also verify the running ELF was built with "
+            "make scheduler-stream or make scheduler-preload."
+        ) from exc
+
+    return parse_info_line(info_line)
+
+
 def execute_awg_scheduler_uploaded_sweep(
     uart: "UartCoordinator",
     console_log: "ConsoleLog",
@@ -3078,16 +4623,11 @@ def execute_awg_scheduler_uploaded_sweep(
     analyzer_settings: Optional[AnalyzerSettings] = None,
     dump_analyzer_state: bool = False,
 ) -> dict:
-    matched = uart.wait_for(
-        AWG_CONSOLE_READY_MARKER,
-        args.uart_timeout,
-        extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+    info = wait_for_awg_scheduler_console_info(
+        uart,
+        args,
+        ready_timeout_s=5.0 if args.skip_make_run else args.uart_timeout,
     )
-    if matched == AWG_CONSOLE_ERROR_MARKER:
-        raise RuntimeError("Scheduler console reported an error before ready.")
-    uart.send_line("INFO")
-    info_line = uart.wait_for_line_containing(AWG_CONSOLE_INFO_PREFIX, args.uart_timeout)
-    info = parse_info_line(info_line)
 
     if info.base_addr == 0:
         raise RuntimeError("Scheduler console is enabled, but FMCDAC_AWG_SCHED_BASEADDR is 0.")
@@ -3100,13 +4640,14 @@ def execute_awg_scheduler_uploaded_sweep(
     if len(freqs_hz) > info.max_events:
         raise RuntimeError(
             f"Requested {len(freqs_hz)} AWG scheduler events, but firmware reports max_events={info.max_events}."
-        )
+    )
 
     dwell_us = resolve_awg_sweep_dwell_us(args, analyzer_enabled=analyzer is not None)
+    scheduler_tick_hz = resolve_awg_scheduler_tick_hz(args, info)
 
     events = build_awg_sweep_events(
         freqs_hz,
-        tick_hz=info.tick_hz,
+        tick_hz=scheduler_tick_hz,
         dds_clock_hz=info.dds_clock_hz,
         dds_phase_dw=info.dds_phase_dw,
         tone=args.awg_sweep_tone if args.awg_sweep_tone is not None else 0,
@@ -3140,11 +4681,11 @@ def execute_awg_scheduler_uploaded_sweep(
 
         for index, (step, event) in enumerate(zip(awg_step_specs, events), start=1):
             event_start_s = scheduler_epoch_monotonic_s + (
-                float(event.timestamp_ticks) / float(info.tick_hz)
+                float(event.timestamp_ticks) / float(scheduler_tick_hz)
             )
             if index < len(events):
                 next_event_start_s = scheduler_epoch_monotonic_s + (
-                    float(events[index].timestamp_ticks) / float(info.tick_hz)
+                    float(events[index].timestamp_ticks) / float(scheduler_tick_hz)
                 )
             else:
                 next_event_start_s = event_start_s + (dwell_us / 1_000_000.0)
@@ -3253,6 +4794,12 @@ def execute_awg_scheduler_uploaded_sweep(
         "mode": "awg_scheduler_console",
         "console_info_initial": asdict(info),
         "info": asdict(info),
+        "scheduler_tick_hz_used": scheduler_tick_hz,
+        "scheduler_tick_hz_source": (
+            "cli"
+            if args.awg_sched_tick_hz is not None
+            else ("console" if scheduler_tick_hz == info.tick_hz else "inferred_dds_clock_div4")
+        ),
         "final_status": asdict(artifact.status),
         "completed_successfully": bool(
             artifact.status.error == 0 and artifact.status.commit_count >= len(events)
@@ -3314,43 +4861,73 @@ def execute_scheduler_dense_fsh_suite(
     measurement_steps: List[StepCaptureSummary] = []
     measurement_windows: List[dict] = []
     batch_summaries: List[dict] = []
+    scheduler_tick_hz = resolve_awg_scheduler_tick_hz(args, info)
+    rf_power_calibration = build_rf_power_calibration(args)
 
     reference_power_dbm: Optional[float] = None
+    reference_corrected_power_dbm: Optional[float] = None
     reference_step_name: Optional[str] = None
+    if args.scheduler_transport == "stream":
+        stream_status_initial = query_awg_stream_status(uart, args, command="STREAMINFO")
+        assert_stream_bringup_identity(stream_status_initial, args)
+    elif args.scheduler_transport != "preload":
+        raise RuntimeError("Per-step scheduler dense FSH supports --scheduler-transport preload or stream.")
 
     for batch in batch_specs:
         batch_output_dir = output_dir / f"batch_{batch.batch_index:03d}"
         batch_output_dir.mkdir(parents=True, exist_ok=True)
         batch_freqs_hz = [int(round(item)) for item in batch.freqs_hz]
-        events = build_awg_sweep_events(
-            batch_freqs_hz,
-            tick_hz=info.tick_hz,
-            dds_clock_hz=info.dds_clock_hz,
-            dds_phase_dw=info.dds_phase_dw,
-            tone=args.awg_sweep_tone if args.awg_sweep_tone is not None else 0,
-            scale_u=args.awg_sweep_scale_u if args.awg_sweep_scale_u is not None else 700000,
-            start_ticks=args.awg_sweep_start_ticks if args.awg_sweep_start_ticks is not None else 0,
-            dwell_us=dwell_us,
-        )
-        load_summary = load_awg_scheduler_events_into_console(uart, args, events)
         step_specs = build_scheduler_dense_step_specs(
             batch.freqs_hz,
             step_index_offset=batch.start_index,
         )
 
-        uart.send_line("RUN")
-        scheduler_epoch_line, scheduler_epoch_monotonic_s = uart.wait_for_line_containing_timed(
-            AWG_SET_EPOCH_ARTIFACT_PREFIX,
-            args.uart_timeout,
-        )
+        stream_record = None
+        if args.scheduler_transport == "stream":
+            events, scheduler_epoch_line, scheduler_epoch_monotonic_s, stream_record = (
+                upload_stream_scheduler_event_batch(
+                    uart,
+                    args,
+                    freqs_hz=batch_freqs_hz,
+                    tick_hz=scheduler_tick_hz,
+                    dds_clock_hz=info.dds_clock_hz,
+                    dds_phase_dw=info.dds_phase_dw,
+                    dwell_us=dwell_us,
+                    seq_base=(batch.batch_index * 1000) + 1,
+                )
+            )
+            load_summary = {
+                "transport": "stream",
+                "event_count": len(events),
+                "frame_count": stream_record["frame_count"],
+                "start_ticks": stream_record["start_ticks"],
+                "upload_margin_s": stream_record["upload_margin_s"],
+            }
+        else:
+            events = build_awg_sweep_events(
+                batch_freqs_hz,
+                tick_hz=scheduler_tick_hz,
+                dds_clock_hz=info.dds_clock_hz,
+                dds_phase_dw=info.dds_phase_dw,
+                tone=args.awg_sweep_tone if args.awg_sweep_tone is not None else 0,
+                scale_u=args.awg_sweep_scale_u if args.awg_sweep_scale_u is not None else 700000,
+                start_ticks=args.awg_sweep_start_ticks if args.awg_sweep_start_ticks is not None else 0,
+                dwell_us=dwell_us,
+            )
+            load_summary = load_awg_scheduler_events_into_console(uart, args, events)
+            uart.send_line("RUN")
+            scheduler_epoch_line, scheduler_epoch_monotonic_s = uart.wait_for_line_containing_timed(
+                AWG_SET_EPOCH_ARTIFACT_PREFIX,
+                args.uart_timeout,
+            )
 
         for index, (step, event) in enumerate(zip(step_specs, events), start=1):
             event_start_s = scheduler_epoch_monotonic_s + (
-                float(event.timestamp_ticks) / float(info.tick_hz)
+                float(event.timestamp_ticks) / float(scheduler_tick_hz)
             )
             if index < len(events):
                 next_event_start_s = scheduler_epoch_monotonic_s + (
-                    float(events[index].timestamp_ticks) / float(info.tick_hz)
+                    float(events[index].timestamp_ticks) / float(scheduler_tick_hz)
                 )
             else:
                 next_event_start_s = event_start_s + (dwell_us / 1_000_000.0)
@@ -3391,12 +4968,17 @@ def execute_scheduler_dense_fsh_suite(
                 )
 
             metrics = summary.metrics
+            apply_spectrum_power_calibration(metrics, rf_power_calibration)
             if reference_power_dbm is None:
                 reference_power_dbm = metrics.power_dbm
+                reference_corrected_power_dbm = metrics.corrected_power_dbm
                 reference_step_name = step.name
             metrics.reference_power_dbm = reference_power_dbm
             metrics.reference_step_name = reference_step_name
             metrics.power_delta_db = metrics.power_dbm - reference_power_dbm
+            if metrics.corrected_power_dbm is not None and reference_corrected_power_dbm is not None:
+                metrics.corrected_reference_power_dbm = reference_corrected_power_dbm
+                metrics.corrected_power_delta_db = metrics.corrected_power_dbm - reference_corrected_power_dbm
 
             if getattr(args, "dump_analyzer_state", False):
                 json_path = batch_output_dir / f"step{step.index:05d}_{step.name}.json"
@@ -3443,36 +5025,65 @@ def execute_scheduler_dense_fsh_suite(
             )
             print_step_summary(step, metrics)
 
-        matched = uart.wait_for(
-            AWG_CONSOLE_RUN_DONE_MARKER,
-            args.uart_timeout,
-            extra_needles=[AWG_CONSOLE_ERROR_MARKER],
-        )
-        if matched == AWG_CONSOLE_ERROR_MARKER:
-            raise RuntimeError("Scheduler console reported an error during dense benchmark RUN.")
-
-        artifact = parse_last_artifact_block(console_log.file_path.read_text(encoding="utf-8"))
+        done_status = None
+        if args.scheduler_transport == "stream":
+            done_status = wait_awg_stream_done(
+                uart,
+                args,
+                timeout_s=max(
+                    args.scheduler_stream_wait_timeout_s,
+                    ((len(events) * dwell_us) / 1_000_000.0) + 15.0,
+                ),
+            )
+            matched = "STREAM_DONE"
+            artifact_dict = None
+        else:
+            matched = uart.wait_for(
+                AWG_CONSOLE_RUN_DONE_MARKER,
+                args.uart_timeout,
+                extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+            )
+            if matched == AWG_CONSOLE_ERROR_MARKER:
+                raise RuntimeError("Scheduler console reported an error during dense benchmark RUN.")
+            artifact = parse_last_artifact_block(console_log.file_path.read_text(encoding="utf-8"))
+            artifact_dict = asdict(artifact)
         batch_summaries.append(
             {
                 "batch_index": batch.batch_index,
                 "total_batches": batch.total_batches,
                 "start_index": batch.start_index,
                 "freqs_hz": batch.freqs_hz,
+                "transport": args.scheduler_transport,
                 "load_summary": load_summary,
                 "scheduler_epoch_anchor_line": scheduler_epoch_line,
-                "artifact": asdict(artifact),
+                "run_done_marker": matched,
+                "artifact": artifact_dict,
+                "stream_record": stream_record,
+                "stream_done_status": None if done_status is None else asdict(done_status),
             }
         )
 
+    rf_quality = summarize_scheduler_dense_rf_quality(
+        measurement_steps,
+        max_freq_error_hz=args.scheduler_dense_rf_max_freq_error_hz,
+        min_power_dbm=args.scheduler_dense_rf_min_power_dbm,
+        max_flatness_db=args.scheduler_dense_rf_max_flatness_db,
+        max_peak_marker_delta_db=args.scheduler_dense_rf_max_peak_marker_delta_db,
+    )
     dense_summary = {
         "kind": "scheduler_dense_sweep",
         "freq_count": len(all_freqs_hz),
         "batch_count": len(batch_specs),
         "max_events_per_batch": info.max_events,
+        "console_tick_hz": info.tick_hz,
+        "scheduler_tick_hz_used": scheduler_tick_hz,
+        "transport": args.scheduler_transport,
         "dwell_us": dwell_us,
         "steps": [asdict(step) for step in measurement_steps],
         "measurement_windows": measurement_windows,
         "batches": batch_summaries,
+        "rf_power_calibration": asdict(rf_power_calibration),
+        "rf_quality": rf_quality,
     }
 
     dense_summary_path = output_dir / "scheduler_dense_sweep.json"
@@ -3489,6 +5100,15 @@ def execute_scheduler_dense_fsh_suite(
             title="Scheduler Dense Sweep Level Delta vs Frequency",
             stem="scheduler_dense_sweep_plot",
         )
+    print(
+        "[HOST] Scheduler dense RF quality "
+        f"passed={rf_quality['passed']} "
+        f"max_abs_freq_error_hz={rf_quality['max_abs_freq_error_hz']} "
+        f"flatness_db={rf_quality['power_flatness_db']} "
+        f"max_peak_marker_delta_db={rf_quality['max_peak_marker_delta_db']}"
+    )
+    if args.scheduler_dense_rf_enforce and not rf_quality["passed"]:
+        raise RuntimeError(f"Scheduler dense RF quality check failed: {rf_quality['failures']}")
     return dense_summary
 
 
@@ -3526,12 +5146,14 @@ def execute_scheduler_sfdr_spot_suite(
     )
     summaries: List[StepCaptureSummary] = []
     batch_summaries: List[dict] = []
+    scheduler_tick_hz = resolve_awg_scheduler_tick_hz(args, info)
+    rf_power_calibration = build_rf_power_calibration(args)
 
     for step in step_specs:
         freq_hz = int(round(step.expected_freq_hz[0]))
         event = build_awg_sweep_events(
             [freq_hz],
-            tick_hz=info.tick_hz,
+            tick_hz=scheduler_tick_hz,
             dds_clock_hz=info.dds_clock_hz,
             dds_phase_dw=info.dds_phase_dw,
             tone=args.awg_sweep_tone if args.awg_sweep_tone is not None else 0,
@@ -3546,7 +5168,9 @@ def execute_scheduler_sfdr_spot_suite(
             args.uart_timeout,
         )
 
-        event_start_s = scheduler_epoch_monotonic_s + (float(event[0].timestamp_ticks) / float(info.tick_hz))
+        event_start_s = scheduler_epoch_monotonic_s + (
+            float(event[0].timestamp_ticks) / float(scheduler_tick_hz)
+        )
         capture_target_s = event_start_s + min(
             AWG_SWEEP_ANALYZER_MAX_SETTLE_S,
             max(AWG_SWEEP_ANALYZER_MIN_SETTLE_S, (dwell_us / 1_000_000.0) * AWG_SWEEP_ANALYZER_SETTLE_FRACTION),
@@ -3556,6 +5180,7 @@ def execute_scheduler_sfdr_spot_suite(
             time.sleep(capture_target_s - now_s)
 
         metrics = analyzer.capture_sfdr(step, analyzer_settings, sfdr_settings)
+        apply_spectrum_power_calibration(metrics, rf_power_calibration)
         csv_path = output_dir / f"step{step.index:03d}_{step.name}.csv"
         if getattr(args, "write_step_csv", False):
             save_trace_csv(
@@ -3612,7 +5237,10 @@ def execute_scheduler_sfdr_spot_suite(
 
     summary = {
         "kind": "scheduler_sfdr_spot_set",
+        "console_tick_hz": info.tick_hz,
+        "scheduler_tick_hz_used": scheduler_tick_hz,
         "dwell_us": dwell_us,
+        "rf_power_calibration": asdict(rf_power_calibration),
         "steps": [asdict(step) for step in summaries],
         "batches": batch_summaries,
     }
@@ -3620,6 +5248,448 @@ def execute_scheduler_sfdr_spot_suite(
     summary_path.write_text(json.dumps(summary, indent=2, default=json_default) + "\n", encoding="utf-8")
     write_sfdr_results_csv(summaries, output_dir / "scheduler_sfdr_spot_set.csv")
     return summary
+
+
+def execute_scheduler_full_sweep_maxhold_run(
+    uart: "UartCoordinator",
+    args: argparse.Namespace,
+    output_dir: Path,
+    info: Any,
+    analyzer: RohdeSchwarzFSH,
+    analyzer_settings: AnalyzerSettings,
+    *,
+    freqs_hz: Sequence[float],
+    dwell_us: int,
+    repeats: int,
+    transport: str,
+    label: str,
+    write_artifacts: bool = True,
+) -> dict:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dds_clock_hz = info.dds_clock_hz or 983_056_640
+    dds_phase_dw = info.dds_phase_dw or 32
+    scheduler_tick_hz = resolve_awg_scheduler_tick_hz(args, info)
+    maxhold_settings = build_scheduler_fsh_maxhold_settings(analyzer_settings)
+    geometry = resolve_scheduler_fsh_capture_geometry(
+        freqs_hz,
+        rbw_hz=maxhold_settings.rbw_hz,
+        span_pad_hz=args.scheduler_fsh_span_pad_hz,
+        bin_window_hz=args.scheduler_fsh_bin_window_hz,
+    )
+
+    stream_status_initial = None
+    if transport == "stream":
+        stream_status_initial = query_awg_stream_status(uart, args, command="STREAMINFO")
+        assert_stream_bringup_identity(stream_status_initial, args)
+
+    analyzer.configure_maxhold_capture(
+        geometry.center_hz,
+        geometry.span_hz,
+        maxhold_settings,
+    )
+    capture_start_s = time.monotonic()
+    run_records: List[dict] = []
+    try:
+        if transport == "preload":
+            run_records = run_preload_scheduler_event_batches(
+                uart,
+                args,
+                info=info,
+                freqs_hz=freqs_hz,
+                tick_hz=scheduler_tick_hz,
+                dds_clock_hz=dds_clock_hz,
+                dds_phase_dw=dds_phase_dw,
+                dwell_us=dwell_us,
+                repeats=repeats,
+                before_run=analyzer.start_maxhold_capture,
+                after_run=analyzer.stop_maxhold_capture,
+            )
+        elif transport == "stream":
+            run_records = run_stream_scheduler_events(
+                uart,
+                args,
+                freqs_hz=freqs_hz,
+                tick_hz=scheduler_tick_hz,
+                dds_clock_hz=dds_clock_hz,
+                dds_phase_dw=dds_phase_dw,
+                dwell_us=dwell_us,
+                repeats=repeats,
+                before_wait=analyzer.start_maxhold_capture,
+                after_wait=analyzer.stop_maxhold_capture,
+            )
+        else:
+            raise ValueError(f"Unsupported maxhold transport: {transport}")
+    finally:
+        analyzer.stop_maxhold_capture()
+    capture_elapsed_s = time.monotonic() - capture_start_s
+
+    bins, trace_freqs_hz, trace_levels_dbm, effective_readout, trace_error = read_scheduler_fsh_maxhold_bins(
+        analyzer,
+        expected_freqs_hz=freqs_hz,
+        geometry=geometry,
+        readout_mode=args.scheduler_fsh_readout,
+        min_power_dbm=args.scheduler_fsh_min_power_dbm,
+        missing_relative_db=args.scheduler_fsh_missing_relative_db,
+        allow_marker_flatline=args.scheduler_fsh_allow_marker_flatline,
+        marker_flatline_floor_dbm=args.scheduler_fsh_marker_flatline_floor_dbm,
+        marker_flatline_epsilon_db=args.scheduler_fsh_marker_flatline_epsilon_db,
+    )
+    rf_power_calibration = build_rf_power_calibration(args)
+    apply_scheduler_fsh_bin_power_calibration(bins, rf_power_calibration)
+    bin_summary = summarize_scheduler_fsh_bins(bins)
+    trace_csv_path = output_dir / "scheduler_full_sweep_maxhold_trace.csv"
+    bins_csv_path = output_dir / "scheduler_full_sweep_maxhold_bins.csv"
+    plot_path = output_dir / "scheduler_full_sweep_maxhold_plot.svg"
+
+    if write_artifacts:
+        write_scheduler_fsh_bins_csv(bins_csv_path, bins)
+        if trace_freqs_hz and trace_levels_dbm:
+            save_trace_csv(trace_csv_path, trace_freqs_hz, trace_levels_dbm)
+        write_scheduler_fsh_maxhold_plot_svg(
+            plot_path,
+            bins,
+            f"Scheduler Full-Sweep Max-Hold ({transport})",
+        )
+
+    summary = {
+        "kind": "scheduler_full_sweep_maxhold",
+        "label": label,
+        "transport": transport,
+        "transport_manifest": build_scheduler_transport_manifest(args),
+        "freq_count": len(freqs_hz),
+        "freqs_hz": list(freqs_hz),
+        "dwell_us": dwell_us,
+        "repeats": repeats,
+        "console_tick_hz": info.tick_hz,
+        "scheduler_tick_hz_used": scheduler_tick_hz,
+        "settings": asdict(maxhold_settings),
+        "rf_power_calibration": asdict(rf_power_calibration),
+        "geometry": asdict(geometry),
+        "requested_readout": args.scheduler_fsh_readout,
+        "effective_readout": effective_readout,
+        "trace_capture_degraded": bool(trace_error),
+        "trace_capture_error": trace_error,
+        "capture_elapsed_s": capture_elapsed_s,
+        "run_records": run_records,
+        "stream_status_initial": None if stream_status_initial is None else asdict(stream_status_initial),
+        "bins": bins,
+        "bin_summary": bin_summary,
+        "bins_csv": str(bins_csv_path.resolve()) if write_artifacts else "",
+        "trace_csv": str(trace_csv_path.resolve()) if write_artifacts and trace_freqs_hz else "",
+        "plot_svg": str(plot_path.resolve()) if write_artifacts else "",
+    }
+    if write_artifacts:
+        summary_path = output_dir / "scheduler_full_sweep_maxhold.json"
+        summary_path.write_text(json.dumps(summary, indent=2, default=json_default) + "\n", encoding="utf-8")
+    print(
+        "[HOST] Scheduler maxhold "
+        f"{transport}: present={bin_summary['present_count']}/{bin_summary['expected_count']} "
+        f"missing={bin_summary['missing_count']} "
+        f"flatness={bin_summary['power_flatness_db']} dB readout={effective_readout}"
+    )
+    return summary
+
+
+def write_scheduler_fsh_calibration_csv(path: Path, results: Sequence[dict]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.writer(fp)
+        writer.writerow(
+            [
+                "candidate_index",
+                "passed",
+                "rbw_hz",
+                "vbw_hz",
+                "dwell_us",
+                "repeats",
+                "estimated_seconds",
+                "missing_count_max",
+                "repeat_power_spread_db",
+                "effective_readout",
+                "failure_reason",
+            ]
+        )
+        for item in results:
+            writer.writerow(
+                [
+                    item.get("candidate_index"),
+                    str(bool(item.get("passed"))).lower(),
+                    item.get("rbw_hz"),
+                    item.get("vbw_hz"),
+                    item.get("dwell_us"),
+                    item.get("repeats"),
+                    f"{float(item.get('estimated_seconds', 0.0)):.6f}",
+                    item.get("missing_count_max"),
+                    "" if item.get("repeat_power_spread_db") is None else f"{float(item['repeat_power_spread_db']):.6f}",
+                    item.get("effective_readout"),
+                    item.get("failure_reason", ""),
+                ]
+            )
+
+
+def evaluate_scheduler_fsh_calibration_candidate(
+    run_summaries: Sequence[dict],
+    *,
+    candidate: SchedulerFshCalibrationCandidate,
+    max_repeat_spread_db: float,
+    requested_readout: str,
+) -> dict:
+    missing_count_max = max((item["bin_summary"]["missing_count"] for item in run_summaries), default=0)
+    degraded = any(item.get("trace_capture_degraded") for item in run_summaries)
+    effective_readouts = sorted(set(str(item.get("effective_readout")) for item in run_summaries))
+    power_by_index: dict = {}
+    for run in run_summaries:
+        for bin_item in run.get("bins", []):
+            if bin_item.get("power_dbm") is None:
+                continue
+            power_by_index.setdefault(int(bin_item["index"]), []).append(float(bin_item["power_dbm"]))
+    spreads = [
+        max(values) - min(values)
+        for values in power_by_index.values()
+        if len(values) >= 2
+    ]
+    repeat_spread_db = max(spreads) if spreads else 0.0
+    failure_reasons = []
+    if missing_count_max > 0:
+        failure_reasons.append("missing_bins")
+    if repeat_spread_db > max_repeat_spread_db:
+        failure_reasons.append("repeat_spread")
+    if requested_readout == "trace" and degraded:
+        failure_reasons.append("trace_degraded")
+    passed = not failure_reasons
+    return {
+        "candidate_index": candidate.index,
+        "passed": passed,
+        "failure_reason": "+".join(failure_reasons),
+        "rbw_hz": candidate.rbw_hz,
+        "vbw_hz": candidate.vbw_hz,
+        "dwell_us": candidate.dwell_us,
+        "repeats": candidate.repeats,
+        "estimated_seconds": candidate.estimated_seconds,
+        "missing_count_max": missing_count_max,
+        "repeat_power_spread_db": repeat_spread_db,
+        "effective_readout": "+".join(effective_readouts),
+        "runs": run_summaries,
+    }
+
+
+def execute_scheduler_fsh_capture_calibration(
+    uart: "UartCoordinator",
+    args: argparse.Namespace,
+    output_dir: Path,
+    info: Any,
+    analyzer: RohdeSchwarzFSH,
+    analyzer_settings: AnalyzerSettings,
+    *,
+    freqs_hz: Sequence[float],
+    transport: str,
+) -> Optional[dict]:
+    if args.scheduler_fsh_calibrate_capture == "off":
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rbw_values = parse_float_csv_list(args.scheduler_fsh_cal_rbw_hz_list, label="--scheduler-fsh-cal-rbw-hz-list")
+    vbw_ratios = parse_float_csv_list(args.scheduler_fsh_cal_vbw_ratio_list, label="--scheduler-fsh-cal-vbw-ratio-list")
+    dwell_values = parse_int_csv_list(args.scheduler_fsh_cal_dwell_us_list, label="--scheduler-fsh-cal-dwell-us-list")
+    repeat_values = parse_int_csv_list(args.scheduler_fsh_cal_repeats_list, label="--scheduler-fsh-cal-repeats-list")
+    if args.scheduler_fsh_calibrate_capture == "quick":
+        rbw_values = rbw_values[: min(2, len(rbw_values))]
+        vbw_ratios = vbw_ratios[:1]
+        dwell_values = dwell_values[: min(3, len(dwell_values))]
+        repeat_values = repeat_values[:1]
+        if len(freqs_hz) > 3:
+            freqs_hz = [freqs_hz[0], freqs_hz[len(freqs_hz) // 2], freqs_hz[-1]]
+
+    candidates = build_scheduler_fsh_calibration_candidates(
+        event_count=len(freqs_hz),
+        rbw_values_hz=rbw_values,
+        vbw_ratios=vbw_ratios,
+        dwell_values_us=dwell_values,
+        repeat_values=repeat_values,
+    )
+    estimated_total_s = sum(item.estimated_seconds for item in candidates)
+    max_s = args.scheduler_fsh_cal_max_minutes * 60.0
+    if estimated_total_s > max_s and not args.scheduler_fsh_cal_force:
+        raise RuntimeError(
+            "Scheduler FSH calibration estimate exceeds safety cap: "
+            f"{estimated_total_s / 60.0:.1f} min > {args.scheduler_fsh_cal_max_minutes:.1f} min. "
+            "Use --scheduler-fsh-cal-force or narrow the calibration grid."
+        )
+
+    results: List[dict] = []
+    for candidate in candidates:
+        candidate_settings = override_analyzer_settings(
+            analyzer_settings,
+            rbw_hz=candidate.rbw_hz,
+            vbw_hz=candidate.vbw_hz,
+            sweep_count=1,
+            trace_mode="maxhold",
+            capture_trace=True,
+        )
+        run_summaries = []
+        for repeat_index in range(1, candidate.repeats + 1):
+            run_summaries.append(
+                execute_scheduler_full_sweep_maxhold_run(
+                    uart,
+                    args,
+                    output_dir / f"candidate_{candidate.index:03d}" / f"repeat_{repeat_index:02d}",
+                    info,
+                    analyzer,
+                    candidate_settings,
+                    freqs_hz=freqs_hz,
+                    dwell_us=candidate.dwell_us,
+                    repeats=1,
+                    transport=transport,
+                    label=f"cal_candidate_{candidate.index:03d}_repeat_{repeat_index:02d}",
+                    write_artifacts=True,
+                )
+            )
+        result = evaluate_scheduler_fsh_calibration_candidate(
+            run_summaries,
+            candidate=candidate,
+            max_repeat_spread_db=args.scheduler_fsh_cal_max_repeat_spread_db,
+            requested_readout=args.scheduler_fsh_readout,
+        )
+        results.append(result)
+        print(
+            "[HOST] Calibration candidate "
+            f"{candidate.index}: pass={result['passed']} "
+            f"rbw={candidate.rbw_hz:g} vbw={candidate.vbw_hz:g} "
+            f"dwell_us={candidate.dwell_us} repeats={candidate.repeats} "
+            f"reason={result['failure_reason']}"
+        )
+
+    selected = select_scheduler_fsh_calibration_candidate(results)
+    summary = {
+        "kind": "scheduler_fsh_capture_calibration",
+        "mode": args.scheduler_fsh_calibrate_capture,
+        "transport": transport,
+        "estimated_total_seconds": estimated_total_s,
+        "selected": selected,
+        "results": results,
+    }
+    summary_path = output_dir / "scheduler_fsh_capture_calibration.json"
+    summary_path.write_text(json.dumps(summary, indent=2, default=json_default) + "\n", encoding="utf-8")
+    write_scheduler_fsh_calibration_csv(output_dir / "scheduler_fsh_capture_calibration.csv", results)
+    if selected is None:
+        raise RuntimeError("No scheduler FSH calibration candidate passed.")
+    return summary
+
+
+def execute_scheduler_full_sweep_maxhold_suite(
+    uart: "UartCoordinator",
+    console_log: "ConsoleLog",
+    args: argparse.Namespace,
+    output_dir: Path,
+    info: Any,
+    analyzer: RohdeSchwarzFSH,
+    analyzer_settings: AnalyzerSettings,
+) -> dict:
+    _ = console_log  # Keep signature aligned with other scheduler suites.
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sweep = parse_optional_sweep_range(
+        args.awg_sweep_start_hz,
+        args.awg_sweep_stop_hz,
+        args.awg_sweep_step_hz,
+        "Scheduler benchmark full-sweep maxhold",
+    )
+    if sweep is None:
+        raise RuntimeError(
+            "Scheduler maxhold requires --awg-sweep-start-hz, --awg-sweep-stop-hz, and --awg-sweep-step-hz."
+        )
+    freqs_hz = build_uniform_freq_list(sweep.start_hz, sweep.stop_hz, sweep.step_hz)
+    dwell_us = resolve_awg_sweep_dwell_us(args, analyzer_enabled=True)
+    repeats = max(1, args.scheduler_fsh_maxhold_repeats)
+    transport = args.scheduler_transport
+
+    calibration_summary = None
+    if transport == "compare":
+        if len(freqs_hz) > info.max_events:
+            raise RuntimeError(
+                "scheduler-transport=compare requires the full program to fit the preload console "
+                f"({len(freqs_hz)} requested > max_events={info.max_events})."
+            )
+        calibration_transport = "preload"
+    else:
+        calibration_transport = transport
+
+    calibration_summary = execute_scheduler_fsh_capture_calibration(
+        uart,
+        args,
+        output_dir / "calibration",
+        info,
+        analyzer,
+        analyzer_settings,
+        freqs_hz=freqs_hz,
+        transport=calibration_transport,
+    )
+    if calibration_summary and calibration_summary.get("selected"):
+        selected = calibration_summary["selected"]
+        analyzer_settings = override_analyzer_settings(
+            analyzer_settings,
+            rbw_hz=float(selected["rbw_hz"]),
+            vbw_hz=float(selected["vbw_hz"]),
+            sweep_count=1,
+            trace_mode="maxhold",
+            capture_trace=True,
+        )
+        dwell_us = int(selected["dwell_us"])
+        repeats = int(selected["repeats"])
+
+    if transport == "compare":
+        preload = execute_scheduler_full_sweep_maxhold_run(
+            uart,
+            args,
+            output_dir / "preload",
+            info,
+            analyzer,
+            analyzer_settings,
+            freqs_hz=freqs_hz,
+            dwell_us=dwell_us,
+            repeats=repeats,
+            transport="preload",
+            label="preload",
+        )
+        stream = execute_scheduler_full_sweep_maxhold_run(
+            uart,
+            args,
+            output_dir / "stream",
+            info,
+            analyzer,
+            analyzer_settings,
+            freqs_hz=freqs_hz,
+            dwell_us=dwell_us,
+            repeats=repeats,
+            transport="stream",
+            label="stream",
+        )
+        result = {
+            "kind": "scheduler_full_sweep_maxhold_compare",
+            "freq_count": len(freqs_hz),
+            "dwell_us": dwell_us,
+            "repeats": repeats,
+            "calibration": calibration_summary,
+            "preload": preload,
+            "stream": stream,
+        }
+    else:
+        result = execute_scheduler_full_sweep_maxhold_run(
+            uart,
+            args,
+            output_dir,
+            info,
+            analyzer,
+            analyzer_settings,
+            freqs_hz=freqs_hz,
+            dwell_us=dwell_us,
+            repeats=repeats,
+            transport=transport,
+            label=transport,
+        )
+        result["calibration"] = calibration_summary
+
+    summary_path = output_dir / "scheduler_full_sweep_maxhold_suite.json"
+    summary_path.write_text(json.dumps(result, indent=2, default=json_default) + "\n", encoding="utf-8")
+    return result
 
 
 def execute_scheduler_stream_bringup_suite(
@@ -3633,6 +5703,7 @@ def execute_scheduler_stream_bringup_suite(
 
     dds_clock_hz = info.dds_clock_hz or 983_056_640
     dds_phase_dw = info.dds_phase_dw or 32
+    scheduler_tick_hz = resolve_awg_scheduler_tick_hz(args, info)
     seq = 1
 
     initial_status = query_awg_stream_status(uart, args, command="STREAMINFO")
@@ -3659,7 +5730,7 @@ def execute_scheduler_stream_bringup_suite(
     after_bad_crc_reset = reset_awg_stream_console(uart, args)
     finite_events = build_awg_sweep_events(
         [200_000_000],
-        tick_hz=info.tick_hz,
+        tick_hz=scheduler_tick_hz,
         dds_clock_hz=dds_clock_hz,
         dds_phase_dw=dds_phase_dw,
         tone=0,
@@ -3684,16 +5755,23 @@ def execute_scheduler_stream_bringup_suite(
     after_finite_reset = reset_awg_stream_console(uart, args)
     refill_event_count = args.scheduler_stream_bringup_events
     if refill_event_count <= 0:
-        refill_event_count = after_finite_reset.stream_depth + 16
+        refill_event_count = max(32, args.scheduler_stream_frame_events * 2)
     refill_freqs = [200_000_000 + (idx * 100_000) for idx in range(refill_event_count)]
+    refill_start_ticks = args.awg_sweep_start_ticks or int(
+        max(
+            5.0,
+            (refill_event_count * args.scheduler_stream_dwell_us / 1_000_000.0) + 2.0,
+        )
+        * scheduler_tick_hz
+    )
     refill_events = build_awg_sweep_events(
         refill_freqs,
-        tick_hz=info.tick_hz,
+        tick_hz=scheduler_tick_hz,
         dds_clock_hz=dds_clock_hz,
         dds_phase_dw=dds_phase_dw,
         tone=0,
         scale_u=args.awg_sweep_scale_u or 700_000,
-        start_ticks=args.awg_sweep_start_ticks or 10_000,
+        start_ticks=refill_start_ticks,
         dwell_us=args.scheduler_stream_dwell_us,
     )
     frame_events = max(1, args.scheduler_stream_frame_events)
@@ -3706,7 +5784,28 @@ def execute_scheduler_stream_bringup_suite(
             open_stream=(frame_index == 0),
             close_with_eof=(offset + frame_events >= len(refill_events)),
         )
-        refill_results.append(send_awg_stream_frame_hex(uart, args, refill_frame))
+        refill_results.append(
+            send_awg_stream_frame_hex(
+                uart,
+                args,
+                refill_frame,
+                tolerated_statuses=[7],
+            )
+        )
+        refill_ack = refill_results[-1]["ack"]
+        if refill_ack.get("status") != 0 and refill_ack.get("ret") != -116:
+            raise RuntimeError(
+                "Stream refill ACK failed: "
+                f"status={refill_ack.get('status')} ret={refill_ack.get('ret')}"
+            )
+        if refill_ack.get("ret") == -116:
+            status_after_timeout = query_awg_stream_status(uart, args)
+            refill_results[-1]["status_after_timeout"] = asdict(status_after_timeout)
+            if status_after_timeout.error:
+                raise RuntimeError(
+                    "Stream start timeout ACK corresponded to a real scheduler error: "
+                    f"{asdict(status_after_timeout)}"
+                )
         seq += 1
     refill_done = wait_awg_stream_done(
         uart,
@@ -3739,6 +5838,13 @@ def execute_scheduler_stream_bringup_suite(
         "console_info_initial": asdict(info),
         "dds_clock_hz_used": dds_clock_hz,
         "dds_phase_dw_used": dds_phase_dw,
+        "console_tick_hz": info.tick_hz,
+        "scheduler_tick_hz_used": scheduler_tick_hz,
+        "scheduler_tick_hz_source": (
+            "cli"
+            if args.awg_sched_tick_hz is not None
+            else ("console" if scheduler_tick_hz == info.tick_hz else "inferred_dds_clock_div4")
+        ),
         "initial_status": asdict(initial_status),
         "after_reset": asdict(after_reset),
         "bad_crc": {
@@ -3756,6 +5862,7 @@ def execute_scheduler_stream_bringup_suite(
         "after_finite_reset": asdict(after_finite_reset),
         "depth_plus_refill": {
             "events_requested": len(refill_events),
+            "start_ticks": refill_start_ticks,
             "frame_events": frame_events,
             "frames": refill_results,
             "done_status": asdict(refill_done),
@@ -3839,16 +5946,11 @@ def run_scheduler_benchmark_suite_mode(args: argparse.Namespace) -> int:
             if uart.rx_count == rx_before:
                 uart.reopen()
 
-        matched = uart.wait_for(
-            AWG_CONSOLE_READY_MARKER,
-            args.uart_timeout,
-            extra_needles=[AWG_CONSOLE_ERROR_MARKER],
+        info = wait_for_awg_scheduler_console_info(
+            uart,
+            args,
+            ready_timeout_s=5.0 if args.skip_make_run else args.uart_timeout,
         )
-        if matched == AWG_CONSOLE_ERROR_MARKER:
-            raise RuntimeError("Scheduler console reported an error before ready.")
-        uart.send_line("INFO")
-        info_line = uart.wait_for_line_containing(AWG_CONSOLE_INFO_PREFIX, args.uart_timeout)
-        info = parse_info_line(info_line)
 
         suite_summary = {
             "mode": "scheduler_benchmark_suite",
@@ -3856,15 +5958,18 @@ def run_scheduler_benchmark_suite_mode(args: argparse.Namespace) -> int:
             "transport": args.scheduler_transport,
             "transport_manifest": build_scheduler_transport_manifest(args),
             "transport_execution_note": (
-                "FSH dense/SFDR profiles remain preload-based; stream transport currently gates "
-                "the stream_bringup profile before RF profiles are switched."
+                "per-step FSH dense profiles can run preload or stream; SFDR spot checks remain "
+                "preload-oriented unless explicitly extended. Full-sweep maxhold can run preload, "
+                "stream, or compare transports."
             ),
             "catalog_path": str((output_dir / "scheduler_benchmark_catalog.json").resolve()),
             "scope_plan_path": str((output_dir / "scheduler_scope_plan.json").resolve()),
             "console_info_initial": asdict(info),
             "stream_bringup": None,
             "dense_sweep": None,
+            "full_sweep_maxhold": None,
             "sfdr_spot_set": None,
+            "console_exit_sent": False,
         }
 
         if args.scheduler_suite_profile == "stream-bringup" or (
@@ -3881,17 +5986,39 @@ def run_scheduler_benchmark_suite_mode(args: argparse.Namespace) -> int:
         if args.scheduler_suite_profile in ("dense", "fsh", "all"):
             if analyzer is None or analyzer_settings is None:
                 raise RuntimeError("FSH scheduler suite requires analyzer setup")
-            suite_summary["dense_sweep"] = execute_scheduler_dense_fsh_suite(
-                uart=uart,
-                console_log=console_log,
-                args=args,
-                output_dir=output_dir / "dense_sweep",
-                info=info,
-                analyzer=analyzer,
-                analyzer_settings=analyzer_settings,
-            )
+            if args.scheduler_fsh_capture_mode == "maxhold":
+                suite_summary["full_sweep_maxhold"] = execute_scheduler_full_sweep_maxhold_suite(
+                    uart=uart,
+                    console_log=console_log,
+                    args=args,
+                    output_dir=output_dir / "full_sweep_maxhold",
+                    info=info,
+                    analyzer=analyzer,
+                    analyzer_settings=analyzer_settings,
+                )
+            else:
+                suite_summary["dense_sweep"] = execute_scheduler_dense_fsh_suite(
+                    uart=uart,
+                    console_log=console_log,
+                    args=args,
+                    output_dir=output_dir / "dense_sweep",
+                    info=info,
+                    analyzer=analyzer,
+                    analyzer_settings=analyzer_settings,
+                )
 
-        if args.scheduler_suite_profile in ("sfdr", "fsh", "all"):
+        run_sfdr_suite = args.scheduler_suite_profile in ("sfdr", "fsh", "all")
+        if args.scheduler_transport != "preload":
+            if args.scheduler_suite_profile == "sfdr":
+                raise RuntimeError("Scheduler SFDR spot mode is preload-only; use --scheduler-transport preload.")
+            if run_sfdr_suite:
+                suite_summary["sfdr_spot_set"] = {
+                    "skipped": True,
+                    "reason": "Scheduler SFDR spot mode is preload-only.",
+                    "transport": args.scheduler_transport,
+                }
+            run_sfdr_suite = False
+        if run_sfdr_suite:
             if analyzer is None or analyzer_settings is None or sfdr_settings is None:
                 raise RuntimeError("SFDR scheduler suite requires analyzer setup")
             suite_summary["sfdr_spot_set"] = execute_scheduler_sfdr_spot_suite(
@@ -3905,8 +6032,12 @@ def run_scheduler_benchmark_suite_mode(args: argparse.Namespace) -> int:
                 sfdr_settings=sfdr_settings,
             )
 
-        uart.send_line("EXIT")
-        uart.wait_for(AWG_CONSOLE_BYE_MARKER, args.uart_timeout, extra_needles=[AWG_CONSOLE_ERROR_MARKER])
+        if args.scheduler_keep_console_open:
+            print("[HOST] Leaving scheduler console running (--scheduler-keep-console-open).")
+        else:
+            uart.send_line("EXIT")
+            uart.wait_for(AWG_CONSOLE_BYE_MARKER, args.uart_timeout, extra_needles=[AWG_CONSOLE_ERROR_MARKER])
+            suite_summary["console_exit_sent"] = True
 
         summary_path = output_dir / "scheduler_benchmark_suite.json"
         summary_path.write_text(
@@ -5617,6 +7748,7 @@ def main() -> int:
             "preamp_on": analyzer_settings.preamp_on,
             "impedance_ohms": analyzer_settings.impedance_ohms,
             "capture_trace": analyzer_settings.capture_trace,
+            "rf_power_calibration": asdict(build_rf_power_calibration(args)),
             "sfdr_settings": asdict(sfdr_settings),
             "dds_band_sweep": {
                 "start_hz": dds_band_step_specs[0].expected_freq_hz[0] if dds_band_step_specs else None,

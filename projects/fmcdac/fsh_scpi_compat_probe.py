@@ -153,6 +153,12 @@ def main() -> int:
             ("form_data_asc", base_setup, {"type": "write", "command": "FORM:DATA ASC"}),
             ("form_data_real32", base_setup, {"type": "write", "command": "FORM:DATA REAL,32"}),
             ("form_border_swap", base_setup, {"type": "write", "command": "FORM:BORD SWAP"}),
+            ("manual_trace_data_no_arg_ascii", base_setup + ["FORMat:DATA ASCii"], {"type": "query", "command": "TRACe:DATA?"}),
+            ("manual_trace_data_trace1_ascii", base_setup + ["FORMat:DATA ASCii"], {"type": "query", "command": "TRACe:DATA? TRACE1"}),
+            ("manual_trace_data_all_ascii", base_setup + ["FORMat:DATA ASCii"], {"type": "query", "command": "TRACe:DATA? ALL"}),
+            ("manual_trace_data_no_arg_real32", base_setup + ["FORMat:BORDer SWAP", "FORMat:DATA REAL,32"], {"type": "query", "command": "TRACe:DATA?"}),
+            ("manual_trace_data_trace1_real32", base_setup + ["FORMat:BORDer SWAP", "FORMat:DATA REAL,32"], {"type": "query", "command": "TRACe:DATA? TRACE1"}),
+            ("manual_trace_data_all_real32", base_setup + ["FORMat:BORDer SWAP", "FORMat:DATA REAL,32"], {"type": "query", "command": "TRACe:DATA? ALL"}),
             ("trace_data_trace1_ascii", base_setup + ["FORM ASC"], {"type": "query", "command": "TRAC:DATA? TRACE1"}),
             ("trace_alias_trace1_ascii", base_setup + ["FORM ASC"], {"type": "query", "command": "TRAC? TRACE1"}),
             ("trace_data_mem_trace1_ascii", base_setup + ["FORM ASC", "CALC:MATH:COPY:MEM", "DISP:TRAC:MEM ON"], {"type": "query", "command": "TRAC:DATA:MEM? TRACE1"}),
@@ -189,8 +195,14 @@ def main() -> int:
             "FORM:DATA ASC",
             "FORM:DATA REAL,32",
             "FORM:BORD SWAP",
+            "FORMat:DATA ASCii",
+            "FORMat:DATA REAL,32",
+            "FORMat:BORDer SWAP",
             "CALC:MATH:COPY:MEM",
             "DISP:TRAC:MEM ON",
+            "TRACe:DATA?",
+            "TRACe:DATA? TRACE1",
+            "TRACe:DATA? ALL",
         ]
 
         result = {

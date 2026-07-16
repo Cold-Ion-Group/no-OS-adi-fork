@@ -1,8 +1,61 @@
 #ifndef APP_CONFIG_H_
 #define APP_CONFIG_H_
 
+/*
+ * Phase F is deliberately opt-in.  The legacy scheduler stream switch is
+ * retained as a source-compatible alias for existing build profiles.
+ */
+#ifndef FMCDAC_AWG_SCHED
+#define FMCDAC_AWG_SCHED 0
+#endif
+
 #ifndef FMCDAC_AWG_SCHED_STREAM
 #define FMCDAC_AWG_SCHED_STREAM 0
+#endif
+
+#if FMCDAC_AWG_SCHED_STREAM && !FMCDAC_AWG_SCHED
+#undef FMCDAC_AWG_SCHED
+#define FMCDAC_AWG_SCHED 1
+#endif
+
+#ifndef FMCDAC_AWG_SCHED_DMA_REFILL
+#define FMCDAC_AWG_SCHED_DMA_REFILL 0
+#endif
+
+#ifndef FMCDAC_AWG_SCHED_ETH
+#define FMCDAC_AWG_SCHED_ETH 0
+#endif
+
+#if FMCDAC_AWG_SCHED_DMA_REFILL && !FMCDAC_AWG_SCHED
+#error "FMCDAC_AWG_SCHED_DMA_REFILL requires FMCDAC_AWG_SCHED"
+#endif
+
+#if FMCDAC_AWG_SCHED_ETH && !FMCDAC_AWG_SCHED_DMA_REFILL
+#error "FMCDAC_AWG_SCHED_ETH requires FMCDAC_AWG_SCHED_DMA_REFILL"
+#endif
+
+#ifndef FMCDAC_AWG_SCHED_DMA_MAX_EVENTS
+#define FMCDAC_AWG_SCHED_DMA_MAX_EVENTS 128U
+#endif
+
+#ifndef FMCDAC_AWG_SCHED_USE_IRQ
+#define FMCDAC_AWG_SCHED_USE_IRQ FMCDAC_AWG_SCHED_DMA_REFILL
+#endif
+
+#ifndef FMCDAC_AWG_NET_LOCAL_MAC
+#define FMCDAC_AWG_NET_LOCAL_MAC { 0x02U, 0x00U, 0x00U, 0x00U, 0x00U, 0x02U }
+#endif
+
+#ifndef FMCDAC_AWG_NET_LOCAL_IPV4
+#define FMCDAC_AWG_NET_LOCAL_IPV4 0xC0000202UL /* 192.0.2.2 */
+#endif
+
+#ifndef FMCDAC_AWG_NET_HOST_IPV4
+#define FMCDAC_AWG_NET_HOST_IPV4 0xC0000201UL /* 192.0.2.1 */
+#endif
+
+#ifndef FMCDAC_AWG_NET_UDP_PORT
+#define FMCDAC_AWG_NET_UDP_PORT 5000U
 #endif
 
 #endif

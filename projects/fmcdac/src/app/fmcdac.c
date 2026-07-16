@@ -27,6 +27,14 @@
 #include "awg_sched.h"
 #include "awg_sched_regs.h"
 #include "awg_stream_proto.h"
+#if FMCDAC_AWG_SCHED_DMA_REFILL
+#include "awg_sched_dma.h"
+#include "no_os_irq.h"
+#include "xilinx_irq.h"
+#endif
+#if FMCDAC_AWG_SCHED_ETH
+#include "awg_phase_f.h"
+#endif
 
 /* Stringify NO_OS_VERSION — the Makefile's -D quotes may not survive
  * the Windows shell, so we force stringification here. */
@@ -51,6 +59,9 @@ struct fmcdac_dev {
 	struct no_os_gpio_desc *gpio_clkd_sync;
 	struct no_os_gpio_desc *gpio_dac_reset;
 	struct no_os_gpio_desc *gpio_dac_txen;
+#if FMCDAC_AWG_SCHED_ETH
+	struct no_os_gpio_desc *gpio_sfp0_tx_disable;
+#endif
 
 	XIic i2c;
 	u32 i2c_base;
@@ -300,6 +311,23 @@ static awg_event_v1_t g_fmcdac_sched_console_events[FMCDAC_AWG_SCHED_MAX_EVENTS]
 static uint32_t g_fmcdac_sched_console_loaded_count;
 static int g_fmcdac_sched_console_configured;
 
+#if FMCDAC_AWG_SCHED_DMA_REFILL
+static struct axi_dmac *g_fmcdac_sched_dmac;
+static struct no_os_irq_ctrl_desc *g_fmcdac_irq_ctrl;
+static struct no_os_callback_desc g_fmcdac_sched_irq_callback;
+static struct no_os_callback_desc g_fmcdac_sched_dma_irq_callback;
+#if FMCDAC_AWG_SCHED_ETH
+static struct axi_dmac *g_fmcdac_eth_rx_dmac;
+static struct axi_dmac *g_fmcdac_eth_tx_dmac;
+static struct no_os_callback_desc g_fmcdac_eth_rx_irq_callback;
+static struct no_os_callback_desc g_fmcdac_eth_tx_irq_callback;
+static struct awg_phase_f g_fmcdac_phase_f;
+#else
+static struct awg_sched_dma g_fmcdac_sched_refill;
+static bool g_fmcdac_sched_refill_initialized;
+#endif
+#endif
+
 #if FMCDAC_AWG_SCHED_STREAM
 #ifndef FMCDAC_AWG_STREAM_CONSOLE_MAX_FRAME_EVENTS
 #define FMCDAC_AWG_STREAM_CONSOLE_MAX_FRAME_EVENTS 128U
@@ -419,6 +447,7 @@ static int fmcdac_awg_stream_console_streamhex(struct fmcdac_dev *dev,
 					       const char *line);
 static int fmcdac_awg_stream_console_status(const char *tag);
 static int fmcdac_awg_stream_console_reset(void);
+static int fmcdac_awg_sched_console_configure(void);
 static void fmcdac_run_benchmark_prompt_flow(struct fmcdac_dev *dev);
 static int fmcdac_dds_band_sweep_override_enabled(void);
 static int fmcdac_sfdr_sweep_override_enabled(void);
@@ -434,6 +463,9 @@ static uint32_t fmcdac_cycles_to_ns_per_op(uint64_t cycles, uint32_t ops);
 static uint32_t fmcdac_ops_per_second(uint32_t ops, uint64_t cycles);
 static void fmcdac_flush_input(void);
 static void fmcdac_awg_stream_poll(void);
+#if FMCDAC_AWG_SCHED_DMA_REFILL
+static int fmcdac_phase_f_hw_init(struct fmcdac_dev *dev);
+#endif
 
 static int fmcdac_gpio_init(struct fmcdac_dev *dev)
 {
@@ -452,6 +484,12 @@ static int fmcdac_gpio_init(struct fmcdac_dev *dev)
 		.number = GPIO_DAC_TXEN,
 		.platform_ops = &xil_gpio_ops
 	};
+#if FMCDAC_AWG_SCHED_ETH
+	struct no_os_gpio_init_param gpio_sfp0_tx_disable_param = {
+		.number = GPIO_SFP0_TX_DISABLE,
+		.platform_ops = &xil_gpio_ops
+	};
+#endif
 
 // removed the altera dependencies as that is nto required here
 // Microblaze is the only Xilinx processor being used here. 
@@ -462,6 +500,9 @@ static int fmcdac_gpio_init(struct fmcdac_dev *dev)
 	gpio_clkd_sync_param.extra = &xil_gpio_param;
 	gpio_dac_reset_param.extra = &xil_gpio_param;
 	gpio_dac_txen_param.extra = &xil_gpio_param;
+#if FMCDAC_AWG_SCHED_ETH
+	gpio_sfp0_tx_disable_param.extra = &xil_gpio_param;
+#endif
 
 	/* set GPIOs */
 	status = no_os_gpio_get(&dev->gpio_clkd_sync, &gpio_clkd_sync_param);
@@ -476,6 +517,13 @@ static int fmcdac_gpio_init(struct fmcdac_dev *dev)
 	if (status < 0)
 		return status;
 
+#if FMCDAC_AWG_SCHED_ETH
+	status = no_os_gpio_get(&dev->gpio_sfp0_tx_disable,
+				&gpio_sfp0_tx_disable_param);
+	if (status < 0)
+		return status;
+#endif
+
 	status = no_os_gpio_direction_output(dev->gpio_clkd_sync, NO_OS_GPIO_LOW);
 	if (status < 0)
 		return status;
@@ -487,6 +535,14 @@ static int fmcdac_gpio_init(struct fmcdac_dev *dev)
 	status = no_os_gpio_direction_output(dev->gpio_dac_txen, NO_OS_GPIO_LOW);
 	if (status < 0)
 		return status;
+
+#if FMCDAC_AWG_SCHED_ETH
+	/* The board control is active high: stay disabled until MAC setup. */
+	status = no_os_gpio_direction_output(dev->gpio_sfp0_tx_disable,
+					     NO_OS_GPIO_HIGH);
+	if (status < 0)
+		return status;
+#endif
 
 	no_os_mdelay(5);
 
@@ -1534,9 +1590,295 @@ static uint32_t fmcdac_cycles_to_us(uint64_t cycles)
 	return (uint32_t)((cycles * 1000000ULL) / FMCDAC_BENCH_TIMER_FREQ_HZ);
 }
 
+#if FMCDAC_AWG_SCHED_DMA_REFILL
+static void fmcdac_cache_flush(void *ctx, uintptr_t address, size_t length)
+{
+	(void)ctx;
+	Xil_DCacheFlushRange((INTPTR)address, (u32)length);
+}
+
+#if FMCDAC_AWG_SCHED_ETH
+static void fmcdac_cache_invalidate(void *ctx, uintptr_t address, size_t length)
+{
+	(void)ctx;
+	Xil_DCacheInvalidateRange((INTPTR)address, (u32)length);
+}
+
+static int32_t fmcdac_mac_read(void *ctx, uint32_t base, uint32_t reg,
+			       uint32_t *value)
+{
+	(void)ctx;
+	return no_os_axi_io_read(base, reg, value);
+}
+
+static int32_t fmcdac_mac_write(void *ctx, uint32_t base, uint32_t reg,
+				uint32_t value)
+{
+	(void)ctx;
+	return no_os_axi_io_write(base, reg, value);
+}
+
+static void fmcdac_mac_delay(void *ctx, uint32_t usec)
+{
+	(void)ctx;
+	no_os_udelay(usec);
+}
+
+static int32_t fmcdac_sfp0_tx_disable(void *ctx, bool disabled)
+{
+	struct fmcdac_dev *dev = ctx;
+
+	if (!dev || !dev->gpio_sfp0_tx_disable)
+		return -ENODEV;
+	return no_os_gpio_set_value(dev->gpio_sfp0_tx_disable,
+				    disabled ? NO_OS_GPIO_HIGH : NO_OS_GPIO_LOW);
+}
+#endif
+
+static void fmcdac_scheduler_irq(void *instance)
+{
+	uint32_t irq_status;
+
+	(void)instance;
+	if (no_os_axi_io_read(FMCDAC_AWG_SCHED_BASEADDR,
+			      AWG_SCHED_REG_IRQ_STATUS, &irq_status))
+		return;
+	awg_sched_stream_irq_handler(irq_status);
+#if FMCDAC_AWG_SCHED_ETH
+	if (g_fmcdac_phase_f.scheduler_dma_initialized &&
+	    (irq_status & (AWG_SCHED_IRQ_LOW_WATERMARK |
+			   AWG_SCHED_IRQ_EMPTY_STALL)) != 0U)
+		awg_sched_dma_request_service(&g_fmcdac_phase_f.scheduler_dma);
+#else
+	if (g_fmcdac_sched_refill_initialized &&
+	    (irq_status & (AWG_SCHED_IRQ_LOW_WATERMARK |
+			   AWG_SCHED_IRQ_EMPTY_STALL)) != 0U)
+		awg_sched_dma_request_service(&g_fmcdac_sched_refill);
+#endif
+}
+
+static int fmcdac_irq_register(uint32_t irq_id,
+			       struct no_os_callback_desc *callback)
+{
+	int ret;
+
+	ret = no_os_irq_register_callback(g_fmcdac_irq_ctrl, irq_id, callback);
+	if (ret)
+		return ret;
+	ret = no_os_irq_trigger_level_set(g_fmcdac_irq_ctrl, irq_id,
+					  NO_OS_IRQ_LEVEL_HIGH);
+	if (ret)
+		return ret;
+	return no_os_irq_enable(g_fmcdac_irq_ctrl, irq_id);
+}
+
+static int fmcdac_phase_f_hw_init(struct fmcdac_dev *dev)
+{
+	struct axi_dmac_init dmac_init;
+	struct xil_irq_init_param xil_irq_init = { .type = IRQ_PL };
+	struct no_os_irq_init_param irq_init = {
+		.irq_ctrl_id = INTC_DEVICE_ID,
+		.platform_ops = &xil_irq_ops,
+		.extra = &xil_irq_init,
+	};
+	int ret;
+
+	if (!g_fmcdac_sched_console_configured) {
+		ret = fmcdac_awg_sched_console_configure();
+		if (ret)
+			return ret;
+	}
+
+	memset(&dmac_init, 0, sizeof(dmac_init));
+	dmac_init.name = "awg-scheduler-dma";
+	dmac_init.base = FMCDAC_AWG_SCHED_DMA_BASEADDR;
+	dmac_init.irq_option = IRQ_ENABLED;
+	ret = axi_dmac_init(&g_fmcdac_sched_dmac, &dmac_init);
+	if (ret)
+		return ret;
+	if (g_fmcdac_sched_dmac->direction != DMA_MEM_TO_DEV)
+		return -ENODEV;
+
+#if FMCDAC_AWG_SCHED_ETH
+	dmac_init.name = "awg-ethernet-rx-dma";
+	dmac_init.base = FMCDAC_AWG_ETH_RX_DMA_BASEADDR;
+	dmac_init.irq_option = IRQ_ENABLED;
+	ret = axi_dmac_init(&g_fmcdac_eth_rx_dmac, &dmac_init);
+	if (ret)
+		return ret;
+	if (g_fmcdac_eth_rx_dmac->direction != DMA_DEV_TO_MEM)
+		return -ENODEV;
+
+	dmac_init.name = "awg-ethernet-tx-dma";
+	dmac_init.base = FMCDAC_AWG_ETH_TX_DMA_BASEADDR;
+	dmac_init.irq_option = IRQ_ENABLED;
+	ret = axi_dmac_init(&g_fmcdac_eth_tx_dmac, &dmac_init);
+	if (ret)
+		return ret;
+	if (g_fmcdac_eth_tx_dmac->direction != DMA_MEM_TO_DEV)
+		return -ENODEV;
+#endif
+
+	ret = no_os_irq_ctrl_init(&g_fmcdac_irq_ctrl, &irq_init);
+	if (ret)
+		return ret;
+
+	memset(&g_fmcdac_sched_irq_callback, 0,
+	       sizeof(g_fmcdac_sched_irq_callback));
+	g_fmcdac_sched_irq_callback.callback = fmcdac_scheduler_irq;
+	ret = fmcdac_irq_register(AWG_SCHED_IRQ_ID,
+				  &g_fmcdac_sched_irq_callback);
+	if (ret)
+		return ret;
+
+	memset(&g_fmcdac_sched_dma_irq_callback, 0,
+	       sizeof(g_fmcdac_sched_dma_irq_callback));
+	g_fmcdac_sched_dma_irq_callback.callback = awg_sched_dma_irq;
+#if FMCDAC_AWG_SCHED_ETH
+	g_fmcdac_sched_dma_irq_callback.ctx = &g_fmcdac_phase_f.scheduler_dma;
+#else
+	g_fmcdac_sched_dma_irq_callback.ctx = &g_fmcdac_sched_refill;
+#endif
+	ret = fmcdac_irq_register(AWG_SCHED_DMA_IRQ_ID,
+				  &g_fmcdac_sched_dma_irq_callback);
+	if (ret)
+		return ret;
+
+#if FMCDAC_AWG_SCHED_ETH
+	memset(&g_fmcdac_eth_rx_irq_callback, 0,
+	       sizeof(g_fmcdac_eth_rx_irq_callback));
+	g_fmcdac_eth_rx_irq_callback.callback = awg_eth_rx_irq;
+	g_fmcdac_eth_rx_irq_callback.ctx = &g_fmcdac_phase_f.rx;
+	ret = fmcdac_irq_register(AWG_ETH_RX_DMA_IRQ_ID,
+				  &g_fmcdac_eth_rx_irq_callback);
+	if (ret)
+		return ret;
+
+	memset(&g_fmcdac_eth_tx_irq_callback, 0,
+	       sizeof(g_fmcdac_eth_tx_irq_callback));
+	g_fmcdac_eth_tx_irq_callback.callback = awg_eth_tx_irq;
+	g_fmcdac_eth_tx_irq_callback.ctx = &g_fmcdac_phase_f.tx;
+	ret = fmcdac_irq_register(AWG_ETH_TX_DMA_IRQ_ID,
+				  &g_fmcdac_eth_tx_irq_callback);
+	if (ret)
+		return ret;
+
+	{
+		struct awg_phase_f_config config;
+		const uint8_t local_mac[6] = FMCDAC_AWG_NET_LOCAL_MAC;
+		uint32_t local_ip = FMCDAC_AWG_NET_LOCAL_IPV4;
+		uint32_t i;
+
+		memset(&config, 0, sizeof(config));
+		awg_eth_mac_config_defaults(&config.mac);
+		config.mac.base = FMCDAC_AWG_ETH_MAC_BASEADDR;
+		config.mac.read = fmcdac_mac_read;
+		config.mac.write = fmcdac_mac_write;
+		config.mac.delay = fmcdac_mac_delay;
+		config.mac.set_sfp0_tx_disable = fmcdac_sfp0_tx_disable;
+		config.mac.sfp_ctx = dev;
+
+		config.rx.dmac = g_fmcdac_eth_rx_dmac;
+		config.rx.buffer_size = AWG_ETH_DMA_BUFFER_BYTES;
+		config.rx.cache_line_size = AWG_DMA_CACHELINE_BYTES;
+		config.rx.invalidate = fmcdac_cache_invalidate;
+		config.tx.dmac = g_fmcdac_eth_tx_dmac;
+		config.tx.buffer_size = AWG_ETH_DMA_BUFFER_BYTES;
+		config.tx.min_frame_size = AWG_ETH_TX_MIN_CLIENT_FRAME_SIZE;
+		config.tx.cache_line_size = AWG_DMA_CACHELINE_BYTES;
+		config.tx.flush = fmcdac_cache_flush;
+		for (i = 0U; i < AWG_ETH_DMA_BUFFER_COUNT; i++) {
+			config.rx.dma_address[i] = AWG_ETH_RX_DDR_BASEADDR +
+				i * AWG_ETH_DMA_BUFFER_BYTES;
+			config.rx.buffer[i] =
+				(uint8_t *)(uintptr_t)config.rx.dma_address[i];
+			config.tx.dma_address[i] = AWG_ETH_TX_DDR_BASEADDR +
+				i * AWG_ETH_DMA_BUFFER_BYTES;
+			config.tx.buffer[i] =
+				(uint8_t *)(uintptr_t)config.tx.dma_address[i];
+		}
+
+		memcpy(config.net.mac_address, local_mac, sizeof(local_mac));
+		config.net.ipv4_address[0] = (uint8_t)(local_ip >> 24);
+		config.net.ipv4_address[1] = (uint8_t)(local_ip >> 16);
+		config.net.ipv4_address[2] = (uint8_t)(local_ip >> 8);
+		config.net.ipv4_address[3] = (uint8_t)local_ip;
+		config.net.udp_port = FMCDAC_AWG_NET_UDP_PORT;
+		config.net.rx_udp_checksum = AWG_NET_UDP_CHECKSUM_ACCEPT_ZERO;
+		config.net.tx_udp_checksum = true;
+
+		config.stream.staging_buffer =
+			(void *)(uintptr_t)AWG_STREAM_DDR_BASEADDR;
+		config.stream.staging_capacity =
+			AWG_STREAM_DDR_SIZE_BYTES / sizeof(awg_event_v1_t);
+		config.stream.refill_chunk_max =
+			FMCDAC_AWG_SCHED_DMA_MAX_EVENTS;
+		config.stream.poll_interval_us = 1U;
+		config.stream.use_dma = true;
+		config.scheduler_dmac = g_fmcdac_sched_dmac;
+		config.scheduler_base = FMCDAC_AWG_SCHED_BASEADDR;
+		config.scheduler_dma_max_events =
+			FMCDAC_AWG_SCHED_DMA_MAX_EVENTS;
+		config.scheduler_cache_line_size = AWG_DMA_CACHELINE_BYTES;
+		config.scheduler_cache_flush = fmcdac_cache_flush;
+		config.mac_status_poll_divider = 10000U;
+
+		ret = awg_phase_f_init(&g_fmcdac_phase_f, &config);
+		if (ret)
+			return ret;
+	}
+#endif
+
+	ret = no_os_irq_global_enable(g_fmcdac_irq_ctrl);
+	if (!ret)
+		xil_printf("[AWG-PHASE-F] DMA/IRQ%s initialized\n\r",
+#if FMCDAC_AWG_SCHED_ETH
+			   ", MAC and UDP"
+#else
+			   ""
+#endif
+		);
+	return ret;
+}
+
+#if !FMCDAC_AWG_SCHED_ETH
+static int fmcdac_sched_dma_service(void)
+{
+	struct awg_sched_dma_config config;
+	awg_stream_ring_t *ring;
+	int ret;
+
+	if (!awg_sched_stream_dma_mode_enabled())
+		return 0;
+	if (!g_fmcdac_sched_refill_initialized) {
+		ring = awg_sched_stream_ring_get();
+		if (!ring)
+			return 0;
+		memset(&config, 0, sizeof(config));
+		config.dmac = g_fmcdac_sched_dmac;
+		config.ring = ring;
+		config.scheduler_base = FMCDAC_AWG_SCHED_BASEADDR;
+		config.max_events = FMCDAC_AWG_SCHED_DMA_MAX_EVENTS;
+		config.cache_line_size = AWG_DMA_CACHELINE_BYTES;
+		config.cache_flush = fmcdac_cache_flush;
+		ret = awg_sched_dma_init(&g_fmcdac_sched_refill, &config);
+		if (ret)
+			return ret;
+		g_fmcdac_sched_refill_initialized = true;
+	}
+	return awg_sched_dma_service(&g_fmcdac_sched_refill);
+}
+#endif
+#endif
+
 static void fmcdac_awg_stream_poll(void)
 {
-#if FMCDAC_AWG_SCHED_STREAM
+#if FMCDAC_AWG_SCHED_ETH
+	if (g_fmcdac_phase_f.initialized)
+		(void)awg_phase_f_service(&g_fmcdac_phase_f);
+#elif FMCDAC_AWG_SCHED_DMA_REFILL
+	(void)fmcdac_sched_dma_service();
+#elif FMCDAC_AWG_SCHED_STREAM
 	static uint64_t last_poll_cycles;
 	uint64_t now_cycles;
 	uint32_t poll_interval_us;
@@ -3689,11 +4031,15 @@ static void fmcdac_awg_stream_console_emit_ack(const awg_stream_proto_ack_t *ack
 		return;
 
 	xil_printf("[AWG-STREAM] ACK magic=0x%08lX seq=%lu ddr_free=%lu "
-		   "status=%lu ret=%d bytes=%lu events=%u flags=0x%04X\n\r",
+		   "status=%lu stream_free=%lu stalls=%lu irq=0x%08lX "
+		   "ret=%d bytes=%lu events=%u flags=0x%04X\n\r",
 		   (unsigned long)ack->magic,
 		   (unsigned long)ack->seq_acked,
 		   (unsigned long)ack->ddr_free_events,
 		   (unsigned long)ack->status,
+		   (unsigned long)ack->stream_free_events,
+		   (unsigned long)ack->stream_stalls,
+		   (unsigned long)ack->irq_status,
 		   ret,
 		   (unsigned long)frame_bytes,
 		   (unsigned)n_events,
@@ -3775,6 +4121,7 @@ static int fmcdac_awg_stream_console_streamhex(struct fmcdac_dev *dev,
 		   (unsigned long)expected_frame_bytes);
 
 	memset(&stream_cfg, 0, sizeof(stream_cfg));
+	stream_cfg.use_dma = (FMCDAC_AWG_SCHED_DMA_REFILL != 0);
 	ret = awg_stream_proto_handle_frame(g_fmcdac_stream_console_frame,
 					    frame_bytes,
 					    &stream_cfg,
@@ -3879,9 +4226,9 @@ static int fmcdac_awg_stream_console_status(const char *tag)
 		   (unsigned)((stream_ctrl & AWG_SCHED_STREAM_CTRL_MODE) != 0U),
 		   (unsigned)((stream_ctrl & AWG_SCHED_STREAM_CTRL_OVERFLOW) != 0U),
 		   (unsigned)((stream_ctrl & AWG_SCHED_STREAM_CTRL_EOF_SEEN) != 0U),
-		   (unsigned)((status & (AWG_SCHED_STATUS_RUNNING | (1U << 1))) != 0U),
-		   (unsigned)((status & (AWG_SCHED_STATUS_DONE | (1U << 2))) != 0U),
-		   (unsigned)((status & (AWG_SCHED_STATUS_ERROR | (1U << 3))) != 0U));
+		   (unsigned)((status & AWG_SCHED_STATUS_RUNNING) != 0U),
+		   (unsigned)((status & AWG_SCHED_STATUS_DONE) != 0U),
+		   (unsigned)((status & AWG_SCHED_STATUS_ERROR) != 0U));
 	return 0;
 #else
 	(void)tag;
@@ -3904,6 +4251,24 @@ static int fmcdac_awg_stream_console_reset(void)
 		}
 	}
 
+#if FMCDAC_AWG_SCHED_DMA_REFILL
+#if FMCDAC_AWG_SCHED_ETH
+	if (g_fmcdac_phase_f.scheduler_dma_initialized) {
+		axi_dmac_transfer_stop(g_fmcdac_sched_dmac);
+		memset(&g_fmcdac_phase_f.scheduler_dma, 0,
+		       sizeof(g_fmcdac_phase_f.scheduler_dma));
+		g_fmcdac_phase_f.scheduler_dma_initialized = false;
+	}
+#else
+	if (g_fmcdac_sched_refill_initialized) {
+		axi_dmac_transfer_stop(g_fmcdac_sched_dmac);
+		memset(&g_fmcdac_sched_refill, 0,
+		       sizeof(g_fmcdac_sched_refill));
+		g_fmcdac_sched_refill_initialized = false;
+	}
+#endif
+#endif
+
 	ret = awg_sched_stream_reset_soft();
 	if (ret != 0) {
 		xil_printf("[AWG-STREAM] ERROR reason=reset_failed status=%d\n\r", ret);
@@ -3912,6 +4277,10 @@ static int fmcdac_awg_stream_console_reset(void)
 
 	g_fmcdac_sched_console_loaded_count = 0U;
 	g_fmcdac_stream_console_output_prepared = 0;
+	awg_stream_proto_reset_default_session();
+#if FMCDAC_AWG_SCHED_ETH
+	awg_stream_proto_session_init(&g_fmcdac_phase_f.protocol);
+#endif
 	xil_printf("[AWG-STREAM] RESET DONE type=soft\n\r");
 	return fmcdac_awg_stream_console_status("after_reset");
 #else
@@ -4902,6 +5271,15 @@ skip_stpl_zero:
 	fmcdac_latency_readback(dev);
 	fmcdac_phy_prbs_test(dev);
 
+#if FMCDAC_AWG_SCHED_DMA_REFILL
+	status = fmcdac_phase_f_hw_init(dev);
+	if (status != 0) {
+		xil_printf("[AWG-PHASE-F] hardware initialization failed: %d\n\r",
+			   status);
+		return status;
+	}
+#endif
+
 	if (FMCDAC_ENABLE_SCHED_DET_SMOKETEST) {
 		xil_printf("[SCHED-DET] Running scheduler path before benchmark prompts.\n\r");
 		status = fmcdac_run_scheduler_deterministic_path(dev);
@@ -4985,6 +5363,26 @@ static int fmcdac_dac_init(struct fmcdac_dev *dev,
 
 static void fmcdac_remove(struct fmcdac_dev *dev)
 {
+#if FMCDAC_AWG_SCHED_DMA_REFILL
+#if FMCDAC_AWG_SCHED_ETH
+	if (g_fmcdac_phase_f.initialized) {
+		awg_phase_f_abort(&g_fmcdac_phase_f);
+		(void)awg_eth_mac_set_sfp_tx_enabled(&g_fmcdac_phase_f.mac, false);
+	}
+	if (g_fmcdac_eth_rx_dmac)
+		axi_dmac_remove(g_fmcdac_eth_rx_dmac);
+	if (g_fmcdac_eth_tx_dmac)
+		axi_dmac_remove(g_fmcdac_eth_tx_dmac);
+#else
+	if (g_fmcdac_sched_refill_initialized)
+		(void)awg_sched_dma_abort(&g_fmcdac_sched_refill);
+#endif
+	if (g_fmcdac_sched_dmac)
+		axi_dmac_remove(g_fmcdac_sched_dmac);
+	if (g_fmcdac_irq_ctrl)
+		no_os_irq_ctrl_remove(g_fmcdac_irq_ctrl);
+#endif
+
 	/* Memory deallocation for devices and spi */
 	ad9144_remove(dev->ad9144_device);
 	ad9516_remove(dev->ad9516_dev);
@@ -4998,6 +5396,9 @@ static void fmcdac_remove(struct fmcdac_dev *dev)
 	no_os_gpio_remove(dev->gpio_clkd_sync);
 	no_os_gpio_remove(dev->gpio_dac_reset);
 	no_os_gpio_remove(dev->gpio_dac_txen);
+#if FMCDAC_AWG_SCHED_ETH
+	no_os_gpio_remove(dev->gpio_sfp0_tx_disable);
+#endif
 }
 
 int fmcdac_reconfig(struct ad9144_init_param *p_ad9144_param,

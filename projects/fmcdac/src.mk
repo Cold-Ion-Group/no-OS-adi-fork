@@ -4,6 +4,7 @@
 
 SRCS += $(PROJECT)/src/app/fmcdac.c \
         $(PROJECT)/src/app/awg_sched.c \
+        $(PROJECT)/src/app/awg_stream_ring.c \
         $(PROJECT)/src/app/awg_stream_proto.c \
         $(DRIVERS)/frequency/ad9516/ad9516.c \
         $(DRIVERS)/si5328/si5328drv.c \
@@ -20,6 +21,20 @@ SRCS += $(PROJECT)/src/app/fmcdac.c \
         $(NO-OS)/jesd204/jesd204-core.c \
         $(NO-OS)/jesd204/jesd204-fsm.c
 
+ifeq ($(FMCDAC_AWG_SCHED_DMA_REFILL),1)
+SRCS += $(PROJECT)/src/app/awg_sched_dma.c \
+        $(DRIVERS)/api/no_os_irq.c \
+        $(PLATFORM_DRIVERS)/xilinx_irq.c
+endif
+
+ifeq ($(FMCDAC_AWG_SCHED_ETH),1)
+SRCS += $(PROJECT)/src/app/awg_phase_f.c \
+        $(PROJECT)/src/app/awg_eth_mac.c \
+        $(PROJECT)/src/app/awg_eth_rx.c \
+        $(PROJECT)/src/app/awg_eth_tx.c \
+        $(PROJECT)/src/app/awg_net.c
+endif
+
 SRCS += $(PLATFORM_DRIVERS)/xilinx_axi_io.c \
         $(PLATFORM_DRIVERS)/xilinx_spi.c \
         $(PLATFORM_DRIVERS)/xilinx_gpio.c \
@@ -28,6 +43,8 @@ SRCS += $(PLATFORM_DRIVERS)/xilinx_axi_io.c \
 INCS += $(PROJECT)/src/app/app_config.h \
         $(PROJECT)/src/app/awg_sched.h \
         $(PROJECT)/src/app/awg_sched_regs.h \
+        $(PROJECT)/src/app/awg_event.h \
+        $(PROJECT)/src/app/awg_stream_ring.h \
         $(PROJECT)/src/app/awg_stream_proto.h \
         $(PROJECT)/src/app/parameters.h \
         $(DRIVERS)/axi_core/axi_dac_core/axi_dac_core.h \
@@ -41,6 +58,20 @@ INCS += $(PROJECT)/src/app/app_config.h \
         $(DRIVERS)/frequency/ad9516/ad9516_cfg.h \
         $(DRIVERS)/si5328/si5328drv.h \
         $(DRIVERS)/dac/ad9144/ad9144.h
+
+ifeq ($(FMCDAC_AWG_SCHED_DMA_REFILL),1)
+INCS += $(PROJECT)/src/app/awg_sched_dma.h \
+        $(INCLUDE)/no_os_irq.h \
+        $(PLATFORM_DRIVERS)/xilinx_irq.h
+endif
+
+ifeq ($(FMCDAC_AWG_SCHED_ETH),1)
+INCS += $(PROJECT)/src/app/awg_phase_f.h \
+        $(PROJECT)/src/app/awg_eth_mac.h \
+        $(PROJECT)/src/app/awg_eth_rx.h \
+        $(PROJECT)/src/app/awg_eth_tx.h \
+        $(PROJECT)/src/app/awg_net.h
+endif
 
 INCS += $(PLATFORM_DRIVERS)/$(PLATFORM)_spi.h \
         $(PLATFORM_DRIVERS)/$(PLATFORM)_gpio.h

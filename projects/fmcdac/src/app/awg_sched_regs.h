@@ -62,12 +62,11 @@
 #define AWG_SCHED_TIME_RELOAD_ARM_ON_SYSREF (1u << 0)
 #define AWG_SCHED_TIME_RELOAD_LOAD_NOW      (1u << 1)
 
-/* STATUS low-byte bits */
-#define AWG_SCHED_STATUS_IDLE           (1u << 0)
-#define AWG_SCHED_STATUS_ARMED          (1u << 1)
-#define AWG_SCHED_STATUS_RUNNING        (1u << 2)
-#define AWG_SCHED_STATUS_DONE           (1u << 3)
-#define AWG_SCHED_STATUS_ERROR          (1u << 4)
+/* STATUS low-byte bits. Idle is represented by no active state bit set. */
+#define AWG_SCHED_STATUS_ARMED          (1u << 0)
+#define AWG_SCHED_STATUS_RUNNING        (1u << 1)
+#define AWG_SCHED_STATUS_DONE           (1u << 2)
+#define AWG_SCHED_STATUS_ERROR          (1u << 3)
 
 /* STATUS[15:8] / ERR_REG error codes */
 #define AWG_SCHED_ERR_NONE              0x00u
@@ -89,10 +88,13 @@
                                          AWG_SCHED_IRQ_LOW_WATERMARK | \
                                          AWG_SCHED_IRQ_EMPTY_STALL)
 
-/* STREAM_CTRL bits. WRITE_OVERFLOW is W1C; EOF_SEEN is read-only. */
+/* STREAM_CTRL bits. WRITE_OVERFLOW is W1C; EOF_SEEN is read-only.
+ * DMA_MODE selects the AXI-Stream DMA ingress path and is captured on ARM.
+ */
 #define AWG_SCHED_STREAM_CTRL_MODE      (1u << 0)
 #define AWG_SCHED_STREAM_CTRL_OVERFLOW  (1u << 1)
 #define AWG_SCHED_STREAM_CTRL_EOF_SEEN  (1u << 2)
+#define AWG_SCHED_STREAM_CTRL_DMA_MODE  (1u << 3)
 
 /* EVT_WCTRL bits */
 #define AWG_SCHED_EVT_WCTRL_PUSH        (1u << 0)

@@ -20,21 +20,26 @@ AWG_EVENT_V1_STRUCT = struct.Struct("<QHHIIIII")
 AWG_SCHED_DEFAULT_STARTUP_MARGIN_US = 20_000
 AWG_STREAM_PROTO_MAGIC = 0x53415747
 AWG_STREAM_PROTO_HEADER_STRUCT = struct.Struct("<IIHH")
-AWG_STREAM_PROTO_ACK_STRUCT = struct.Struct("<IIII")
+AWG_STREAM_PROTO_ACK_STRUCT = struct.Struct("<IIIIIII")
+AWG_STREAM_PROTO_MAX_FRAME_EVENTS = 128
 AWG_STREAM_PROTO_FLAG_OPEN = 0x0001
 AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF = 0x0002
 AWG_STREAM_ACK_STATUS_NAMES = {
-    0: "ok",
-    1: "bad_arg",
-    2: "bad_magic",
-    3: "bad_length",
-    4: "bad_crc",
-    5: "disabled",
-    6: "open_failed",
-    7: "ddr_full",
-    8: "overflow",
-    9: "scheduler_error",
-    10: "close_failed",
+    1 << 0: "bad_arg",
+    1 << 1: "bad_magic",
+    1 << 2: "bad_length",
+    1 << 3: "bad_crc",
+    1 << 4: "disabled",
+    1 << 5: "open_failed",
+    1 << 6: "ring_full",
+    1 << 7: "overflow",
+    1 << 8: "scheduler_error",
+    1 << 9: "close_failed",
+    1 << 10: "bad_sequence",
+    1 << 11: "bad_flags",
+    1 << 12: "bad_session",
+    1 << 13: "dma_error",
+    1 << 14: "bad_event",
 }
 AWG_STREAM_UART_RAW_BAUD = 115200
 AWG_STREAM_UART_RAW_BYTES_PER_S = AWG_STREAM_UART_RAW_BAUD / 10.0
@@ -120,6 +125,9 @@ _STREAM_ACK_RE = re.compile(
     r"seq=(?P<seq>\d+) "
     r"ddr_free=(?P<ddr_free>\d+) "
     r"status=(?P<status>\d+) "
+    r"stream_free=(?P<stream_free>\d+) "
+    r"stalls=(?P<stalls>\d+) "
+    r"irq=0x(?P<irq>[0-9A-Fa-f]+) "
     r"ret=(?P<ret>-?\d+) "
     r"bytes=(?P<bytes>\d+) "
     r"events=(?P<events>\d+) "
@@ -243,6 +251,9 @@ class AwgStreamAck:
     seq_acked: int
     ddr_free_events: int
     status: int
+    stream_free_events: int
+    stream_stalls: int
+    irq_status: int
     ret: int
     frame_bytes: int
     event_count: int
@@ -250,7 +261,26 @@ class AwgStreamAck:
 
     @property
     def status_name(self) -> str:
-        return AWG_STREAM_ACK_STATUS_NAMES.get(self.status, f"unknown_{self.status}")
+        return stream_ack_status_name(self.status)
+
+
+@dataclass(frozen=True)
+class AwgStreamWireAck:
+    magic: int
+    seq_acked: int
+    ddr_free_events: int
+    status: int
+    stream_free_events: int
+    stream_stalls: int
+    irq_status: int
+
+    @property
+    def ok(self) -> bool:
+        return self.magic == AWG_STREAM_PROTO_MAGIC and self.status == 0
+
+    @property
+    def status_name(self) -> str:
+        return stream_ack_status_name(self.status)
 
 
 @dataclass(frozen=True)
@@ -437,8 +467,14 @@ def pack_stream_frame(
     corrupt_crc: bool = False,
 ) -> bytes:
     event_list = list(events)
-    if len(event_list) > 0xFFFF:
-        raise ValueError("stream frame cannot carry more than 65535 events")
+    if len(event_list) > AWG_STREAM_PROTO_MAX_FRAME_EVENTS:
+        raise ValueError(
+            f"stream frame cannot carry more than {AWG_STREAM_PROTO_MAX_FRAME_EVENTS} events"
+        )
+    if open_stream and (seq & 0xFFFFFFFF) != 0:
+        raise ValueError("an OPEN frame must use sequence zero")
+    if close_with_eof and not event_list:
+        raise ValueError("CLOSE_WITH_EOF requires at least one event")
 
     flags = 0
     if open_stream:
@@ -456,6 +492,27 @@ def pack_stream_frame(
     if corrupt_crc:
         crc ^= 0xFFFFFFFF
     return body + struct.pack("<I", crc)
+
+
+def stream_ack_status_name(status: int) -> str:
+    if status == 0:
+        return "ok"
+    names = [
+        name for bit, name in AWG_STREAM_ACK_STATUS_NAMES.items() if status & bit
+    ]
+    known_mask = sum(AWG_STREAM_ACK_STATUS_NAMES)
+    unknown = status & ~known_mask
+    if unknown:
+        names.append(f"unknown_0x{unknown:08x}")
+    return "|".join(names)
+
+
+def unpack_stream_ack(data: bytes) -> AwgStreamWireAck:
+    if len(data) != AWG_STREAM_PROTO_ACK_STRUCT.size:
+        raise ValueError(
+            f"AWG stream ACK must be {AWG_STREAM_PROTO_ACK_STRUCT.size} bytes"
+        )
+    return AwgStreamWireAck(*AWG_STREAM_PROTO_ACK_STRUCT.unpack(data))
 
 
 def stream_frame_wire_stats(frame: bytes, *, elapsed_s: Optional[float] = None) -> dict:
@@ -493,6 +550,9 @@ def parse_stream_ack_line(line: str) -> AwgStreamAck:
         seq_acked=int(match.group("seq")),
         ddr_free_events=int(match.group("ddr_free")),
         status=int(match.group("status")),
+        stream_free_events=int(match.group("stream_free")),
+        stream_stalls=int(match.group("stalls")),
+        irq_status=int(match.group("irq"), 16),
         ret=int(match.group("ret")),
         frame_bytes=int(match.group("bytes")),
         event_count=int(match.group("events")),

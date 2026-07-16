@@ -1,3 +1,4 @@
+import struct
 import unittest
 from pathlib import Path
 import sys
@@ -22,6 +23,7 @@ from awg_sched_host import (
     parse_stream_ack_line,
     parse_stream_status_line,
     stream_crc32_ieee,
+    unpack_stream_ack,
 )
 from run_nco_scope_test import (
     RfPowerCalibration,
@@ -122,10 +124,10 @@ class AwgSchedHostTest(unittest.TestCase):
             payload_word2=0,
             payload_word3=0,
         )
-        frame = pack_stream_frame([event], seq=7, open_stream=True, close_with_eof=True)
+        frame = pack_stream_frame([event], seq=0, open_stream=True, close_with_eof=True)
         self.assertEqual(len(frame), 12 + AWG_EVENT_V1_SIZE + 4)
         self.assertEqual(int.from_bytes(frame[0:4], "little"), AWG_STREAM_PROTO_MAGIC)
-        self.assertEqual(int.from_bytes(frame[4:8], "little"), 7)
+        self.assertEqual(int.from_bytes(frame[4:8], "little"), 0)
         self.assertEqual(int.from_bytes(frame[8:10], "little"), 1)
         flags = int.from_bytes(frame[10:12], "little")
         self.assertEqual(flags, AWG_STREAM_PROTO_FLAG_OPEN | AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF)
@@ -136,11 +138,27 @@ class AwgSchedHostTest(unittest.TestCase):
 
     def test_parse_stream_ack_line(self) -> None:
         ack = parse_stream_ack_line(
-            "[AWG-STREAM] ACK magic=0x53415747 seq=3 ddr_free=4096 status=0 ret=0 bytes=48 events=1 flags=0x0003"
+            "[AWG-STREAM] ACK magic=0x53415747 seq=3 ddr_free=4096 status=0 "
+            "stream_free=511 stalls=2 irq=0x00000011 ret=0 bytes=48 events=1 flags=0x0003"
         )
         self.assertEqual(ack.magic, AWG_STREAM_PROTO_MAGIC)
         self.assertEqual(ack.seq_acked, 3)
         self.assertEqual(ack.status_name, "ok")
+        self.assertEqual(ack.stream_free_events, 511)
+
+    def test_unpack_stream_wire_ack(self) -> None:
+        wire = struct.pack("<IIIIIII", AWG_STREAM_PROTO_MAGIC, 9, 100, 0, 511, 2, 0x11)
+        ack = unpack_stream_ack(wire)
+        self.assertTrue(ack.ok)
+        self.assertEqual(ack.seq_acked, 9)
+        self.assertEqual(ack.stream_free_events, 511)
+
+    def test_open_sequence_and_empty_close_rejected(self) -> None:
+        event = AwgSchedEvent(1, 0, 0, 0, 0, 0, 0)
+        with self.assertRaises(ValueError):
+            pack_stream_frame([event], seq=1, open_stream=True)
+        with self.assertRaises(ValueError):
+            pack_stream_frame([], seq=1, close_with_eof=True)
 
     def test_parse_stream_status_line(self) -> None:
         status = parse_stream_status_line(

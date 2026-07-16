@@ -34,18 +34,20 @@ python .\awg_sweep_test.py `
 ```
 
 Notes:
-- The AWG scheduler base address must match the bitstream.
-- The current KCU116 image reports `max_events=64`. Dense one-shot sweeps such
-  as `200-300 MHz` in `10 kHz` steps do not fit in the current event RAM.
-- The current measured host path validates one loaded batch at a time. Very
-  dense sweeps therefore require host-side batching or a larger HDL event RAM.
-- The refreshed Phase A HDL also exposes stream-mode scheduler registers and a
-  stream FIFO. Phase B firmware support exists behind
-  `FMCDAC_AWG_SCHED_STREAM`. UARTLite `STREAMHEX` has passed correctness
-  smoke testing, and scheduler dense per-step FSH has now passed a coarse
-  stream RF smoke over `200-210 MHz` in `1 MHz` steps. Dense `10 kHz`
-  granularity RF characterization and throughput stress remain deferred to
-  trace-capable readout and/or a higher-rate transport.
+- The AWG scheduler base address must match the bitstream (`0x44AA0000` in the
+  current KCU116 AWG image).
+- Discover legacy capacity from `IP_CAPS[31:24]`; the currently measured image
+  reports `max_events=64`. Do not assume that value for another bitstream.
+- Discover streaming capacity from `STREAM_DEPTH` (0x88), then validate it
+  against `OCCUPANCY` and `FREE_SPACE` at empty, full, and boundary states. The
+  current RTL reports 512 while its asynchronous FIFO has 511 usable entries.
+- Phase B firmware support exists behind `FMCDAC_AWG_SCHED_STREAM`. UARTLite
+  `STREAMHEX` has passed correctness smoke testing, and a coarse scheduler RF
+  smoke passed over `200-210 MHz` in `1 MHz` steps. Dense `10 kHz`
+  characterization and throughput stress remain deferred to trace-capable
+  readout and/or a higher-rate transport.
+- The current measured host path validates one loaded batch at a time. Dense
+  sweeps require streaming/refill support or host-side batching.
 - The current payload contract supports `DDS_PHASE_DW=32`; this is no longer a
   16-bit FTW-only path.
 - When an analyzer is attached, the host selects a longer default dwell and a

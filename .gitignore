@@ -48,3 +48,9 @@ projects/fmcdac/fmcdac_build.env
 /projects/fmcdac/*.pyc
 /projects/fmcdac/.Xil.stale.*/
 /projects/fmcdac/build.stale.*/
+
+# Generated FMCDAC host-test products
+/projects/fmcdac/tests/*.exe
+/projects/fmcdac/tests/parameters.h
+__pycache__/
+*.py[cod]

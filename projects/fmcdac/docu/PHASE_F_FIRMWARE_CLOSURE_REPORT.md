@@ -1,0 +1,181 @@
+# Phase F Firmware Closure Report
+
+## Status
+
+Phase F source implementation is present in `projects/fmcdac`, with host-side
+models and unit tests for the scheduler ABI, scheduler DMA refill, Ethernet
+frame I/O, the minimal ARP/IPv4/UDP stack, and the stream protocol.
+
+Hardware closure is **not claimed**. This workspace does not contain the
+licensed Phase E bitstream/XSA, its generated BSP `xparameters.h`, or board-run
+logs. Consequently the generated-XPAR gate, MAC/PCS link bring-up, physical DMA
+traffic, sustained-rate telemetry, and soak acceptance remain to be run on the
+target KCU116.
+
+## Revisions and artifacts
+
+| Item | Value |
+| --- | --- |
+| HDL repository | `hdl-adi-fork` |
+| HDL revision inspected | `82b1419f7` (`control-plane-work`) |
+| Firmware repository | `no-OS-adi-fork` |
+| Firmware base revision | `7688d0497` (`control-plane-work`) plus this working-tree implementation |
+| Vivado version | Pending licensed XSA handoff |
+| Bitstream path | Pending licensed Phase E build |
+| XSA path | Pending licensed Phase E build |
+| Generated BSP/XPAR | Pending XSA import |
+
+The HDL design instantiates the `xxv_ethernet` v4.0 subsystem. The source uses
+that generated IP configuration and the corresponding v4.0 management-register
+map; the handoff's references to "PG203" are treated as a naming error rather
+than permission to invent register offsets.
+
+## Verified HDL ABI
+
+The firmware scheduler register header mirrors
+`hdl-adi-fork/projects/awg/common/awg_sched_regs.h`. The implementation also
+models the associated RTL behavior in `awg_timed_ctrl.v`:
+
+- idle has no active scheduler status bit;
+- stream mode and DMA mode are captured when ARM is issued;
+- STOP aborts without flushing the FIFO, while RESET_SOFT flushes it;
+- STREAM_DEPTH and FREE_SPACE are read at runtime (the present default usable
+  depth is 511 events);
+- software push overflow and IRQ causes use write-one-to-clear handling;
+- DMA and MMIO event word 2 use their respective, explicitly tested packing;
+- EOF is acknowledged only after the EOF event fires;
+- the RTL status error-byte placement is tolerated while retaining the
+  documented register definition.
+
+Expected Phase E address and interrupt table:
+
+| Core | Base address | MicroBlaze IRQ | Processing-system IRQ |
+| --- | ---: | ---: | ---: |
+| AWG scheduler | `0x44AA0000` | 14 | 11 |
+| Scheduler DMAC | `0x44AB0000` | 12 | 13 |
+| 10G Ethernet MAC | `0x44C00000` | polled | polled |
+| Ethernet RX DMAC | `0x44AC0000` | 10 | 14 |
+| Ethernet TX DMAC | `0x44AD0000` | 9 | 15 |
+| Existing AD9144 DMAC | `0x7C420000` | 13 | 12 |
+
+`parameters.h` requires generated symbols for enabled Phase F profiles and
+compares their values with the expected Phase E constants. The included fake
+`tests/xparameters.h` exercises this compile-time gate on the host; it is not a
+substitute for the generated BSP.
+
+## Implemented firmware
+
+Feature profiles keep the existing DDS/JESD path as the default build:
+
+| Profile | Scheduler | Scheduler DMA | Ethernet |
+| --- | ---: | ---: | ---: |
+| `default` | off | off | off |
+| `scheduler-preload` | on | off | off |
+| `scheduler-stream` | on | off | off |
+| `scheduler-dma` | on | on | off |
+| `scheduler-eth` | on | on | on |
+
+The implementation includes:
+
+- exact 32-byte `awg_event_v1_t` wire/DMA ABI and separate MMIO/DMA packing;
+- legacy preload plus software-stream fallback with runtime FIFO accounting;
+- a DDR producer/consumer ring whose DMA submissions never cross its physical
+  end;
+- one scheduler-DMA transfer in flight, cache flush before submission, EOT-only
+  ring consumption, wrap splitting, bounded IRQ handlers, and foreground
+  refill;
+- generic ADI DMAC partial-transfer reporting helpers used to determine RX
+  frame length rather than guessing it;
+- polled 10G MAC reset/configuration/status and intentional SFP0 TX-disable
+  GPIO control;
+- aligned RX/TX ping-pong buffers, RX invalidation, TX flush, short-frame
+  padding, re-arm/chaining, and EOT/error counters;
+- strict Ethernet II, ARP, IPv4, and UDP parsing plus ARP replies and UDP ACKs;
+- a transport-independent, CRC32-protected stream protocol with strict flags,
+  modulo-32-bit sequence checking, idempotent duplicate handling, and distinct
+  failure status bits;
+- a deterministic/stress-capable UDP host sender with batching, pacing,
+  optional ACK/retry, and JSON/CSV telemetry output;
+- integration in the existing `fmcdac.c` initialization/service/teardown path
+  behind the feature gates.
+
+Network defaults are the locally administered MAC `02:00:00:00:00:02`, FPGA
+IPv4 `192.0.2.2`, host IPv4 `192.0.2.1`, and UDP port 5000. They are build-time
+configuration defaults, not hard requirements of the protocol.
+
+Before running the sender, configure the selected host NIC with a static
+address in `192.0.2.0/24` (the default is `192.0.2.1/24`), connect it to SFP0,
+and ensure that another interface or route does not claim `192.0.2.0/24`. The
+sender intentionally does not make privileged host-network changes.
+
+## Host verification
+
+The last completed host run before the final Ethernet-I/O test was integrated
+reported:
+
+| Test | Result |
+| --- | --- |
+| HDL-faithful scheduler model | 122 assertions passed |
+| Stream protocol | 10 test groups passed |
+| Scheduler DMA refill/ring wrap | 125 assertions passed |
+| Generated-XPAR compile fixture | passed |
+| Minimal network stack | 110 assertions passed |
+| Python host tooling | 25 tests passed before the final ACK-regex update |
+
+An additional strict `awg_eth_io_test.c` covers MAC polling, RX partial-length
+handling, ping-pong/cache/drop paths, TX padding, queueing, and chaining. A
+complete clean rerun of all C and Python tests is required after importing this
+test; do not interpret the table as board evidence.
+
+The final source audit should also add direct regression coverage for the
+generic AXI-DMAC partial-transfer helpers and a fake-hardware orchestration test
+around `awg_phase_f.c`. The latter must prove UDP-to-ring-to-scheduler-DMA-to-EOF
+and show that an asynchronous scheduler-DMA error is latched into a later ACK or
+diagnostic snapshot. These are source-test gaps, distinct from the XSA/board
+blockers below.
+
+## Required hardware closure run
+
+1. Build a licensed Phase E bitstream/XSA and record the Vivado version and
+   artifact hashes/paths.
+2. Import the XSA, replace the host fixture with the generated BSP, and build
+   all five firmware profiles. Confirm that every address and IRQ compile-time
+   check passes.
+3. Record the scheduler probe (`IP_ID`, `IP_VERSION`, `STREAM_DEPTH`) and DMAC
+   capability probes for scheduler, RX, and TX.
+4. Run legacy preload and software-stream EOF tests before enabling DMA.
+5. Run scheduler-DMA finite EOF, ring-wrap, EOT/error recovery, and software
+   fallback tests. Record pushes, stalls, occupancy, free space, and IRQ state.
+6. Bring up SFP0, record MAC/PCS block lock and local/remote faults for both
+   link-up and link-down cases, then run known-pattern RX/TX DMA cache tests.
+7. Run ARP, UDP/ACK, and end-to-end UDP-to-ring-to-scheduler-to-EOF tests.
+8. Sweep event rate and capture `COMMIT_COUNT`, `STREAM_PUSHES`,
+   `STREAM_STALLS`, `IRQ_STATUS`, `OCCUPANCY`, `FREE_SPACE`, scheduler DMAC
+   EOT/errors, Ethernet RX/TX counts, CRC failures, drops, and host telemetry.
+9. Run the selected-rate soak and retain logs showing zero scheduler errors and
+   bounded backlog.
+
+The 130 ns / approximately 7.692 ME/s Regime C target also needs transport,
+queue, timing, and analog evidence. This source implementation deliberately
+does not claim that result.
+
+## Known limits
+
+- Exact generated `xparameters.h` symbol names cannot be confirmed until the
+  target XSA is imported; the compile gate contains documented candidate
+  aliases and fails closed for an enabled feature when none is present.
+- No MAC interrupt is wired in the current HDL, so link and fault status are
+  polled in bounded foreground service.
+- The hardware clock tick frequency is not guessed by firmware. Test event
+  timestamps must use the frequency documented by the generated design/JESD
+  configuration.
+- Host fake-MMIO/DMAC tests validate state machines and cache calls, not AXI,
+  DDR, transceiver, or interrupt-controller electrical behavior.
+- Static alignment checks do not alone prove the linked start and end of every
+  buffer is within DMA-accessible DDR. The target build must validate the linker
+  map or perform overflow-safe runtime range checks for the event ring and both
+  RX/TX buffer banks.
+- The compact stream ACK does not contain every sustained-run counter. Until a
+  versioned diagnostics reply is added, capture `COMMIT_COUNT`, `STREAM_PUSHES`,
+  `OCCUPANCY`, scheduler-DMAC EOT/errors, and Ethernet RX/TX/drop counters from
+  bounded periodic firmware logs alongside ACK telemetry.

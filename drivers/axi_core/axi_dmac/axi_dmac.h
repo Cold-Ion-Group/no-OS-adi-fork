@@ -75,6 +75,12 @@
 #define AXI_DMAC_REG_DEST_STRIDE		0x420
 #define AXI_DMAC_REG_SRC_STRIDE			0x424
 #define AXI_DMAC_REG_TRANSFER_DONE		0x428
+#define AXI_DMAC_REG_TRANSFER_PROGRESS		0x448
+#define AXI_DMAC_REG_PARTIAL_TRANSFER_LENGTH	0x44c
+#define AXI_DMAC_REG_PARTIAL_TRANSFER_ID		0x450
+
+#define AXI_DMAC_PARTIAL_TRANSFER_DONE		NO_OS_BIT(31)
+#define AXI_DMAC_PARTIAL_TRANSFER_ID_MASK	NO_OS_GENMASK(1, 0)
 
 /******************************************************************************/
 /*************************** Types Declarations *******************************/
@@ -144,6 +150,12 @@ int32_t axi_dmac_read(struct axi_dmac *dmac, uint32_t reg_addr,
 int32_t axi_dmac_write(struct axi_dmac *dmac, uint32_t reg_addr,
 		       uint32_t reg_data);
 int32_t axi_dmac_is_transfer_ready(struct axi_dmac *dmac, bool *rdy);
+int32_t axi_dmac_set_partial_reporting(struct axi_dmac *dmac, bool enable);
+int32_t axi_dmac_get_transfer_progress(struct axi_dmac *dmac,
+				       uint32_t *length);
+int32_t axi_dmac_get_partial_transfer(struct axi_dmac *dmac,
+				      uint32_t *length,
+				      uint32_t *transfer_id);
 int32_t axi_dmac_init(struct axi_dmac **adc_core,
 		      const struct axi_dmac_init *init);
 int32_t axi_dmac_remove(struct axi_dmac *dmac);

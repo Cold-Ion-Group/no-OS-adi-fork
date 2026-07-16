@@ -273,6 +273,101 @@ int32_t axi_dmac_is_transfer_ready(struct axi_dmac *dmac, bool *rdy)
 }
 
 /*******************************************************************************
+ * @brief Enable or disable reporting of partial transfers caused by TLAST.
+ *
+ * @param dmac - DMAC instance.
+ * @param enable - True to enable partial-transfer reporting, false to disable.
+ *
+ * @return 0 for success, negative error code otherwise.
+*******************************************************************************/
+int32_t axi_dmac_set_partial_reporting(struct axi_dmac *dmac, bool enable)
+{
+	uint32_t flags;
+	int32_t ret;
+
+	if (!dmac)
+		return -EINVAL;
+
+	ret = axi_dmac_read(dmac, AXI_DMAC_REG_FLAGS, &flags);
+	if (ret)
+		return ret;
+
+	if (enable)
+		flags |= DMA_PARTIAL_REPORTING_EN;
+	else
+		flags &= ~DMA_PARTIAL_REPORTING_EN;
+
+	return axi_dmac_write(dmac, AXI_DMAC_REG_FLAGS, flags);
+}
+
+/*******************************************************************************
+ * @brief Read the number of bytes transferred by the active transfer.
+ *
+ * @note This register is intended for debugging and is cleared at end of
+ * transfer. It does not consume a completed partial-transfer report.
+ *
+ * @param dmac - DMAC instance.
+ * @param length - Number of bytes transferred so far.
+ *
+ * @return 0 for success, negative error code otherwise.
+*******************************************************************************/
+int32_t axi_dmac_get_transfer_progress(struct axi_dmac *dmac, uint32_t *length)
+{
+	if (!dmac || !length)
+		return -EINVAL;
+
+	return axi_dmac_read(dmac, AXI_DMAC_REG_TRANSFER_PROGRESS, length);
+}
+
+/*******************************************************************************
+ * @brief Get and consume the oldest completed partial-transfer report.
+ *
+ * @note Reading the partial-transfer ID consumes the report. The length must
+ * therefore be read first. If more reports are queued, call this function
+ * repeatedly until it returns -EAGAIN.
+ *
+ * @param dmac - DMAC instance.
+ * @param length - Completed partial-transfer length in bytes.
+ * @param transfer_id - ID of the transfer that completed partially.
+ *
+ * @return 0 for success, -EAGAIN if no partial report is available, or another
+ * negative error code otherwise.
+*******************************************************************************/
+int32_t axi_dmac_get_partial_transfer(struct axi_dmac *dmac,
+				      uint32_t *length,
+				      uint32_t *transfer_id)
+{
+	uint32_t done;
+	uint32_t report_length;
+	uint32_t report_id;
+	int32_t ret;
+
+	if (!dmac || !length || !transfer_id)
+		return -EINVAL;
+
+	ret = axi_dmac_read(dmac, AXI_DMAC_REG_TRANSFER_DONE, &done);
+	if (ret)
+		return ret;
+	if (!(done & AXI_DMAC_PARTIAL_TRANSFER_DONE))
+		return -EAGAIN;
+
+	ret = axi_dmac_read(dmac, AXI_DMAC_REG_PARTIAL_TRANSFER_LENGTH,
+			    &report_length);
+	if (ret)
+		return ret;
+
+	/* Reading the ID pops this report, so it must be the final register read. */
+	ret = axi_dmac_read(dmac, AXI_DMAC_REG_PARTIAL_TRANSFER_ID, &report_id);
+	if (ret)
+		return ret;
+
+	*length = report_length;
+	*transfer_id = report_id & AXI_DMAC_PARTIAL_TRANSFER_ID_MASK;
+
+	return 0;
+}
+
+/*******************************************************************************
  * @brief Get DMAC capabilities.
  *
  * @param dmac - DMAC istance.
@@ -436,6 +531,9 @@ int32_t axi_dmac_transfer_start(struct axi_dmac *dmac,
 	/* If we don't have a start of transfer then start compute
 	 * values and trigger next transfer. */
 	if (!(reg_val & AXI_DMAC_QUEUE_FULL)) {
+		/* A prior completion must not satisfy this transfer's wait. */
+		dmac->transfer.transfer_done = false;
+
 		switch (dmac->direction) {
 		case DMA_DEV_TO_MEM:
 			dmac->init_addr = dmac->next_dest_addr;

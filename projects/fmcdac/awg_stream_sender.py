@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Deterministic/stress UDP sender for the FMCDAC Phase F AWG stream."""
+"""Legacy GWAS/1 diagnostic sender for the FMCDAC Phase-F AWG stream.
+
+Production benchmark runs use the rfsoc-bench GWAS/2 controller, which adds
+session identity and direct/C1 payload discrimination.
+"""
 
 from __future__ import annotations
 

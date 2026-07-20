@@ -146,6 +146,8 @@ _STREAM_STATUS_RE = re.compile(
     r"stream_pushes=(?P<stream_pushes>\d+) "
     r"stream_stalls=(?P<stream_stalls>\d+) "
     r"commit=(?P<commit>\d+) "
+    r"reinit=(?P<reinit>\d+) "
+    r"reinit_reject=(?P<reinit_reject>\d+) "
     r"err=0x(?P<err>[0-9A-Fa-f]+) "
     r"irq=0x(?P<irq>[0-9A-Fa-f]+) "
     r"hw_status=0x(?P<hw_status>[0-9A-Fa-f]+) "
@@ -296,6 +298,8 @@ class AwgStreamStatus:
     stream_pushes: int
     stream_stalls: int
     commit_count: int
+    reinit_count: int
+    reinit_reject_count: int
     err_reg: int
     irq_status: int
     hw_status: int
@@ -577,6 +581,8 @@ def parse_stream_status_line(line: str) -> AwgStreamStatus:
         stream_pushes=int(match.group("stream_pushes")),
         stream_stalls=int(match.group("stream_stalls")),
         commit_count=int(match.group("commit")),
+        reinit_count=int(match.group("reinit")),
+        reinit_reject_count=int(match.group("reinit_reject")),
         err_reg=int(match.group("err"), 16),
         irq_status=int(match.group("irq"), 16),
         hw_status=int(match.group("hw_status"), 16),

@@ -7,6 +7,108 @@
 #include "awg_sched_regs.h"
 #include "no_os_axi_io.h"
 
+static int32_t awg_phase_f_extension_init(struct awg_phase_f *phase)
+{
+	uint32_t id;
+	uint32_t version;
+	uint32_t required;
+	int32_t ret;
+
+	if (!phase->config.extension_base)
+		return -ENODEV;
+	ret = no_os_axi_io_read(phase->config.extension_base,
+		AWG_PHASE_F_AWGX_REG_ID, &id);
+	if (ret)
+		return ret;
+	ret = no_os_axi_io_read(phase->config.extension_base,
+		AWG_PHASE_F_AWGX_REG_VERSION, &version);
+	if (ret)
+		return ret;
+	ret = no_os_axi_io_read(phase->config.extension_base,
+		AWG_PHASE_F_AWGX_REG_CAPS, &phase->extension_caps);
+	if (ret)
+		return ret;
+
+	required = AWG_PHASE_F_AWGX_CAP_DMA | AWG_PHASE_F_AWGX_CAP_UDP |
+		AWG_PHASE_F_AWGX_CAP_DIRECT_BYPASS;
+	if (id != AWG_PHASE_F_AWGX_ID)
+		return -ENODEV;
+	if (version != AWG_PHASE_F_AWGX_VERSION)
+		return -ENOTSUP;
+	if ((phase->extension_caps & required) != required)
+		return -ENOTSUP;
+	return 0;
+}
+
+static int awg_phase_f_protocol_prepare(void *ctx)
+{
+	struct awg_phase_f *phase = ctx;
+	int32_t ret;
+
+	if (!phase || !phase->initialized)
+		return -EINVAL;
+
+	if (phase->scheduler_dma_initialized) {
+		ret = awg_sched_dma_abort(&phase->scheduler_dma);
+		if (ret)
+			return ret;
+		memset(&phase->scheduler_dma, 0, sizeof(phase->scheduler_dma));
+		phase->scheduler_dma_initialized = false;
+	} else if (phase->protocol.active) {
+		ret = awg_sched_stream_reset_soft();
+		if (ret)
+			return ret;
+	}
+
+	/* Every session starts with a clean decoder and direct bypass selected. */
+	ret = no_os_axi_io_write(phase->config.extension_base,
+		AWG_PHASE_F_AWGX_REG_CONTROL,
+		AWG_PHASE_F_AWGX_CONTROL_SOFT_RESET);
+	if (ret)
+		return ret;
+	ret = no_os_axi_io_write(phase->config.extension_base,
+		AWG_PHASE_F_AWGX_REG_CONTROL, 0U);
+	if (!ret)
+		phase->selected_payload_kind = AWG_STREAM_PROTO_V2_KIND_CONTROL;
+	return ret;
+}
+
+static int awg_phase_f_protocol_select_kind(void *ctx, uint8_t kind)
+{
+	struct awg_phase_f *phase = ctx;
+	awg_stream_ring_t *ring;
+	uint32_t control;
+
+	if (!phase || !phase->initialized ||
+	    !awg_sched_stream_dma_mode_enabled())
+		return -EINVAL;
+	if (phase->scheduler_dma_initialized &&
+	    awg_sched_dma_in_flight(&phase->scheduler_dma))
+		return -EBUSY;
+	ring = awg_sched_stream_ring_get();
+	if (!ring || awg_stream_ring_count(ring) != 0U)
+		return -EBUSY;
+
+	if (kind == AWG_STREAM_PROTO_V2_KIND_EVENTS) {
+		if ((phase->extension_caps &
+		     AWG_PHASE_F_AWGX_CAP_DIRECT_BYPASS) == 0U)
+			return -ENOTSUP;
+		control = 0U;
+	} else if (kind == AWG_STREAM_PROTO_V2_KIND_C1) {
+		if ((phase->extension_caps & AWG_PHASE_F_AWGX_CAP_C1) == 0U)
+			return -ENOTSUP;
+		control = AWG_PHASE_F_AWGX_CONTROL_C1_ENABLE;
+	} else {
+		return -EINVAL;
+	}
+
+	if (no_os_axi_io_write(phase->config.extension_base,
+				AWG_PHASE_F_AWGX_REG_CONTROL, control))
+		return -EIO;
+	phase->selected_payload_kind = kind;
+	return 0;
+}
+
 static int32_t awg_phase_f_tx(struct awg_phase_f *phase, size_t length)
 {
 	int32_t ret;
@@ -36,24 +138,51 @@ static int32_t awg_phase_f_reply_arp(struct awg_phase_f *phase,
 static int32_t awg_phase_f_reply_udp(struct awg_phase_f *phase,
 				     const struct awg_net_packet *packet)
 {
-	awg_stream_proto_ack_t ack;
+	const awg_stream_proto_v2_ops_t ops = {
+		.prepare = awg_phase_f_protocol_prepare,
+		.select_kind = awg_phase_f_protocol_select_kind,
+		.ctx = phase,
+	};
+	awg_stream_proto_v2_ack_t ack;
+	awg_stream_proto_ack_t legacy_ack;
 	size_t length;
+	size_t ack_length;
+	bool is_v2;
 	int32_t proto_ret;
 	int32_t ret;
 
-	proto_ret = awg_stream_proto_handle_frame_ctx(&phase->protocol,
-			packet->payload, packet->payload_length,
-			&phase->config.stream, &ack);
+	/* Keep the completed GWAS/1 sender usable as a diagnostic fallback. */
+	is_v2 = packet->payload_length >= AWG_STREAM_PROTO_V2_HEADER_BYTES +
+		AWG_STREAM_PROTO_CRC_BYTES &&
+		((packet->payload[18U] == AWG_STREAM_PROTO_V2_HEADER_BYTES &&
+		  packet->payload[19U] == 0U) ||
+		 (phase->protocol.active &&
+		  packet->payload[8U] == (uint8_t)phase->protocol.session_id &&
+		  packet->payload[9U] == (uint8_t)(phase->protocol.session_id >> 8) &&
+		  packet->payload[10U] == (uint8_t)(phase->protocol.session_id >> 16) &&
+		  packet->payload[11U] == (uint8_t)(phase->protocol.session_id >> 24)));
+	if (is_v2) {
+		proto_ret = awg_stream_proto_v2_handle_frame(&phase->protocol,
+				packet->payload, packet->payload_length,
+				&phase->config.stream, &ops, &ack);
+		awg_stream_proto_v2_ack_to_le(&ack, phase->ack_payload);
+		ack_length = AWG_STREAM_PROTO_V2_ACK_BYTES;
+	} else {
+		proto_ret = awg_stream_proto_handle_frame_ctx(&phase->legacy_protocol,
+				packet->payload, packet->payload_length,
+				&phase->config.stream, &legacy_ack);
+		awg_stream_proto_ack_to_le(&legacy_ack, phase->ack_payload);
+		ack_length = AWG_STREAM_PROTO_ACK_BYTES;
+	}
 	if (proto_ret)
 		phase->stats.protocol_rejects++;
 	else
 		phase->stats.protocol_accepts++;
 
-	awg_stream_proto_ack_to_le(&ack, phase->ack_payload);
 	ret = awg_net_build_udp(&phase->net, packet->source_mac,
 				packet->source_ipv4, phase->config.net.udp_port,
 				packet->source_port, phase->ack_payload,
-				sizeof(phase->ack_payload), phase->tx_frame,
+				ack_length, phase->tx_frame,
 				sizeof(phase->tx_frame), &length);
 	if (ret)
 		return ret;
@@ -141,10 +270,21 @@ int32_t awg_phase_f_init(struct awg_phase_f *phase,
 
 	if (!phase || !config)
 		return -EINVAL;
+	if (config->rx.buffer_size < AWG_PHASE_F_MAX_RX_FRAME_BYTES ||
+	    config->mac.rx_max_frame_size < AWG_PHASE_F_MAX_RX_FRAME_BYTES ||
+	    config->tx.buffer_size < AWG_NET_ETH_HEADER_LEN +
+		AWG_NET_IPV4_MIN_HEADER_LEN + AWG_NET_UDP_HEADER_LEN +
+		AWG_STREAM_PROTO_V2_ACK_BYTES)
+		return -EMSGSIZE;
 
 	memset(phase, 0, sizeof(*phase));
 	phase->config = *config;
-	awg_stream_proto_session_init(&phase->protocol);
+	awg_stream_proto_v2_session_init(&phase->protocol);
+	awg_stream_proto_session_init(&phase->legacy_protocol);
+
+	ret = awg_phase_f_extension_init(phase);
+	if (ret)
+		return ret;
 
 	ret = awg_eth_mac_init(&phase->mac, &config->mac);
 	if (ret)
@@ -165,8 +305,8 @@ int32_t awg_phase_f_init(struct awg_phase_f *phase,
 	if (ret)
 		return ret;
 
-	phase->mac_poll_countdown = config->mac_status_poll_divider;
 	phase->initialized = true;
+	phase->mac_poll_countdown = config->mac_status_poll_divider;
 	return 0;
 }
 

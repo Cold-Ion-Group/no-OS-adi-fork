@@ -1772,6 +1772,7 @@ static int fmcdac_phase_f_hw_init(struct fmcdac_dev *dev)
 		memset(&config, 0, sizeof(config));
 		awg_eth_mac_config_defaults(&config.mac);
 		config.mac.base = FMCDAC_AWG_ETH_MAC_BASEADDR;
+		config.mac.rx_max_frame_size = AWG_ETH_DMA_BUFFER_BYTES;
 		config.mac.read = fmcdac_mac_read;
 		config.mac.write = fmcdac_mac_write;
 		config.mac.delay = fmcdac_mac_delay;
@@ -1817,6 +1818,7 @@ static int fmcdac_phase_f_hw_init(struct fmcdac_dev *dev)
 		config.stream.use_dma = true;
 		config.scheduler_dmac = g_fmcdac_sched_dmac;
 		config.scheduler_base = FMCDAC_AWG_SCHED_BASEADDR;
+		config.extension_base = FMCDAC_AWG_EXTENSION_BASEADDR;
 		config.scheduler_dma_max_events =
 			FMCDAC_AWG_SCHED_DMA_MAX_EVENTS;
 		config.scheduler_cache_line_size = AWG_DMA_CACHELINE_BYTES;
@@ -4174,6 +4176,8 @@ static int fmcdac_awg_stream_console_status(const char *tag)
 	uint32_t stream_pushes = 0U;
 	uint32_t stream_stalls = 0U;
 	uint32_t commit_count = 0U;
+	uint32_t reinit_count = 0U;
+	uint32_t reinit_reject = 0U;
 	int ret = 0;
 
 	if (!g_fmcdac_sched_console_configured) {
@@ -4198,6 +4202,8 @@ static int fmcdac_awg_stream_console_status(const char *tag)
 	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_STREAM_PUSHES, &stream_pushes);
 	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_STREAM_STALLS, &stream_stalls);
 	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_COMMIT_COUNT, &commit_count);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_REINIT_COUNT, &reinit_count);
+	ret |= fmcdac_awg_sched_console_read_reg(AWG_SCHED_REG_REINIT_REJECT, &reinit_reject);
 	if (ret != 0) {
 		xil_printf("[AWG-STREAM] ERROR reason=status_read_failed status=%d\n\r",
 			   ret);
@@ -4207,7 +4213,8 @@ static int fmcdac_awg_stream_console_status(const char *tag)
 	xil_printf("[AWG-STREAM] STATUS tag=%s ip_id=0x%08lX ip_version=0x%08lX "
 		   "stream_depth=%lu low_wmark=%lu stream_ctrl=0x%08lX "
 		   "occupancy=%lu free_space=%lu stream_pushes=%lu stream_stalls=%lu "
-		   "commit=%lu err=0x%08lX irq=0x%08lX hw_status=0x%08lX "
+		   "commit=%lu reinit=%lu reinit_reject=%lu "
+		   "err=0x%08lX irq=0x%08lX hw_status=0x%08lX "
 		   "mode=%u overflow=%u eof_seen=%u running=%u done=%u error=%u\n\r",
 		   tag ? tag : "status",
 		   (unsigned long)ip_id,
@@ -4220,6 +4227,8 @@ static int fmcdac_awg_stream_console_status(const char *tag)
 		   (unsigned long)stream_pushes,
 		   (unsigned long)stream_stalls,
 		   (unsigned long)commit_count,
+		   (unsigned long)reinit_count,
+		   (unsigned long)reinit_reject,
 		   (unsigned long)err_reg,
 		   (unsigned long)irq_status,
 		   (unsigned long)status,
@@ -4279,7 +4288,8 @@ static int fmcdac_awg_stream_console_reset(void)
 	g_fmcdac_stream_console_output_prepared = 0;
 	awg_stream_proto_reset_default_session();
 #if FMCDAC_AWG_SCHED_ETH
-	awg_stream_proto_session_init(&g_fmcdac_phase_f.protocol);
+	awg_stream_proto_v2_session_init(&g_fmcdac_phase_f.protocol);
+	awg_stream_proto_session_init(&g_fmcdac_phase_f.legacy_protocol);
 #endif
 	xil_printf("[AWG-STREAM] RESET DONE type=soft\n\r");
 	return fmcdac_awg_stream_console_status("after_reset");

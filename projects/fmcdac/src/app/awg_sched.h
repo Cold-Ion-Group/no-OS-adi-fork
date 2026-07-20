@@ -130,6 +130,21 @@ typedef struct {
 	uint32_t hw_status_word;
 } awg_sched_status_t;
 
+/*
+ * Retained proof of the most recent scheduler epoch application.  The
+ * sequence advances only after TIME_NOW proves that the requested reload was
+ * applied; failed attempts retain their before/after evidence without
+ * advancing the sequence.
+ */
+typedef struct {
+	uint64_t reload_ticks;
+	uint32_t control;
+	uint64_t time_before;
+	uint64_t time_after;
+	uint32_t apply_seq;
+	bool applied;
+} awg_sched_epoch_result_t;
+
 int awg_sched_config(const awg_sched_cfg_t *cfg);
 int awg_sched_read_status(awg_sched_status_t *status);
 int awg_sched_get_status(awg_sched_status_t *status);
@@ -158,6 +173,7 @@ int awg_sched_start(void);
 int awg_sched_stop(void);
 int awg_sched_wait_done(uint32_t timeout_ms, awg_sched_status_t *final_status);
 int awg_sched_set_epoch(void);
+int awg_sched_get_last_epoch_result(awg_sched_epoch_result_t *result);
 void awg_sched_irq_signal(void);
 void awg_sched_dump_artifacts(const awg_event_v1_t *events, uint32_t count,
 			      const awg_sched_status_t *status);

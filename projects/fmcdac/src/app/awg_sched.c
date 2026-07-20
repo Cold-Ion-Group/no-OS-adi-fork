@@ -1241,41 +1241,72 @@ wait_ms--;
 }
 }
 
+static awg_sched_epoch_result_t g_awg_sched_epoch_result;
+static uint32_t g_awg_sched_epoch_apply_seq;
+
+int awg_sched_get_last_epoch_result(awg_sched_epoch_result_t *result)
+{
+	if (!result)
+		return -EINVAL;
+
+	*result = g_awg_sched_epoch_result;
+	return 0;
+}
+
 int awg_sched_set_epoch(void)
 {
 	uint64_t time_before;
 	uint64_t time_now;
 	uint32_t poll_us;
+	awg_sched_epoch_result_t result;
 	int ret;
 
 	if (!g_awg_sched.configured)
 		return -ENODEV;
 
+	memset(&result, 0, sizeof(result));
+	result.reload_ticks = 0U;
+	result.control = AWG_SCHED_TIME_RELOAD_LOAD_NOW;
+	result.apply_seq = g_awg_sched_epoch_apply_seq;
+
 	ret = awg_sched_read_time_now(&time_before);
 	if (ret)
 		return ret;
+	result.time_before = time_before;
 
 	ret = awg_sched_reg_write(AWG_SCHED_REG_TIME_RELOAD_LO, 0U);
-	if (ret)
+	if (ret) {
+		g_awg_sched_epoch_result = result;
 		return ret;
+	}
 
 	ret = awg_sched_reg_write(AWG_SCHED_REG_TIME_RELOAD_HI, 0U);
-	if (ret)
+	if (ret) {
+		g_awg_sched_epoch_result = result;
 		return ret;
+	}
 
 	AWG_LOG("%s", "[AWG-SCHED] set_epoch step=load_now\n\r");
 	ret = awg_sched_reg_write(AWG_SCHED_REG_TIME_RELOAD_CTRL,
 				  AWG_SCHED_TIME_RELOAD_LOAD_NOW);
-	if (ret)
+	if (ret) {
+		g_awg_sched_epoch_result = result;
 		return ret;
+	}
 
 	for (poll_us = 0U; poll_us < 1000U; poll_us++) {
 		ret = awg_sched_read_time_now(&time_now);
-		if (ret)
+		if (ret) {
+			g_awg_sched_epoch_result = result;
 			return ret;
+		}
+		result.time_after = time_now;
 
 		if ((time_now <= AWG_SCHED_TIME_EPOCH_NEAR_ZERO) ||
 		    (time_now < time_before)) {
+			result.applied = true;
+			result.apply_seq = ++g_awg_sched_epoch_apply_seq;
+			g_awg_sched_epoch_result = result;
 			AWG_LOG("[SCHED-ARTIFACT] set_epoch before=0x%08lX_%08lX now=0x%08lX_%08lX\n\r",
 				(unsigned long)(time_before >> 32),
 				(unsigned long)time_before,
@@ -1287,6 +1318,7 @@ int awg_sched_set_epoch(void)
 		no_os_udelay(1U);
 	}
 
+	g_awg_sched_epoch_result = result;
 	return -ETIMEDOUT;
 }
 

@@ -40,7 +40,8 @@ Notes:
   reports `max_events=64`. Do not assume that value for another bitstream.
 - Discover streaming capacity from `STREAM_DEPTH` (0x88), then validate it
   against `OCCUPANCY` and `FREE_SPACE` at empty, full, and boundary states. The
-  current RTL reports 512 while its asynchronous FIFO has 511 usable entries.
+  current RTL configures 512 physical FIFO slots, while `STREAM_DEPTH` reports
+  the authoritative usable capacity of 511 events.
 - Phase B firmware support exists behind `FMCDAC_AWG_SCHED_STREAM`. UARTLite
   `STREAMHEX` has passed correctness smoke testing, and a coarse scheduler RF
   smoke passed over `200-210 MHz` in `1 MHz` steps. Dense `10 kHz`

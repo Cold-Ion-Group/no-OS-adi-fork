@@ -164,12 +164,15 @@ class AwgSchedHostTest(unittest.TestCase):
         status = parse_stream_status_line(
             "[AWG-STREAM] STATUS tag=status ip_id=0x41574753 ip_version=0x00010000 "
             "stream_depth=511 low_wmark=127 stream_ctrl=0x00000005 occupancy=0 free_space=511 "
-            "stream_pushes=12 stream_stalls=1 commit=12 err=0x00000000 irq=0x00000011 "
+            "stream_pushes=12 stream_stalls=1 commit=12 reinit=5 reinit_reject=2 "
+            "err=0x00000000 irq=0x00000011 "
             "hw_status=0x00000008 mode=1 overflow=0 eof_seen=1 running=0 done=1 error=0"
         )
         self.assertEqual(status.stream_depth, 511)
         self.assertTrue(status.done)
         self.assertTrue(status.eof_seen)
+        self.assertEqual(status.reinit_count, 5)
+        self.assertEqual(status.reinit_reject_count, 2)
 
     def test_pack_awg_payload_v1_32bit(self) -> None:
         word0, word1, word2, word3 = pack_awg_payload_v1(

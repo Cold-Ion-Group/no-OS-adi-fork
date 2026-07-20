@@ -20,6 +20,7 @@ CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic \
 SRC_DIR := ../src/app
 TEST_BIN := awg_sched_validate_test
 PROTO_TEST_BIN := awg_stream_proto_test
+PROTO_V2_TEST_BIN := awg_stream_proto_v2_test
 DMA_TEST_BIN := awg_sched_dma_test
 PARAM_TEST_BIN := parameters_compile_test
 NET_TEST_BIN := awg_net_test
@@ -31,6 +32,9 @@ SRCS := awg_sched_validate_test.c \
 
 PROTO_SRCS := awg_stream_proto_test.c \
               $(SRC_DIR)/awg_stream_proto.c
+
+PROTO_V2_SRCS := awg_stream_proto_v2_test.c \
+                 $(SRC_DIR)/awg_stream_proto.c
 
 DMA_SRCS := awg_sched_dma_test.c \
             $(SRC_DIR)/awg_sched_dma.c \
@@ -48,6 +52,7 @@ PARAM_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -Werror \
                 -DFMCDAC_AWG_ETH_MAC_BASEADDR=0x44C00000U \
                 -DFMCDAC_AWG_ETH_RX_DMA_BASEADDR=0x44AC0000U \
                 -DFMCDAC_AWG_ETH_TX_DMA_BASEADDR=0x44AD0000U
+PARAM_CFLAGS += -DFMCDAC_AWG_EXTENSION_BASEADDR=0x44AE0000U
 
 NET_SRCS := awg_net_test.c $(SRC_DIR)/awg_net.c
 
@@ -56,13 +61,16 @@ ETH_IO_SRCS := awg_eth_io_test.c \
                $(SRC_DIR)/awg_eth_rx.c \
                $(SRC_DIR)/awg_eth_tx.c
 
-all: $(TEST_BIN) $(PROTO_TEST_BIN) $(DMA_TEST_BIN) $(PARAM_TEST_BIN) $(NET_TEST_BIN) $(ETH_IO_TEST_BIN)
+all: $(TEST_BIN) $(PROTO_TEST_BIN) $(PROTO_V2_TEST_BIN) $(DMA_TEST_BIN) $(PARAM_TEST_BIN) $(NET_TEST_BIN) $(ETH_IO_TEST_BIN)
 
 $(TEST_BIN): $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(PROTO_TEST_BIN): $(PROTO_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
+
+$(PROTO_V2_TEST_BIN): $(PROTO_V2_SRCS)
+	$(CC) $(CFLAGS) -Werror -o $@ $^
 
 $(DMA_TEST_BIN): $(DMA_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
@@ -76,9 +84,10 @@ $(NET_TEST_BIN): $(NET_SRCS)
 $(ETH_IO_TEST_BIN): $(ETH_IO_SRCS)
 	$(CC) $(CFLAGS) -Werror -o $@ $^
 
-run: $(TEST_BIN) $(PROTO_TEST_BIN) $(DMA_TEST_BIN) $(PARAM_TEST_BIN) $(NET_TEST_BIN) $(ETH_IO_TEST_BIN)
+run: $(TEST_BIN) $(PROTO_TEST_BIN) $(PROTO_V2_TEST_BIN) $(DMA_TEST_BIN) $(PARAM_TEST_BIN) $(NET_TEST_BIN) $(ETH_IO_TEST_BIN)
 	./$(TEST_BIN)
 	./$(PROTO_TEST_BIN)
+	./$(PROTO_V2_TEST_BIN)
 	./$(DMA_TEST_BIN)
 	./$(PARAM_TEST_BIN)
 	./$(NET_TEST_BIN)
@@ -88,6 +97,6 @@ run-host:
 	python awg_sched_host_test.py
 
 clean:
-	rm -f $(TEST_BIN) $(PROTO_TEST_BIN) $(DMA_TEST_BIN) $(PARAM_TEST_BIN) $(NET_TEST_BIN) $(ETH_IO_TEST_BIN)
+	rm -f $(TEST_BIN) $(PROTO_TEST_BIN) $(PROTO_V2_TEST_BIN) $(DMA_TEST_BIN) $(PARAM_TEST_BIN) $(NET_TEST_BIN) $(ETH_IO_TEST_BIN)
 
 .PHONY: all run run-host clean

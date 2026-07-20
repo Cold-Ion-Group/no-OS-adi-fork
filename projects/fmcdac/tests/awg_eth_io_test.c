@@ -250,7 +250,7 @@ int32_t axi_dmac_read(struct axi_dmac *dmac, uint32_t reg_addr,
 		break;
 	case AXI_DMAC_REG_TRANSFER_DONE:
 		*reg_data = fake->partial_available ?
-			    AXI_DMAC_PARTIAL_TRANSFER_DONE : 0U;
+			    (uint32_t)AXI_DMAC_PARTIAL_TRANSFER_DONE : 0U;
 		break;
 	case AXI_DMAC_REG_PARTIAL_TRANSFER_LENGTH:
 		*reg_data = fake->partial_length;
@@ -338,7 +338,9 @@ int32_t axi_dmac_get_partial_transfer(struct axi_dmac *dmac,
 		return ret;
 
 	*length = report_length;
-	*transfer_id = report_id & AXI_DMAC_PARTIAL_TRANSFER_ID_MASK;
+	/* The production mask is GENMASK(1, 0); avoid its GNU expression in
+	 * this strictly ISO-C host fake. */
+	*transfer_id = report_id & UINT32_C(0x3);
 	return 0;
 }
 
@@ -675,8 +677,10 @@ static void test_rx_ping_pong_and_partial_reports(void)
 	CHECK(fake_events[0].op == FAKE_OP_DMAC_READ);
 	CHECK(fake_events[0].reg == AXI_DMAC_REG_TRANSFER_DONE);
 	CHECK(fake_count_op(FAKE_OP_DMAC_READ) == 3U);
-	CHECK(fake_events[1].reg == AXI_DMAC_REG_FLAGS);
-	CHECK(fake_events[2].reg == AXI_DMAC_REG_FLAGS);
+	CHECK(fake_events[fake_find_op(FAKE_OP_DMAC_READ, 1U)].reg ==
+	      AXI_DMAC_REG_FLAGS);
+	CHECK(fake_events[fake_find_op(FAKE_OP_DMAC_READ, 2U)].reg ==
+	      AXI_DMAC_REG_FLAGS);
 
 	ret = awg_eth_rx_release(&rx, frame1.buffer_index);
 	CHECK(ret == 0);

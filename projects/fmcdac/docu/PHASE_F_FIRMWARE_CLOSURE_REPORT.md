@@ -19,7 +19,7 @@ target KCU116.
 | HDL repository | `hdl-adi-fork` |
 | HDL revision inspected | `82b1419f7` (`control-plane-work`) |
 | Firmware repository | `no-OS-adi-fork` |
-| Firmware base revision | `7688d0497` (`control-plane-work`) plus this working-tree implementation |
+| Firmware base revision | `3b98aae93` (`control-plane-work`) plus the benchmark-integration working tree |
 | Vivado version | Pending licensed XSA handoff |
 | Bitstream path | Pending licensed Phase E build |
 | XSA path | Pending licensed Phase E build |
@@ -56,6 +56,7 @@ Expected Phase E address and interrupt table:
 | 10G Ethernet MAC | `0x44C00000` | polled | polled |
 | Ethernet RX DMAC | `0x44AC0000` | 10 | 14 |
 | Ethernet TX DMAC | `0x44AD0000` | 9 | 15 |
+| AWGX direct/C1 extension | `0x44AE0000` | polled | polled |
 | Existing AD9144 DMAC | `0x7C420000` | 13 | 12 |
 
 `parameters.h` requires generated symbols for enabled Phase F profiles and
@@ -94,6 +95,21 @@ The implementation includes:
 - a transport-independent, CRC32-protected stream protocol with strict flags,
   modulo-32-bit sequence checking, idempotent duplicate handling, and distinct
   failure status bits;
+- production GWAS/2 control/direct/C1 discrimination with a 32-byte declared
+  program SHA-256 identity, session ID, cached duplicate ACK, and a race-free
+  held direct tail event for CLOSE/EOF;
+- fail-closed epoch establishment on GWAS/2 OPEN: the stream OPEN path writes
+  `TIME_RELOAD_LO/HI=0`, strobes `TIME_RELOAD_CTRL.LOAD_NOW`, and withholds the
+  successful ACK until `TIME_NOW` proves the reload was applied;
+- retained `awg_sched_epoch_result_t` diagnostics containing reload/control,
+  `TIME_NOW` before/after, application sequence, and applied state. Successful
+  applications advance `apply_seq`; failed attempts retain evidence without
+  advancing it;
+- AWGX identity/capability validation and direct/C1 selection before the first
+  scheduler-DMA transfer; the original GWAS/1 path remains available as a
+  diagnostic fallback;
+- 9216-byte RX/TX DMA storage and MAC MTU configuration, with a compile/runtime
+  consistency gate for the bounded 128-record protocol frame;
 - a deterministic/stress-capable UDP host sender with batching, pacing,
   optional ACK/retry, and JSON/CSV telemetry output;
 - integration in the existing `fmcdac.c` initialization/service/teardown path
@@ -110,29 +126,23 @@ sender intentionally does not make privileged host-network changes.
 
 ## Host verification
 
-The last completed host run before the final Ethernet-I/O test was integrated
-reported:
+The complete host suite after the GWAS/2 integration reported:
 
 | Test | Result |
 | --- | --- |
 | HDL-faithful scheduler model | 122 assertions passed |
 | Stream protocol | 10 test groups passed |
+| GWAS/2 control/direct/C1 protocol | 51 assertions passed |
 | Scheduler DMA refill/ring wrap | 125 assertions passed |
 | Generated-XPAR compile fixture | passed |
 | Minimal network stack | 110 assertions passed |
-| Python host tooling | 25 tests passed before the final ACK-regex update |
+| Ethernet MAC/RX/TX/cache state machines | 326 assertions passed |
+| Python host tooling | 25 tests passed |
 
-An additional strict `awg_eth_io_test.c` covers MAC polling, RX partial-length
-handling, ping-pong/cache/drop paths, TX padding, queueing, and chaining. A
-complete clean rerun of all C and Python tests is required after importing this
-test; do not interpret the table as board evidence.
-
-The final source audit should also add direct regression coverage for the
-generic AXI-DMAC partial-transfer helpers and a fake-hardware orchestration test
-around `awg_phase_f.c`. The latter must prove UDP-to-ring-to-scheduler-DMA-to-EOF
-and show that an asynchronous scheduler-DMA error is latched into a later ACK or
-diagnostic snapshot. These are source-test gaps, distinct from the XSA/board
-blockers below.
+These are host state-machine tests, not board evidence. A fake-hardware
+orchestration test around the complete `awg_phase_f.c` service loop remains a
+source-test gap; target closure must prove UDP-to-ring-to-scheduler-DMA-to-EOF
+and asynchronous error visibility end to end.
 
 ## Required hardware closure run
 
@@ -148,7 +158,9 @@ blockers below.
    fallback tests. Record pushes, stalls, occupancy, free space, and IRQ state.
 6. Bring up SFP0, record MAC/PCS block lock and local/remote faults for both
    link-up and link-down cases, then run known-pattern RX/TX DMA cache tests.
-7. Run ARP, UDP/ACK, and end-to-end UDP-to-ring-to-scheduler-to-EOF tests.
+7. Run ARP, legacy UDP/ACK, GWAS/2 direct, and GWAS/2 C1 end-to-end tests.
+   Confirm direct/C1 logical count and CRC equality and verify the declared
+   session program hash in collected telemetry.
 8. Sweep event rate and capture `COMMIT_COUNT`, `STREAM_PUSHES`,
    `STREAM_STALLS`, `IRQ_STATUS`, `OCCUPANCY`, `FREE_SPACE`, scheduler DMAC
    EOT/errors, Ethernet RX/TX counts, CRC failures, drops, and host telemetry.
@@ -161,9 +173,9 @@ does not claim that result.
 
 ## Known limits
 
-- Exact generated `xparameters.h` symbol names cannot be confirmed until the
-  target XSA is imported; the compile gate contains documented candidate
-  aliases and fails closed for an enabled feature when none is present.
+- The target XSA must generate `XPAR_AWG_EXTENSION_0_BASEADDR` at `0x44AE0000`
+  in addition to the scheduler, three DMAC/MAC addresses, and four IRQ symbols.
+  The enabled profile fails closed if any symbol is absent or mismatched.
 - No MAC interrupt is wired in the current HDL, so link and fault status are
   polled in bounded foreground service.
 - The hardware clock tick frequency is not guessed by firmware. Test event
@@ -175,7 +187,8 @@ does not claim that result.
   buffer is within DMA-accessible DDR. The target build must validate the linker
   map or perform overflow-safe runtime range checks for the event ring and both
   RX/TX buffer banks.
-- The compact stream ACK does not contain every sustained-run counter. Until a
-  versioned diagnostics reply is added, capture `COMMIT_COUNT`, `STREAM_PUSHES`,
-  `OCCUPANCY`, scheduler-DMAC EOT/errors, and Ethernet RX/TX/drop counters from
+- The 40-byte GWAS/2 ACK includes ring free records, scheduler status,
+  hardware stream free space/stalls, and IRQ state, but not every sustained-run
+  counter. Capture `COMMIT_COUNT`, `STREAM_PUSHES`, `OCCUPANCY`, decoder
+  telemetry, scheduler-DMAC EOT/errors, and Ethernet RX/TX/drop counters from
   bounded periodic firmware logs alongside ACK telemetry.

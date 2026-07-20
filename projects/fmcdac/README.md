@@ -142,6 +142,29 @@ For a current bench handoff covering the latest archived runs and the intended
 end-state validation plan, see
 [docu/SCHEDULER_HANDOFF_STATUS.md](./docu/SCHEDULER_HANDOFF_STATUS.md).
 
+## Phase-F Ethernet benchmark transport
+
+Build the target with `FMCDAC_AWG_PROFILE=scheduler-eth`. The production UDP
+interface is GWAS/2: a CONTROL/SHA-256 OPEN, strictly sequenced 32-byte direct
+event or C1 record frames, and a zero-record CONTROL CLOSE. The service caches
+the last ACK for idempotent retransmission and retains the original GWAS/1
+format only as a diagnostic fallback. Use the external `rfsoc-bench`
+controller for GWAS/2; `awg_stream_sender.py` remains the legacy diagnostic
+sender.
+
+A successful GWAS/2 OPEN ACK is also the AWG epoch-application proof. OPEN
+programs `TIME_RELOAD_LO/HI=0`, strobes `LOAD_NOW`, and returns success only
+after `TIME_NOW` is observed near zero or behind its pre-strobe value. Firmware
+retains the reload/control, before/after timestamps, applied flag, and monotonic
+apply sequence through `awg_sched_get_last_epoch_result()`.
+
+The generated XSA must contain `awg_extension_0` at `0x44AE0000` in addition
+to the scheduler, scheduler DMAC, XXV Ethernet, and RX/TX DMAC blocks. The
+firmware validates AWGX ID/version/capabilities and selects direct bypass or
+C1 before the first scheduler-DMA transfer. Production RX/TX buffers and the
+MAC frame limit are 9216 bytes; the controller computes 1500-byte-safe batches
+or uses the configured jumbo MTU.
+
 ## Dependencies
 
 - Python with pyserial installed for UART access.

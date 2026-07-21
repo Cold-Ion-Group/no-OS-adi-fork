@@ -1,0 +1,6 @@
+# UART access for run_nco_scope_test.py, awg_sweep_test.py, and boot capture.
+pyserial>=3.5
+
+# Optional spectrum-analyzer support. Uncomment both lines when using an FSH.
+# pyvisa>=1.14
+# pyvisa-py>=0.7

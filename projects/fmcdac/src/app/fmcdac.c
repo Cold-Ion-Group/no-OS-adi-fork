@@ -6003,7 +6003,7 @@ static void print_boot_banner(void)
 
 	/* JESD link parameters */
 	xil_printf("[BANNER] JESD: subclass=%d  lane_rate=9830400 kbps"
-		   "  ref=122880 kHz  DAC=983040 kHz\n\r",
+		   "  ref=122880 kHz  DAC=1966080 kHz\n\r",
 		   1 /* jesd204_subclass */);
 
 	/* Clock source */

@@ -1,5 +1,10 @@
 # FMCDAC Quick Notes
 
+Start with [BUILD_AND_USE.md](./BUILD_AND_USE.md) for repository navigation,
+HDL handoff, firmware profiles, build and programming commands, UART capture,
+10G host setup, GWAS/2 streaming, recovery, and artifact collection. The notes
+below are for the existing RF benchmark tools.
+
 ## AWG scheduler sweep test
 
 The AWG sweep test uses the dedicated AWG scheduler UART console. The host
@@ -55,7 +60,7 @@ Notes:
   narrow expected-tone measurement window so the FSH8 can finish each
   measurement inside the programmed step.
 
-## Full integration wrapper
+## Legacy benchmark integration wrapper
 
 `run_nco_scope_test.py --run-full-integration` is a two-pass wrapper:
 
@@ -149,9 +154,10 @@ Build the target with `FMCDAC_AWG_PROFILE=scheduler-eth`. The production UDP
 interface is GWAS/2: a CONTROL/SHA-256 OPEN, strictly sequenced 32-byte direct
 event or C1 record frames, and a zero-record CONTROL CLOSE. The service caches
 the last ACK for idempotent retransmission and retains the original GWAS/1
-format only as a diagnostic fallback. Use the external `rfsoc-bench`
-controller for GWAS/2; `awg_stream_sender.py` remains the legacy diagnostic
-sender.
+format only as a diagnostic fallback. Use `awg_stream_sender_v2.py` for the
+repository-local GWAS/2 path. `awg_stream_sender.py` is the legacy diagnostic
+sender. Use `awg_c1_program.py` to create a finite EOF-marked C1 LINEAR
+program for the C1 HDL variant.
 
 A successful GWAS/2 OPEN ACK is also the AWG epoch-application proof. OPEN
 programs `TIME_RELOAD_LO/HI=0`, strobes `LOAD_NOW`, and returns success only
@@ -163,11 +169,14 @@ The generated XSA must contain `awg_extension_0` at `0x44AE0000` in addition
 to the scheduler, scheduler DMAC, XXV Ethernet, and RX/TX DMAC blocks. The
 firmware validates AWGX ID/version/capabilities and selects direct bypass or
 C1 before the first scheduler-DMA transfer. Production RX/TX buffers and the
-MAC frame limit are 9216 bytes; the controller computes 1500-byte-safe batches
-or uses the configured jumbo MTU.
+MAC frame limit are 9216 bytes. The sender defaults to 45 records at IPv4 MTU
+1500. Pass the actual configured MTU to use a larger unfragmented batch.
+
+A CLOSE ACK proves protocol acceptance, not scheduler completion. Keep the
+UART log and confirm EOF, DONE, and error counters.
 
 ## Dependencies
 
-- Python with pyserial installed for UART access.
+- Install host packages with `python -m pip install -r requirements-host.txt`.
 - The analyzer stack (`pyvisa`, `pyvisa-py`) is required for measured AWG runs
   and for `run_nco_scope_test.py`.

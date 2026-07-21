@@ -1,4 +1,4 @@
-# AWG Scheduler Contract (v3)
+# AWG Scheduler Contract (v4)
 
 This document is the software<->HDL contract for the AWG timed-control
 peripheral used by `projects/fmcdac/src/app/awg_sched.{h,c}`.
@@ -81,21 +81,20 @@ reload before `RUN`.
 
 ## STATUS Register Bits
 
-The Phase A ABI header defines the low-byte state bits as:
+The active ABI is:
 
 | Bits | Name    | Description |
 |------|---------|-------------|
-| 0    | idle    | Engine is idle |
-| 1    | armed   | Hardware trigger gate is armed |
-| 2    | running | Sequence is currently executing |
-| 3    | done    | Sequence has completed |
-| 4    | error   | Hardware error latched |
-| 15:8 | err_code| Latched error code |
+| 0    | armed   | Hardware trigger gate is armed |
+| 1    | running | Sequence is currently executing |
+| 2    | done    | Sequence has completed |
+| 3    | error   | Hardware error latched |
+| 15:8 | err_code| Documented error-code field |
 
-Current FMCDAC firmware decodes both this Phase A layout and the older
-pre-stream status snapshot layout (`armed/running/done/error` in bits `0..3`).
-That compatibility shim is intentional until all loaded XSAs are known to emit
-only the Phase A layout.
+Idle is zero: none of the four state bits is set. Current RTL also exposes a
+known status-snapshot error byte in bits `23:16`; firmware falls back to that
+byte when the documented field is zero. `ERR_REG` remains the preferred error
+source.
 
 Error codes:
 
@@ -129,10 +128,9 @@ Error codes:
 `awg_sched_wait_done()` supports an IRQ-driven wait path when
 `FMCDAC_AWG_SCHED_USE_IRQ` is enabled. Otherwise firmware uses polling.
 
-`LOW_WATERMARK` is intended to behave as a level-sensitive refill request in
-the refreshed Phase A HDL. Firmware still uses opportunistic and periodic
-refill paths because redundant `drain_step()` calls are harmless and no stream
-design should depend on a single IRQ edge for progress.
+`LOW_WATERMARK` is a sticky downward-crossing event, not a level request.
+Firmware sets a bounded refill-pending flag in the ISR and also uses periodic
+foreground refill so progress does not depend on one interrupt edge.
 
 ## STREAM_CTRL Bits
 
@@ -141,9 +139,10 @@ design should depend on a single IRQ edge for progress.
 | 0   | MODE      | `0` = legacy fixed preload, `1` = stream FIFO mode |
 | 1   | OVERFLOW  | Stream push overflow sticky flag; write 1 to clear |
 | 2   | EOF_SEEN  | Read-only sticky indication that an EOF event fired |
+| 3   | DMA_MODE  | `1` selects the scheduler AXI-Stream DMA ingress |
 
-`STREAM_CTRL.MODE` is captured at ARM. Firmware must stop or reset before
-changing between legacy and stream execution.
+`STREAM_CTRL.MODE` and `DMA_MODE` are captured at ARM and locked for the run.
+Firmware must stop or reset before changing them.
 
 `CTRL.RESET_SOFT` flushes the stream FIFO, clears stream counters/sticky flags,
 and is the required stream recovery path.
@@ -249,8 +248,8 @@ post-load compare logic produces false mismatches after the first event.
 
 ## Host Upload Transport
 
-The current UART console transport accepts `LOADBIN <count>` followed by the
-packed event blob encoded as ASCII hex, not raw binary.
+The UART preload console accepts `LOADBIN <count>` followed by packed events
+encoded as ASCII hex, not raw binary.
 
 Expected console sequence:
 
@@ -260,11 +259,8 @@ Expected console sequence:
 4. `[AWG-UART] LOADBIN COMMIT BEGIN ...`
 5. `[AWG-UART] LOADBIN OK ...`
 
-That console remains the active bench path for uploaded FSH scheduler sweeps
-and the preload side of the scheduler-native benchmark suite.
-
-The stream-mode parser now exists separately in
-`projects/fmcdac/src/app/awg_stream_proto.{c,h}`. Its frame format is:
+`STREAMHEX <byte_count>` carries the legacy GWAS/1 frame as ASCII hex. GWAS/1
+is a diagnostic compatibility protocol:
 
 ```text
 u32 magic      // 0x53415747
@@ -282,26 +278,68 @@ u32 magic
 u32 seq_acked
 u32 ddr_free_events
 u32 status
+u32 stream_free_events
+u32 stream_stalls
+u32 irq_status
 ```
 
-The no-OS application also exposes a conservative UARTLite ASCII-hex stream
-smoke transport when built with `FMCDAC_AWG_SCHED_STREAM=1`:
+The UART response includes those fields plus firmware return and frame
+metadata. UARTLite at 115200 baud is for correctness checks, not high-rate
+streaming.
+
+GWAS/2 is the production UDP protocol. Each frame contains this 24-byte
+little-endian header, zero or more 32-byte records, and IEEE CRC32:
 
 ```text
-STREAMHEX <byte_count>
-<2 * byte_count ASCII hex characters>
+u32 magic            // 0x53415747
+u8  version          // 2
+u8  kind             // 0=CONTROL, 1=direct events, 2=C1
+u16 flags            // OPEN or CLOSE_WITH_EOF
+u32 session_id
+u32 sequence
+u16 record_count
+u16 header_bytes     // 24
+u32 payload_bytes
+u8  records[record_count][32]
+u32 crc32_ieee
 ```
 
-The response is a machine-parsable line carrying the ACK fields plus firmware
-return code and frame metadata:
+Session order is strict:
 
-```text
-[AWG-STREAM] ACK magic=0x53415747 seq=<n> ddr_free=<events> status=<code> ret=<ret> bytes=<frame_bytes> events=<n_events> flags=0x....
-```
+1. CONTROL OPEN at sequence 0 with one 32-byte SHA-256 program record.
+2. Direct-event or C1 frames at consecutive sequence numbers.
+3. Zero-record CONTROL CLOSE. Direct mode uses `CLOSE_WITH_EOF`; C1 mode does
+   not add a firmware EOF event.
 
-This is a correctness transport only. At `115200` baud, ASCII-hex stream mode
-is expected to sustain roughly `100-150 events/s`; dense throughput testing is
-deferred to UART16550 or Ethernet.
+The 40-byte ACK returns magic, version, session, acknowledged sequence, status,
+ring free records, scheduler status, hardware stream free records, stream
+stalls, and IRQ state. A retry must repeat the identical datagram. See
+`awg_stream_sender_v2.py` and `tests/awg_stream_proto_v2_test.c`.
+
+At IPv4 MTU 1500, one GWAS/2 data frame can carry at most 45 records without
+fragmentation. Firmware rejects IPv4 fragments. Larger batches require a
+matching jumbo MTU and must still stay at or below 128 records.
+
+### C1 records
+
+A C1 program is a sequence of 32-byte little-endian records:
+
+1. Header 0: magic `0x43475741`, version 1, header size 64, record size 32,
+   flags, start timestamp, command count, and declared repeat depth.
+2. Header 1: declared output-event count, command bytes, input CRC64, and a
+   zero reserved word.
+3. The declared command records.
+
+The input CRC uses polynomial `0x42F0E1EBA9EA3693`, initial value zero, no
+reflection, and no final XOR. Calculate it over Header 0, Header 1 with its CRC
+field zero, and every command record. Header flag bit 0 makes the decoder add
+EOF to the final output event.
+
+The decoder supports `WAIT`, `FIRE`, `LINEAR`, `LINEAR_CONT`,
+`REPEAT_BEGIN`, and `REPEAT_END`. Use `awg_c1_program.py` to create a finite
+`LINEAR` + `LINEAR_CONT` program; use the RTL in
+`hdl-adi-fork/projects/awg/common/awg_extension.v` as the full field-level
+source of truth.
 
 ## Host Measured-AWG Policy
 
@@ -321,26 +359,15 @@ pre-run work such as link checks, DAC/GPIO setup, `set_nco`, and epoch reload.
 
 ## Event Depth Limitation
 
-The legacy fixed-length KCU116 image path reports `max_events=64`.
+Read legacy capacity from `IP_CAPS`; do not assume the value from an older
+bitstream. Read streaming capacity from `STREAM_DEPTH`. The current default
+FIFO has 512 physical slots and reports 511 usable events.
 
-That is enough for short deterministic sequences and coarse stepped sweeps, but
-not for dense one-shot benches such as `200-300 MHz` in `10 kHz` steps
-(`~10001` events). Those workflows require:
-
-1. host-side batching across multiple scheduler runs
-2. a larger HDL event RAM
-3. or the new stream FIFO path after a byte transport and bench smoke are
-   added
-
-The stream-mode HDL FIFO exists in the Phase A image, and Phase B firmware can
-stage events in DDR and refill the HDL FIFO through AXI-Lite event pushes. The
-host now has a `stream-bringup` profile for parser/refill/EOF/reset smoke
-testing. That profile has passed the current UARTLite correctness smoke with
-`STREAM_DEPTH=511`, bad-CRC rejection, finite EOF completion, and a 32-event
-refill run. Scheduler dense per-step FSH has also passed a coarse stream RF
-smoke over `200-210 MHz` in `1 MHz` steps. That is not yet a dense `10 kHz`
-RF characterization or transport-throughput result; those remain gated on
-trace-capable readout and/or UART16550/Ethernet.
+Sequences larger than legacy preload capacity must use host batching, software
+streaming, scheduler DMA, or the production Ethernet path. `FREE_SPACE` is the
+hardware truth for each refill. A source or host test result is not evidence of
+the sustained hardware event rate; use the closure procedure in
+`../BUILD_AND_USE.md`.
 
 ## Artifact Dump
 
@@ -369,10 +396,9 @@ HDL, not an execution failure.
 make -C projects/fmcdac/tests run
 ```
 
-On the current Windows host, plain `gcc` may be unavailable. The firmware was
-also build-checked with MicroBlaze GCC and full project links:
+Build every target profile from its real XSA on the build machine. For example:
 
 ```powershell
-make -C projects\fmcdac build SKIP_MANIFEST=1
-make -C projects\fmcdac build SKIP_MANIFEST=1 NEW_CFLAGS=-DFMCDAC_AWG_SCHED_STREAM=1
+make -C projects\fmcdac reset FMCDAC_AWG_PROFILE=scheduler-eth
+make -C projects\fmcdac FMCDAC_AWG_PROFILE=scheduler-eth
 ```

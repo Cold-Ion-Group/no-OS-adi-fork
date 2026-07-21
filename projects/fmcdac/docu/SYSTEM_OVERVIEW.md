@@ -1,5 +1,11 @@
 # FMCDAC System Overview
 
+For build, programming, network, and runtime instructions, use
+[BUILD_AND_USE.md](../BUILD_AND_USE.md). Phase F Ethernet and scheduler-DMA
+support is implemented in source. Treat hardware acceptance as open until the
+steps in [PHASE_F_FIRMWARE_CLOSURE_REPORT.md](./PHASE_F_FIRMWARE_CLOSURE_REPORT.md)
+are completed with a licensed XSA and matching board artifacts.
+
 **Platform**: AD9144-FMC-EBZ on Xilinx KCU116 (Kintex UltraScale XCKU5P)
 **DAC**: AD9144 — dual 16-bit, 1966.08 MSPS (2× interpolation), JESD204B Subclass 1
 **Processor**: MicroBlaze soft-core (100 MHz, bare-metal)

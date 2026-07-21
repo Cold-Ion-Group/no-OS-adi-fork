@@ -131,7 +131,7 @@ ifneq ($(SKIP_MANIFEST),1)
 .PHONY: manifest-verify
 manifest-verify:
 	@echo "[MANIFEST] Verifying build inputs..."
-	@powershell -ExecutionPolicy Bypass -File gen_manifest.ps1 -Verify
+	@powershell -ExecutionPolicy Bypass -File gen_manifest.ps1 -Verify -XsaPath "$(FMCDAC_XSA)" -Profile "$(FMCDAC_AWG_PROFILE)"
 build: manifest-verify
   endif
 endif
@@ -139,7 +139,7 @@ endif
 # Generate / refresh the manifest
 .PHONY: manifest-gen
 manifest-gen:
-	@powershell -ExecutionPolicy Bypass -File gen_manifest.ps1
+	@powershell -ExecutionPolicy Bypass -File gen_manifest.ps1 -XsaPath "$(FMCDAC_XSA)" -Profile "$(FMCDAC_AWG_PROFILE)"
 
 # Verify a captured UART log against golden
 .PHONY: verify-uart

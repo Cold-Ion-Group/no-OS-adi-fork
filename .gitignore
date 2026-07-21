@@ -9,6 +9,9 @@ xsct.log
 RemoteSystemsTempFiles
 build
 projects/*/build_*
+!projects/fmcdac/BUILD_AND_USE.md
+!projects/fmcdac/build_phase_f_firmware.ps1
+!projects/fmcdac/build_phase_f_profiles.ps1
 dfp_drivers
 aducm_project
 aducm_build

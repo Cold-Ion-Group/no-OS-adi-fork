@@ -3,16 +3,30 @@
     Generate manifest.json for FMCDAC build reproducibility.
 
 .DESCRIPTION
-    Captures exact git commit SHAs, submodule states, XSA file hash,
-    and JESD build configuration into a single manifest.json file.
+    Captures exact git commit SHAs, submodule states, selected profile,
+    XSA/bitstream/ELF hashes, and JESD build configuration in one JSON file.
     Run from the projects/fmcdac/ directory.
 
 .EXAMPLE
     .\gen_manifest.ps1
     .\gen_manifest.ps1 -Verify
+    .\gen_manifest.ps1 -XsaPath D:\build\system_top.xsa `
+        -ElfPath .\build\fmcdac.elf -Profile scheduler-eth `
+        -OutputPath D:\artifacts\manifest.json
 #>
 param(
-    [switch]$Verify
+    [switch]$Verify,
+    [string]$XsaPath = (Join-Path $PSScriptRoot 'system_top.xsa'),
+    [string]$BitPath = '',
+    [string]$ElfPath = '',
+    [string]$XparametersPath = '',
+    [string]$LinkerScriptPath = '',
+    [string]$BuildLogPath = '',
+    [string]$BuildConfigPath = '',
+    [ValidateSet('unknown', 'default', 'scheduler-preload', 'scheduler-stream',
+                 'scheduler-dma', 'scheduler-eth')]
+    [string]$Profile = 'unknown',
+    [string]$OutputPath = (Join-Path $PSScriptRoot 'manifest.json')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,22 +45,55 @@ $fwDirty     = $null -ne (git -C $RepoRoot status --porcelain)
 
 # --- Gather submodule state ---
 $submodules = @{}
-$subRaw = git -C $RepoRoot submodule status 2>$null
+$subRaw = git -C $RepoRoot submodule status --recursive 2>$null
 if ($subRaw) {
     foreach ($line in $subRaw) {
-        if ($line -match '^\s*[+-]?([0-9a-f]+)\s+(\S+)') {
+        if ($line -match '^\s*[+\-U]?([0-9a-f]+)\s+(\S+)') {
             $submodules[$Matches[2]] = $Matches[1]
         }
     }
 }
 
-# --- Hash the XSA file ---
-$xsaFile = Join-Path $ProjectDir 'system_top.xsa'
-$xsaHash = ''
-if (Test-Path $xsaFile) {
-    $xsaHash = (Get-FileHash -Algorithm SHA256 -Path $xsaFile).Hash.ToLower()
-} else {
-    Write-Warning 'system_top.xsa not found - XSA hash will be empty.'
+function Get-ArtifactRecord {
+    param([string]$Path, [string]$Label)
+
+    if (-not $Path) {
+        return [ordered]@{ file = ''; sha256 = '' }
+    }
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+        Write-Warning "$Label not found - hash will be empty: $fullPath"
+        return [ordered]@{ file = $fullPath; sha256 = '' }
+    }
+    return [ordered]@{
+        file = $fullPath
+        sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $fullPath).Hash.ToLower()
+    }
+}
+
+# --- Hash build artifacts ---
+$xsaArtifact = Get-ArtifactRecord $XsaPath 'XSA'
+$bitArtifact = Get-ArtifactRecord $BitPath 'Bitstream'
+$elfArtifact = Get-ArtifactRecord $ElfPath 'ELF'
+$xparametersArtifact = Get-ArtifactRecord $XparametersPath 'xparameters.h'
+$linkerArtifact = Get-ArtifactRecord $LinkerScriptPath 'linker script'
+$buildLogArtifact = Get-ArtifactRecord $BuildLogPath 'build log'
+$buildConfigArtifact = Get-ArtifactRecord $BuildConfigPath 'build configuration file'
+
+if (-not $xsaArtifact.sha256) {
+    throw "Cannot record a missing XSA: $($xsaArtifact.file)"
+}
+foreach ($requested in @(
+    @{ Path = $BitPath; Record = $bitArtifact; Label = 'bitstream' },
+    @{ Path = $ElfPath; Record = $elfArtifact; Label = 'ELF' },
+    @{ Path = $XparametersPath; Record = $xparametersArtifact; Label = 'xparameters.h' },
+    @{ Path = $LinkerScriptPath; Record = $linkerArtifact; Label = 'linker script' },
+    @{ Path = $BuildLogPath; Record = $buildLogArtifact; Label = 'build log' },
+    @{ Path = $BuildConfigPath; Record = $buildConfigArtifact; Label = 'build configuration file' }
+)) {
+    if ($requested.Path -and -not $requested.Record.sha256) {
+        throw "Cannot record a missing $($requested.Label): $($requested.Record.file)"
+    }
 }
 
 # --- Build config constants (must match fmcdac.c source) ---
@@ -71,20 +118,36 @@ $buildConfig = [ordered]@{
 # --- Assemble manifest ---
 $manifest = [ordered]@{
     project   = 'fmcdac_kcu116'
-    created   = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK')
+    created   = [DateTime]::UtcNow.ToString('o')
     firmware  = [ordered]@{
         repo     = 'Cold-Ion-Group/no-OS-adi-fork'
         branch   = $fwBranch
         commit   = $fwCommit
         describe = $fwDescribe
         dirty    = $fwDirty
+        profile  = $Profile
+        elf      = $elfArtifact
+        generated = [ordered]@{
+            xparameters = $xparametersArtifact
+            linker_script = $linkerArtifact
+            build_log = $buildLogArtifact
+            build_config_file = $buildConfigArtifact
+        }
     }
-    hdl       = [ordered]@{
-        file     = 'system_top.xsa'
-        sha256   = $xsaHash
+    hdl = [ordered]@{
+        # Keep the original fields for older manifest readers.
+        file      = $xsaArtifact.file
+        sha256    = $xsaArtifact.sha256
+        xsa       = $xsaArtifact
+        bitstream = $bitArtifact
     }
     submodules   = $submodules
     build_config = $buildConfig
+    build_config_provenance = if ($buildConfigArtifact.sha256) {
+        'baseline values plus overrides in firmware.generated.build_config_file'
+    } else {
+        'clean-wrapper defaults; no local build configuration file'
+    }
 }
 
 # --- Capture toolchain versions ---
@@ -128,40 +191,80 @@ if ($mbGcc) {
 
 $manifest['toolchain'] = $toolchain
 
-$outFile = Join-Path $ProjectDir 'manifest.json'
+$outFile = [IO.Path]::GetFullPath($OutputPath)
+$outDirectory = Split-Path -Parent $outFile
+if (-not (Test-Path -LiteralPath $outDirectory -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $outDirectory | Out-Null
+}
 
 if ($Verify) {
     # --- Verify mode ---
-    if (-not (Test-Path $outFile)) {
+    if (-not (Test-Path -LiteralPath $outFile)) {
         Write-Error 'No manifest.json found. Run without -Verify first.'
         exit 1
     }
-    $existing = Get-Content $outFile -Raw | ConvertFrom-Json
+    $existing = Get-Content -LiteralPath $outFile -Raw | ConvertFrom-Json
     $mismatches = @()
     $warnings   = @()
 
-    # The XSA hash is the only thing worth verifying — it lives outside git,
-    # so git can't track it. The firmware.commit is NOT checked here because
+    # Verify every requested artifact and the selected profile. The
+    # firmware.commit is NOT checked here because
     # committing manifest.json itself creates a new commit, making the recorded
     # SHA perpetually one behind (circular dependency). Git log already tracks
     # which commit the manifest lives in — no need to duplicate that check.
-    if ($existing.hdl.sha256 -ne $xsaHash) {
-        $mismatches += ('hdl.sha256 (XSA): manifest={0} current={1}' -f $existing.hdl.sha256, $xsaHash)
+    # Accept the old manifest shape while repositories migrate to the explicit
+    # artifact records above.
+    $recordedXsaHash = if ($existing.hdl.xsa) {
+        $existing.hdl.xsa.sha256
+    } else {
+        $existing.hdl.sha256
+    }
+    if ($recordedXsaHash -ne $xsaArtifact.sha256) {
+        $mismatches += ('XSA sha256: manifest={0} current={1}' -f
+            $recordedXsaHash, $xsaArtifact.sha256)
+    }
+    if ($BitPath -and $existing.hdl.bitstream.sha256 -ne $bitArtifact.sha256) {
+        $mismatches += ('bitstream sha256: manifest={0} current={1}' -f
+            $existing.hdl.bitstream.sha256, $bitArtifact.sha256)
+    }
+    if ($ElfPath -and $existing.firmware.elf.sha256 -ne $elfArtifact.sha256) {
+        $mismatches += ('ELF sha256: manifest={0} current={1}' -f
+            $existing.firmware.elf.sha256, $elfArtifact.sha256)
+    }
+    foreach ($requested in @(
+        @{ Path = $XparametersPath; Existing = $existing.firmware.generated.xparameters.sha256; Current = $xparametersArtifact.sha256; Label = 'xparameters.h' },
+        @{ Path = $LinkerScriptPath; Existing = $existing.firmware.generated.linker_script.sha256; Current = $linkerArtifact.sha256; Label = 'linker script' },
+        @{ Path = $BuildLogPath; Existing = $existing.firmware.generated.build_log.sha256; Current = $buildLogArtifact.sha256; Label = 'build log' },
+        @{ Path = $BuildConfigPath; Existing = $existing.firmware.generated.build_config_file.sha256; Current = $buildConfigArtifact.sha256; Label = 'build configuration file' }
+    )) {
+        if ($requested.Path -and $requested.Existing -ne $requested.Current) {
+            $mismatches += ('{0} sha256: manifest={1} current={2}' -f
+                $requested.Label, $requested.Existing, $requested.Current)
+        }
+    }
+    if ($Profile -ne 'unknown' -and $existing.firmware.profile -ne $Profile) {
+        $mismatches += ('profile: manifest={0} current={1}' -f
+            $existing.firmware.profile, $Profile)
     }
     if ($fwDirty) {
         $warnings += 'Working tree has uncommitted changes (dirty) - normal during development'
     }
 
     # Informational: show what commit the manifest was generated on
-    $infoCommit = if ($existing.firmware.commit) { $existing.firmware.commit.Substring(0,12) } else { 'unknown' }
+    $recordedCommit = [string]$existing.firmware.commit
+    $infoCommit = if ([string]::IsNullOrWhiteSpace($recordedCommit)) {
+        'unknown'
+    } else {
+        $recordedCommit.Substring(0, [Math]::Min(12, $recordedCommit.Length))
+    }
 
     if ($mismatches.Count -eq 0) {
-        Write-Host ('MANIFEST: Verification PASSED - XSA matches manifest (recorded on {0})' -f $infoCommit) -ForegroundColor Green
+        Write-Host ('MANIFEST: Verification PASSED - requested inputs match (recorded on {0})' -f $infoCommit) -ForegroundColor Green
         foreach ($w in $warnings) {
             Write-Host ('  WARN: {0}' -f $w) -ForegroundColor Yellow
         }
     } else {
-        Write-Host 'MANIFEST: Verification FAILED - XSA has changed since manifest was recorded:' -ForegroundColor Red
+        Write-Host 'MANIFEST: Verification FAILED - requested inputs differ:' -ForegroundColor Red
         foreach ($m in $mismatches) {
             Write-Host ('  - {0}' -f $m) -ForegroundColor Yellow
         }
@@ -170,11 +273,18 @@ if ($Verify) {
     }
 } else {
     # --- Generate mode ---
-    $json = $manifest | ConvertTo-Json -Depth 4
-    Set-Content -Path $outFile -Value $json -Encoding UTF8
+    $json = $manifest | ConvertTo-Json -Depth 6
+    Set-Content -LiteralPath $outFile -Value $json -Encoding UTF8
     Write-Host ('MANIFEST: Generated {0}' -f $outFile) -ForegroundColor Green
     Write-Host ('  firmware commit : {0}' -f $fwCommit) -ForegroundColor Cyan
     Write-Host ('  firmware branch : {0}' -f $fwBranch) -ForegroundColor Cyan
-    Write-Host ('  XSA sha256      : {0}' -f $xsaHash) -ForegroundColor Cyan
+    Write-Host ('  profile         : {0}' -f $Profile) -ForegroundColor Cyan
+    Write-Host ('  XSA sha256      : {0}' -f $xsaArtifact.sha256) -ForegroundColor Cyan
+    if ($bitArtifact.sha256) {
+        Write-Host ('  bit sha256      : {0}' -f $bitArtifact.sha256) -ForegroundColor Cyan
+    }
+    if ($elfArtifact.sha256) {
+        Write-Host ('  ELF sha256      : {0}' -f $elfArtifact.sha256) -ForegroundColor Cyan
+    }
     Write-Host ('  dirty           : {0}' -f $fwDirty) -ForegroundColor Cyan
 }

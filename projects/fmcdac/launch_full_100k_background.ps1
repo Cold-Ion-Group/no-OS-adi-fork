@@ -1,5 +1,11 @@
 $ErrorActionPreference = "Stop"
 
+Write-Warning @"
+This is an archived, machine-specific DDS/analyzer launcher with hard-coded
+paths and instruments. It is not the Phase F full-system entry point. Use
+BUILD_AND_USE.md for the supported workflow.
+"@
+
 $repoRoot = "C:\Users\fpga_\yr\tmp\no-OS-adi-fork"
 $projectDir = Join-Path $repoRoot "projects\fmcdac"
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"

@@ -4,6 +4,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+Write-Warning @"
+This is a legacy, bench-specific DDS/analyzer launcher. It currently skips its
+scheduler command and is not the Phase F full-system closure entry point. Use
+BUILD_AND_USE.md for the HDL, firmware, Ethernet, GWAS/2, and artifact flow.
+"@
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Set-Location $repoRoot
 

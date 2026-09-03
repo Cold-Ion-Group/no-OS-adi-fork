@@ -16,7 +16,7 @@ param(
     [Parameter(Mandatory = $true)] [string]$HdlManifestPath,
     [Parameter(Mandatory = $true)] [string]$FirmwareManifestPath,
     [ValidateSet('default', 'scheduler-preload', 'scheduler-stream',
-                 'scheduler-dma', 'scheduler-eth')]
+                 'scheduler-dma', 'scheduler-eth', 'scheduler-eth-release')]
     [string]$Profile = 'scheduler-eth',
     [string]$BuildConfigPath = '',
     [string[]]$UartLog = @(),
@@ -193,6 +193,77 @@ if (-not [string]::IsNullOrWhiteSpace($firmwareBuildConfigHash)) {
 }
 if ([string]$firmwareManifest.firmware.profile -ne $Profile) {
     throw "Firmware manifest profile does not match -Profile $Profile."
+}
+if ($Profile -eq 'scheduler-eth-release') {
+    if (-not $hdlManifest.active_build -or -not $firmwareManifest.active_build) {
+        throw 'Release closure requires active-build evidence in both HDL and firmware manifests.'
+    }
+    if ([string]$hdlManifest.active_build.schema -ne 'awg-hdl/active-build/1.0' -or
+        [string]$firmwareManifest.active_build.schema -ne 'rfsoc-bench/awg-active-build-release/1.0') {
+        throw 'Release closure found an unsupported active-build evidence schema.'
+    }
+    foreach ($binding in @(
+        @{ Label = 'scheduler IP ID'; Hdl = $hdlManifest.active_build.scheduler.identity.ip_id; Firmware = $firmwareManifest.active_build.scheduler.ip_id },
+        @{ Label = 'scheduler IP version'; Hdl = $hdlManifest.active_build.scheduler.identity.ip_version; Firmware = $firmwareManifest.active_build.scheduler.ip_version },
+        @{ Label = 'scheduler IP capabilities'; Hdl = $hdlManifest.active_build.scheduler.identity.ip_caps; Firmware = $firmwareManifest.active_build.scheduler.ip_caps },
+        @{ Label = 'scheduler base'; Hdl = $hdlManifest.active_build.scheduler.base_address; Firmware = $firmwareManifest.active_build.scheduler.base_address },
+        @{ Label = 'active channels'; Hdl = $hdlManifest.active_build.scheduler.instantiated_channels; Firmware = $firmwareManifest.active_build.scheduler.instantiated_channels },
+        @{ Label = 'frozen default channels'; Hdl = $hdlManifest.active_build.scheduler.frozen_module_default_channels; Firmware = $firmwareManifest.active_build.scheduler.frozen_module_default_channels },
+        @{ Label = 'scheduler clock numerator'; Hdl = $hdlManifest.active_build.scheduler.clock_hz.numerator; Firmware = $firmwareManifest.active_build.scheduler.clock_hz.numerator },
+        @{ Label = 'scheduler clock denominator'; Hdl = $hdlManifest.active_build.scheduler.clock_hz.denominator; Firmware = $firmwareManifest.active_build.scheduler.clock_hz.denominator },
+        @{ Label = 'phase accumulator bits'; Hdl = $hdlManifest.active_build.scheduler.dds_phase_accumulator_bits; Firmware = $firmwareManifest.active_build.scheduler.dds_phase_accumulator_bits },
+        @{ Label = 'CORDIC angle bits'; Hdl = $hdlManifest.active_build.scheduler.cordic_angle_bits; Firmware = $firmwareManifest.active_build.scheduler.cordic_angle_bits },
+        @{ Label = 'minimum spacing'; Hdl = $hdlManifest.active_build.scheduler.min_spacing_ticks; Firmware = $firmwareManifest.active_build.scheduler.min_spacing_ticks },
+        @{ Label = 'usable FIFO entries'; Hdl = $hdlManifest.active_build.scheduler.usable_fifo_entries; Firmware = $firmwareManifest.active_build.scheduler.usable_fifo_entries },
+        @{ Label = 'AWGX ID'; Hdl = $hdlManifest.active_build.extensions.awgx.ip_id; Firmware = $firmwareManifest.active_build.extensions.awgx.ip_id },
+        @{ Label = 'AWGX version'; Hdl = $hdlManifest.active_build.extensions.awgx.ip_version; Firmware = $firmwareManifest.active_build.extensions.awgx.ip_version },
+        @{ Label = 'AWGC ID'; Hdl = $hdlManifest.active_build.extensions.awgc.ip_id; Firmware = $firmwareManifest.active_build.extensions.awgc.ip_id },
+        @{ Label = 'AWGC version'; Hdl = $hdlManifest.active_build.extensions.awgc.ip_version; Firmware = $firmwareManifest.active_build.extensions.awgc.ip_version },
+        @{ Label = 'AWGC capabilities'; Hdl = $hdlManifest.active_build.extensions.awgc.caps; Firmware = $firmwareManifest.active_build.extensions.awgc.caps },
+        @{ Label = 'extension base'; Hdl = $hdlManifest.active_build.extensions.base_address; Firmware = $firmwareManifest.active_build.extensions.base_address },
+        @{ Label = 'TPL base'; Hdl = $hdlManifest.active_build.address_map.tpl; Firmware = $firmwareManifest.active_build.address_map.tpl },
+        @{ Label = 'XCVR base'; Hdl = $hdlManifest.active_build.address_map.xcvr; Firmware = $firmwareManifest.active_build.address_map.xcvr },
+        @{ Label = 'JESD TX base'; Hdl = $hdlManifest.active_build.address_map.jesd_tx; Firmware = $firmwareManifest.active_build.address_map.jesd_tx },
+        @{ Label = 'scheduler DMA base'; Hdl = $hdlManifest.active_build.address_map.scheduler_dma; Firmware = $firmwareManifest.active_build.address_map.scheduler_dma },
+        @{ Label = 'Ethernet RX DMA base'; Hdl = $hdlManifest.active_build.address_map.eth_rx_dma; Firmware = $firmwareManifest.active_build.address_map.eth_rx_dma },
+        @{ Label = 'Ethernet TX DMA base'; Hdl = $hdlManifest.active_build.address_map.eth_tx_dma; Firmware = $firmwareManifest.active_build.address_map.eth_tx_dma },
+        @{ Label = 'Ethernet MAC base'; Hdl = $hdlManifest.active_build.address_map.eth_mac_10g; Firmware = $firmwareManifest.active_build.address_map.eth_mac_10g },
+        @{ Label = 'DAC DMA base'; Hdl = $hdlManifest.active_build.address_map.dac_dma; Firmware = $firmwareManifest.active_build.address_map.dac_dma },
+        @{ Label = 'JESD TX IRQ'; Hdl = $hdlManifest.active_build.interrupts.jesd_tx; Firmware = $firmwareManifest.active_build.interrupts.jesd_tx },
+        @{ Label = 'scheduler IRQ'; Hdl = $hdlManifest.active_build.interrupts.scheduler; Firmware = $firmwareManifest.active_build.interrupts.scheduler },
+        @{ Label = 'DAC DMA IRQ'; Hdl = $hdlManifest.active_build.interrupts.dac_dma; Firmware = $firmwareManifest.active_build.interrupts.dac_dma },
+        @{ Label = 'scheduler DMA IRQ'; Hdl = $hdlManifest.active_build.interrupts.scheduler_dma; Firmware = $firmwareManifest.active_build.interrupts.scheduler_dma },
+        @{ Label = 'Ethernet RX DMA IRQ'; Hdl = $hdlManifest.active_build.interrupts.eth_rx_dma; Firmware = $firmwareManifest.active_build.interrupts.eth_rx_dma },
+        @{ Label = 'Ethernet TX DMA IRQ'; Hdl = $hdlManifest.active_build.interrupts.eth_tx_dma; Firmware = $firmwareManifest.active_build.interrupts.eth_tx_dma },
+        @{ Label = 'PS JESD TX IRQ'; Hdl = $hdlManifest.active_build.interrupts.processing_system.jesd_tx; Firmware = $firmwareManifest.active_build.interrupts.processing_system.jesd_tx },
+        @{ Label = 'PS scheduler IRQ'; Hdl = $hdlManifest.active_build.interrupts.processing_system.scheduler; Firmware = $firmwareManifest.active_build.interrupts.processing_system.scheduler },
+        @{ Label = 'PS DAC DMA IRQ'; Hdl = $hdlManifest.active_build.interrupts.processing_system.dac_dma; Firmware = $firmwareManifest.active_build.interrupts.processing_system.dac_dma },
+        @{ Label = 'PS scheduler DMA IRQ'; Hdl = $hdlManifest.active_build.interrupts.processing_system.scheduler_dma; Firmware = $firmwareManifest.active_build.interrupts.processing_system.scheduler_dma },
+        @{ Label = 'PS Ethernet RX DMA IRQ'; Hdl = $hdlManifest.active_build.interrupts.processing_system.eth_rx_dma; Firmware = $firmwareManifest.active_build.interrupts.processing_system.eth_rx_dma },
+        @{ Label = 'PS Ethernet TX DMA IRQ'; Hdl = $hdlManifest.active_build.interrupts.processing_system.eth_tx_dma; Firmware = $firmwareManifest.active_build.interrupts.processing_system.eth_tx_dma },
+        @{ Label = 'JESD mode'; Hdl = $hdlManifest.active_build.jesd.mode; Firmware = $firmwareManifest.active_build.jesd.mode },
+        @{ Label = 'JESD converters'; Hdl = $hdlManifest.active_build.jesd.converters; Firmware = $firmwareManifest.active_build.jesd.converters },
+        @{ Label = 'JESD lanes'; Hdl = $hdlManifest.active_build.jesd.lanes; Firmware = $firmwareManifest.active_build.jesd.lanes },
+        @{ Label = 'JESD octets per frame'; Hdl = $hdlManifest.active_build.jesd.octets_per_frame; Firmware = $firmwareManifest.active_build.jesd.octets_per_frame },
+        @{ Label = 'JESD frames per multiframe'; Hdl = $hdlManifest.active_build.jesd.frames_per_multiframe; Firmware = $firmwareManifest.active_build.jesd.frames_per_multiframe },
+        @{ Label = 'JESD bits per sample'; Hdl = $hdlManifest.active_build.jesd.bits_per_sample; Firmware = $firmwareManifest.active_build.jesd.bits_per_sample },
+        @{ Label = 'JESD subclass'; Hdl = $hdlManifest.active_build.jesd.subclass; Firmware = $firmwareManifest.active_build.jesd.subclass }
+    )) {
+        if ([string]$binding.Hdl -ne [string]$binding.Firmware) {
+            throw ("HDL/firmware active-build mismatch for {0}: HDL={1}, firmware={2}" -f
+                $binding.Label, $binding.Hdl, $binding.Firmware)
+        }
+    }
+    $ExpectedAwgxCaps = if ([string]$hdlManifest.active_build.variant -eq 'C1') {
+        [string]$firmwareManifest.active_build.extensions.awgx.c1_caps
+    } elseif ([string]$hdlManifest.active_build.variant -eq 'Direct') {
+        [string]$firmwareManifest.active_build.extensions.awgx.direct_caps
+    } else {
+        throw 'HDL active-build variant must be C1 or Direct.'
+    }
+    if ([string]$hdlManifest.active_build.extensions.awgx.caps -ne $ExpectedAwgxCaps) {
+        throw 'HDL/firmware active-build mismatch for AWGX capabilities.'
+    }
 }
 
 $resolvedArtifactRoot = [IO.Path]::GetFullPath($ArtifactRoot)

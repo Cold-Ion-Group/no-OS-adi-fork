@@ -24,6 +24,11 @@
 #include "awg_sched.h"
 #include "awg_sched_regs.h"
 
+_Static_assert(AWG_SCHED_ERR_EXTENSION_FAULT == 0x04U,
+	       "compatible extension-fault error code changed");
+_Static_assert(AWG_SCHED_ERR_STREAM_OVERFLOW == 0x05U,
+	       "compatible stream-overflow error code changed");
+
 /* -----------------------------------------------------------------------
  * Stub register bank — mirrors writes back on reads.
  * The bank is indexed by (offset / 4); 256 entries covers 0x00..0x3FF.
@@ -697,6 +702,42 @@ EXPECT_NE(ret, 0);
 EXPECT_EQ((int)r.code, (int)AWG_EVTVAL_ERR_PHASE_WIDTH);
 }
 
+static void test_preload_uses_active_canonical_policy_before_mmio(void)
+{
+	awg_event_v1_t events[2];
+	uint32_t ctrl_before;
+
+	test_begin("preload rejects active-build violations before MMIO");
+	EXPECT_EQ(stub_config(64), 0);
+	ctrl_before = s_last_ctrl_write;
+	memset(events, 0, sizeof(events));
+	events[0].timestamp_ticks = 100U;
+	events[1].timestamp_ticks = 107U;
+	EXPECT_NE(awg_sched_load_events(events, 2U), 0);
+	EXPECT_EQ((int)s_last_ctrl_write, (int)ctrl_before);
+	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_EVENT_COUNT / 4U], 0);
+
+	events[1].timestamp_ticks = 108U;
+	events[1].channel = 2U;
+	EXPECT_NE(awg_sched_load_events(events, 2U), 0);
+	EXPECT_EQ((int)s_last_ctrl_write, (int)ctrl_before);
+
+	events[1].channel = 1U;
+	events[1].payload.word2 = UINT32_C(0x00010000);
+	EXPECT_NE(awg_sched_load_events(events, 2U), 0);
+	EXPECT_EQ((int)s_last_ctrl_write, (int)ctrl_before);
+
+	events[1].payload.word2 = 0U;
+	events[1].reserved = 1U;
+	EXPECT_NE(awg_sched_load_events(events, 2U), 0);
+	EXPECT_EQ((int)s_last_ctrl_write, (int)ctrl_before);
+
+	events[1].reserved = 0U;
+	events[1].flags = AWG_SCHED_FLAG_EOF;
+	EXPECT_EQ(awg_sched_load_events(events, 2U), 0);
+	EXPECT_EQ((int)s_stub_regs[AWG_SCHED_REG_EVENT_COUNT / 4U], 2);
+}
+
 static void test_fake_hw_progression(void)
 {
 	awg_event_v1_t ev;
@@ -779,7 +820,7 @@ static void test_rtl_error_code_fallback(void)
 	awg_sched_status_t status;
 	int ret;
 
-	test_begin("status error code: documented field then Phase-E RTL fallback");
+	test_begin("status error code: documented field then legacy RTL fallback");
 	EXPECT_EQ(stub_config(64), 0);
 
 	s_stub_regs[AWG_SCHED_REG_STATUS / 4U] =
@@ -1078,6 +1119,7 @@ test_tone_width();
 test_freq_width();
 test_scale_width();
 test_phase_width();
+test_preload_uses_active_canonical_policy_before_mmio();
 test_set_epoch();
 test_fake_hw_progression();
 test_irq_wait_done();

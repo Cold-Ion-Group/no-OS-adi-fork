@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "awg_sched_regs.h"
+#include "awg_event_validate.h"
 #include "awg_stream_proto.h"
 
 static awg_stream_proto_session_t g_awg_stream_session;
@@ -113,8 +114,10 @@ static void awg_stream_proto_accept(awg_stream_proto_session_t *session,
 
 void awg_stream_proto_session_init(awg_stream_proto_session_t *session)
 {
-	if (session)
+	if (session) {
 		memset(session, 0, sizeof(*session));
+		awg_event_validation_state_init(&session->event_validation);
+	}
 }
 
 void awg_stream_proto_reset_default_session(void)
@@ -158,6 +161,8 @@ int awg_stream_proto_handle_frame_ctx(awg_stream_proto_session_t *session,
 	size_t expected_len;
 	size_t off;
 	uint32_t i;
+	awg_event_validation_state_t next_validation;
+	awg_event_validation_report_t validation_report;
 	int ret;
 
 	if (!session || !frame || !ack)
@@ -231,6 +236,7 @@ int awg_stream_proto_handle_frame_ctx(awg_stream_proto_session_t *session,
 		session->have_last_ack = false;
 		session->have_last_event = false;
 		session->next_seq = 0U;
+		awg_event_validation_state_init(&session->event_validation);
 	} else {
 		if (!session->active || session->closed)
 			return awg_stream_proto_fail(ack, seq,
@@ -245,35 +251,36 @@ int awg_stream_proto_handle_frame_ctx(awg_stream_proto_session_t *session,
 	off = AWG_STREAM_PROTO_HEADER_BYTES;
 	for (i = 0U; i < n_events; i++) {
 		awg_stream_event_from_le(frame + off, &g_awg_stream_events[i]);
-		if ((g_awg_stream_events[i].flags &
-		     ~(AWG_SCHED_FLAG_PHASE_REINIT | AWG_SCHED_FLAG_EOF)) != 0U ||
-		    (((g_awg_stream_events[i].flags & AWG_SCHED_FLAG_EOF) != 0U) &&
-		     ((flags & AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF) == 0U)) ||
-		    g_awg_stream_events[i].reserved != 0U ||
-		    (session->have_last_event &&
-		     g_awg_stream_events[i].timestamp_ticks < session->last_timestamp) ||
-		    (i > 0U && g_awg_stream_events[i].timestamp_ticks <
-		     g_awg_stream_events[i - 1U].timestamp_ticks))
-			return awg_stream_proto_fail(ack, seq,
-						     AWG_STREAM_PROTO_ACK_BAD_EVENT,
-						     -EINVAL);
 		off += sizeof(awg_event_v1_t);
 	}
 
 	if ((flags & AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF) != 0U) {
-		for (i = 0U; i < n_events; i++)
-			g_awg_stream_events[i].flags &= ~AWG_SCHED_FLAG_EOF;
+		/* CLOSE may append EOF, but must not hide an invalid early EOF. */
 		g_awg_stream_events[n_events - 1U].flags |= AWG_SCHED_FLAG_EOF;
 	}
 
 	if (n_events > 0U) {
-		ret = awg_sched_stream_push(g_awg_stream_events, n_events);
+		next_validation = session->event_validation;
+		ret = awg_event_v1_validate_batch(&next_validation,
+			g_awg_stream_events, n_events,
+			(flags & AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF) != 0U,
+			true, &validation_report);
+		if (ret)
+			return awg_stream_proto_fail(ack, seq,
+				AWG_STREAM_PROTO_ACK_BAD_EVENT, ret);
+		ret = (flags & AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF) != 0U ?
+			awg_sched_stream_push_final(g_awg_stream_events, n_events,
+				true) :
+			awg_sched_stream_push(g_awg_stream_events, n_events);
 		if (ret != 0)
 			return awg_stream_proto_fail(ack, seq,
+				(ret == -EINVAL || ret == -ERANGE || ret == -EPERM) ?
+				AWG_STREAM_PROTO_ACK_BAD_EVENT :
 				awg_stream_status_from_ret(ret,
 					AWG_STREAM_PROTO_ACK_RING_FULL), ret);
 		session->last_timestamp = g_awg_stream_events[n_events - 1U].timestamp_ticks;
 		session->have_last_event = true;
+		session->event_validation = next_validation;
 	}
 
 	if ((flags & AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF) != 0U) {
@@ -363,8 +370,10 @@ static void awg_stream_v2_accept(awg_stream_proto_v2_session_t *session,
 void awg_stream_proto_v2_session_init(
 	awg_stream_proto_v2_session_t *session)
 {
-	if (session)
+	if (session) {
 		memset(session, 0, sizeof(*session));
+		awg_event_validation_state_init(&session->event_validation);
+	}
 }
 
 static bool awg_stream_v2_kind_valid(uint8_t kind)
@@ -413,30 +422,29 @@ static int awg_stream_v2_push_events(
 	awg_stream_proto_v2_session_t *session, const uint8_t *payload,
 	uint16_t count)
 {
+	awg_event_validation_state_t next_validation;
+	awg_event_validation_report_t validation_report;
 	uint32_t base = session->have_pending_event ? 1U : 0U;
 	uint32_t push_count;
 	uint32_t i;
-	uint64_t previous;
-	bool have_previous;
 	int ret;
 
 	if (session->have_pending_event)
 		g_awg_stream_v2_records[0] = session->pending_event;
 
-	previous = session->last_timestamp;
-	have_previous = session->have_last_timestamp;
 	for (i = 0U; i < count; i++) {
 		awg_event_v1_t *event = &g_awg_stream_v2_records[base + i];
 
 		awg_stream_event_from_le(payload +
 			((size_t)i * AWG_STREAM_PROTO_V2_RECORD_BYTES), event);
-		if ((event->flags & ~AWG_SCHED_FLAG_PHASE_REINIT) != 0U ||
-		    event->reserved != 0U ||
-		    (have_previous && event->timestamp_ticks < previous))
-			return -EINVAL;
-		previous = event->timestamp_ticks;
-		have_previous = true;
 	}
+
+	next_validation = session->event_validation;
+	ret = awg_event_v1_validate_batch(&next_validation,
+		&g_awg_stream_v2_records[base], count, false, true,
+		&validation_report);
+	if (ret)
+		return ret;
 
 	/*
 	 * Hold exactly one direct event until CONTROL/CLOSE.  This lets EOF be
@@ -449,9 +457,10 @@ static int awg_stream_v2_push_events(
 			return ret;
 	}
 
+	session->event_validation = next_validation;
 	session->pending_event = g_awg_stream_v2_records[base + count - 1U];
 	session->have_pending_event = true;
-	session->last_timestamp = previous;
+	session->last_timestamp = session->pending_event.timestamp_ticks;
 	session->have_last_timestamp = true;
 	return 0;
 }
@@ -460,7 +469,7 @@ static int awg_stream_v2_push_c1(const uint8_t *payload, uint16_t count)
 {
 	memcpy(g_awg_stream_v2_records, payload,
 	       (size_t)count * AWG_STREAM_PROTO_V2_RECORD_BYTES);
-	return awg_sched_stream_push(g_awg_stream_v2_records, count);
+	return awg_sched_stream_push_opaque(g_awg_stream_v2_records, count);
 }
 
 int awg_stream_proto_v2_handle_frame(
@@ -600,6 +609,23 @@ int awg_stream_proto_v2_handle_frame(
 		    flags != 0U)
 			return awg_stream_v2_fail(ack, session_id, seq,
 				AWG_STREAM_PROTO_ACK_BAD_FLAGS, -EINVAL);
+		if (session->payload_kind == AWG_STREAM_PROTO_V2_KIND_C1) {
+			if (!ops || !ops->finalize_kind) {
+				ret = -ENOTSUP;
+			} else {
+				ret = ops->finalize_kind(ops->ctx,
+					AWG_STREAM_PROTO_V2_KIND_C1);
+			}
+			if (ret) {
+				/* No C1 record has reached DMA; discard the staged blob. */
+				(void)awg_sched_stream_reset_soft();
+				session->closed = true;
+				awg_stream_v2_ack_init(ack, session_id, seq,
+					AWG_STREAM_PROTO_ACK_BAD_EVENT);
+				awg_stream_v2_accept(session, seq, expected_crc, ack);
+				return ret;
+			}
+		}
 
 		if (session->payload_kind == AWG_STREAM_PROTO_V2_KIND_EVENTS) {
 			if (!session->have_pending_event)
@@ -607,7 +633,8 @@ int awg_stream_proto_v2_handle_frame(
 					AWG_STREAM_PROTO_ACK_BAD_EVENT, -EINVAL);
 			if ((flags & AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF) != 0U)
 				session->pending_event.flags |= AWG_SCHED_FLAG_EOF;
-			ret = awg_sched_stream_push(&session->pending_event, 1U);
+			ret = awg_sched_stream_push_final(&session->pending_event, 1U,
+				true);
 			if (ret)
 				return awg_stream_v2_fail(ack, session_id, seq,
 					awg_stream_status_from_ret(ret,
@@ -616,6 +643,9 @@ int awg_stream_proto_v2_handle_frame(
 		}
 
 		ret = awg_sched_stream_close(false);
+		if (!ret &&
+		    session->payload_kind == AWG_STREAM_PROTO_V2_KIND_C1)
+			session->c1_preflight_complete = true;
 		session->closed = true;
 		awg_stream_v2_ack_init(ack, session_id, seq,
 			ret ? awg_stream_status_from_ret(ret,
@@ -638,7 +668,8 @@ int awg_stream_proto_v2_handle_frame(
 		ret = awg_stream_v2_push_c1(payload, count);
 	if (ret)
 		return awg_stream_v2_fail(ack, session_id, seq,
-			ret == -EINVAL ? AWG_STREAM_PROTO_ACK_BAD_EVENT :
+			(ret == -EINVAL || ret == -ERANGE || ret == -EPERM) ?
+			AWG_STREAM_PROTO_ACK_BAD_EVENT :
 			awg_stream_status_from_ret(ret,
 				AWG_STREAM_PROTO_ACK_RING_FULL), ret);
 

@@ -5,6 +5,7 @@
 #include <errno.h>
 
 #include "awg_sched.h"
+#include "awg_event_validate.h"
 #include "awg_sched_regs.h"
 #include "awg_stream_ring.h"
 #include "no_os_axi_io.h"
@@ -527,25 +528,44 @@ uint32_t awg_sched_stream_depth(void)
 	return g_awg_sched.configured ? g_awg_sched.hw_stream_depth : 0U;
 }
 
+static int awg_sched_validate_active_events(const awg_event_v1_t *events,
+		uint32_t count)
+{
+	awg_sched_validation_report_t scheduler_report;
+	awg_event_validation_report_t active_report;
+	awg_event_validation_state_t active_state;
+	int ret;
+
+	/* Preserve every frozen AWGS-v1/configured-width check first. */
+	ret = awg_sched_validate_events(events, count, NULL, &scheduler_report);
+	if (ret != 0)
+		return ret;
+
+	/* Then apply the stricter generated active-build contract. */
+	awg_event_validation_state_init(&active_state);
+	ret = awg_event_v1_validate_batch(&active_state, events, count, true,
+					  false, &active_report);
+	return ret;
+}
+
 int awg_sched_verify_events(const awg_event_v1_t *events, uint32_t count)
 {
-awg_sched_validation_report_t report;
-int ret;
+	int ret;
 
-ret = awg_sched_validate_events(events, count, NULL, &report);
-if (ret != 0)
-return ret;
+	ret = awg_sched_validate_active_events(events, count);
+	if (ret != 0)
+		return ret;
 
 #if AWG_SCHED_ENABLE_LOAD_READBACK_VERIFY
-if (g_awg_sched.loaded_events == count) {
-ret = awg_sched_verify_loaded_events_readback(events, count);
-if (ret != 0)
-return ret;
-}
+	if (g_awg_sched.loaded_events == count) {
+		ret = awg_sched_verify_loaded_events_readback(events, count);
+		if (ret != 0)
+			return ret;
+	}
 #endif
 
-g_awg_sched.events_validated = true;
-return 0;
+	g_awg_sched.events_validated = true;
+	return 0;
 }
 
 int awg_sched_validate_events(const awg_event_v1_t *events, uint32_t count,
@@ -838,14 +858,13 @@ ms_left--;
 
 int awg_sched_load_events(const awg_event_v1_t *events, uint32_t count)
 {
-awg_sched_validation_report_t report;
 uint32_t i;
 int ret;
 
 g_awg_sched.events_validated = false;
 
-/* Validate event data before touching hardware. */
-ret = awg_sched_validate_events(events, count, NULL, &report);
+/* Validate event data before touching hardware without changing load state. */
+ret = awg_sched_validate_active_events(events, count);
 if (ret)
 return ret;
 
@@ -1068,10 +1087,10 @@ if (ret)
 return ret;
 
 /*
- * ERR_REG and STATUS[15:8] are the documented ABI.  The current Phase-E RTL
- * assigns a 40-bit concatenation to a 32-bit status snapshot, which places
- * the error byte in STATUS[23:16] and leaves ERR_REG zero.  Use that byte only
- * when ERROR is asserted and both documented locations are empty.
+ * ERR_REG and STATUS[15:8] are the documented ABI.  Some older engineering
+ * images assigned a 40-bit concatenation to a 32-bit status snapshot, which
+ * placed the error byte in STATUS[23:16] and left ERR_REG zero.  Use that byte
+ * only when ERROR is asserted and both documented locations are empty.
  */
 err_code = (uint8_t)(err_reg & AWG_SCHED_STATUS_ERR_CODE_MASK);
 if (err_code == AWG_SCHED_ERR_NONE)
@@ -1087,7 +1106,7 @@ if (rtl_err != AWG_SCHED_ERR_NONE) {
 err_code = rtl_err;
 err_fallback = true;
 if (!g_awg_sched.error_fallback_logged) {
-AWG_LOG("[AWG-SCHED] applying Phase-E RTL error-code fallback "
+AWG_LOG("[AWG-SCHED] applying legacy RTL error-code fallback "
 "STATUS[23:16]=0x%02X raw=0x%08lX\n\r",
 (unsigned)rtl_err, (unsigned long)raw_status);
 g_awg_sched.error_fallback_logged = true;
@@ -1363,6 +1382,7 @@ static struct {
 	volatile uint32_t error_pending;
 	volatile uint32_t irq_latched;
 	awg_sched_stream_snapshot_t last_error;
+	awg_event_validation_state_t event_validator;
 } g_awg_stream;
 
 static uint32_t awg_stream_min_u32(uint32_t a, uint32_t b)
@@ -1546,6 +1566,7 @@ int awg_sched_stream_open(const awg_sched_stream_cfg_t *cfg)
 		poll_interval = AWG_STREAM_DEFAULT_POLL_INTERVAL_US;
 
 	memset(&g_awg_stream, 0, sizeof(g_awg_stream));
+	awg_event_validation_state_init(&g_awg_stream.event_validator);
 	ret = awg_stream_ring_init(&g_awg_stream.ring, ring, capacity,
 				   sizeof(awg_event_v1_t));
 	if (ret)
@@ -1597,8 +1618,11 @@ fail:
 	return ret;
 }
 
-int awg_sched_stream_push(const awg_event_v1_t *ev, uint32_t n)
+static int awg_sched_stream_push_impl(const void *records, uint32_t n,
+		bool logical_events, bool final_batch, bool require_event)
 {
+	awg_event_validation_state_t next_validation;
+	awg_event_validation_report_t validation_report;
 	int ret;
 
 	if (!g_awg_stream.open)
@@ -1613,8 +1637,17 @@ int awg_sched_stream_push(const awg_event_v1_t *ev, uint32_t n)
 	if (n == 0U)
 		return awg_sched_stream_drain_step();
 
-	if (!ev)
+	if (!records)
 		return -EINVAL;
+
+	if (logical_events) {
+		next_validation = g_awg_stream.event_validator;
+		ret = awg_event_v1_validate_batch(&next_validation,
+			(const awg_event_v1_t *)records, n, final_batch,
+			require_event, &validation_report);
+		if (ret)
+			return ret;
+	}
 
 	if (awg_stream_ring_free(&g_awg_stream.ring) < n) {
 		ret = awg_sched_stream_drain_step();
@@ -1625,14 +1658,35 @@ int awg_sched_stream_push(const awg_event_v1_t *ev, uint32_t n)
 	if (awg_stream_ring_free(&g_awg_stream.ring) < n)
 		return -EAGAIN;
 
-	ret = awg_stream_ring_push(&g_awg_stream.ring, ev, n);
+	ret = awg_stream_ring_push(&g_awg_stream.ring, records, n);
 	if (ret)
 		return (ret == -ENOSPC) ? -EAGAIN : ret;
 
-	g_awg_stream.last_event = ev[n - 1U];
-	g_awg_stream.has_last_event = true;
+	if (logical_events) {
+		const awg_event_v1_t *events = records;
+
+		g_awg_stream.event_validator = next_validation;
+		g_awg_stream.last_event = events[n - 1U];
+		g_awg_stream.has_last_event = true;
+	}
 
 	return awg_sched_stream_drain_step();
+}
+
+int awg_sched_stream_push(const awg_event_v1_t *ev, uint32_t n)
+{
+	return awg_sched_stream_push_impl(ev, n, true, false, false);
+}
+
+int awg_sched_stream_push_final(const awg_event_v1_t *ev, uint32_t n,
+				 bool require_event)
+{
+	return awg_sched_stream_push_impl(ev, n, true, true, require_event);
+}
+
+int awg_sched_stream_push_opaque(const void *records, uint32_t n)
+{
+	return awg_sched_stream_push_impl(records, n, false, false, false);
 }
 
 int awg_sched_stream_drain_step(void)
@@ -1860,6 +1914,22 @@ int awg_sched_stream_open(const awg_sched_stream_cfg_t *cfg)
 int awg_sched_stream_push(const awg_event_v1_t *ev, uint32_t n)
 {
 	(void)ev;
+	(void)n;
+	return -ENOTSUP;
+}
+
+int awg_sched_stream_push_final(const awg_event_v1_t *ev, uint32_t n,
+				 bool require_event)
+{
+	(void)ev;
+	(void)n;
+	(void)require_event;
+	return -ENOTSUP;
+}
+
+int awg_sched_stream_push_opaque(const void *records, uint32_t n)
+{
+	(void)records;
 	(void)n;
 	return -ENOTSUP;
 }

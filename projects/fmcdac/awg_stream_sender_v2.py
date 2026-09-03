@@ -36,6 +36,8 @@ FLAG_CLOSE_WITH_EOF = 1 << 1
 
 EVENT_FLAG_PHASE_REINIT = 1 << 0
 EVENT_FLAG_EOF = 1 << 1
+ACTIVE_CHANNELS = 2
+MIN_EVENT_SPACING_TICKS = 8
 
 HEADER = struct.Struct("<IBBHIIHHI")
 ACK = struct.Struct("<IBBHIIIIIIII")
@@ -293,13 +295,15 @@ def _validate_direct_records(records: bytes) -> None:
     for index in range(0, len(records), RECORD_BYTES):
         event = EVENT.unpack_from(records, index)
         timestamp = event[0]
+        channel = event[1]
         flags = event[2]
         reserved = event[-1]
         record_number = index // RECORD_BYTES
 
-        if previous_timestamp is not None and timestamp < previous_timestamp:
+        if channel >= ACTIVE_CHANNELS:
             raise ValueError(
-                f"direct record {record_number} timestamp moves backward"
+                f"direct record {record_number} channel {channel} is outside "
+                f"active channels 0-{ACTIVE_CHANNELS - 1}"
             )
         if flags & EVENT_FLAG_EOF:
             raise ValueError(
@@ -311,6 +315,22 @@ def _validate_direct_records(records: bytes) -> None:
             )
         if reserved != 0:
             raise ValueError(f"direct record {record_number} reserved word is nonzero")
+        if event[5] & 0xFFFF0000 or event[6] != 0:
+            raise ValueError(
+                f"direct record {record_number} payload bits 127:80 are nonzero"
+            )
+        if previous_timestamp is not None and timestamp < previous_timestamp:
+            raise ValueError(
+                f"direct record {record_number} timestamp moves backward"
+            )
+        if (
+            previous_timestamp is not None
+            and timestamp - previous_timestamp < MIN_EVENT_SPACING_TICKS
+        ):
+            raise ValueError(
+                f"direct record {record_number} is fewer than "
+                f"{MIN_EVENT_SPACING_TICKS} ticks after its predecessor"
+            )
         previous_timestamp = timestamp
 
 
@@ -326,8 +346,10 @@ def _dds_payload(scale: int, initial_phase: int, phase_increment: int) -> bytes:
 def _generate_direct_records(args: argparse.Namespace) -> bytes:
     if args.count <= 0:
         raise ValueError("count must be positive")
-    if args.tick_step <= 0:
-        raise ValueError("tick-step must be positive")
+    if args.tick_step < MIN_EVENT_SPACING_TICKS:
+        raise ValueError(
+            f"tick-step must be at least {MIN_EVENT_SPACING_TICKS} ticks"
+        )
     start_ticks = args.start_ticks
     if start_ticks is None:
         upload_s = args.count / args.rate if args.rate > 0 else 0.0
@@ -337,8 +359,8 @@ def _generate_direct_records(args: argparse.Namespace) -> bytes:
         args.start_ticks = start_ticks
     if not 0 <= start_ticks <= 0xFFFFFFFFFFFFFFFF:
         raise ValueError("start-ticks must fit in 64 bits")
-    if not 0 <= args.channel <= 0xFFFF:
-        raise ValueError("channel must fit in 16 bits")
+    if not 0 <= args.channel < ACTIVE_CHANNELS:
+        raise ValueError(f"channel must be in [0, {ACTIVE_CHANNELS - 1}]")
     if not 0 <= args.scale <= 0xFFFF:
         raise ValueError("scale must fit in 16 bits")
     if not 0 <= args.initial_phase <= 0xFFFFFFFF:

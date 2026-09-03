@@ -9,6 +9,9 @@
 #include <xiic.h>
 #include <xtmrctr.h>
 #include "app_config.h"
+#if FMCDAC_AWG_RELEASE_PROFILE
+#include <xuartlite_l.h>
+#endif
 #include "parameters.h"
 #include "axi_adxcvr.h"
 #include "no_os_spi.h"
@@ -446,6 +449,7 @@ static void fmcdac_run_awg_sched_console(struct fmcdac_dev *dev);
 static int fmcdac_awg_stream_console_streamhex(struct fmcdac_dev *dev,
 					       const char *line);
 static int fmcdac_awg_stream_console_status(const char *tag);
+static int fmcdac_awg_stream_console_status2(void);
 static int fmcdac_awg_stream_console_reset(void);
 static int fmcdac_awg_sched_console_configure(void);
 static void fmcdac_run_benchmark_prompt_flow(struct fmcdac_dev *dev);
@@ -461,6 +465,7 @@ static uint64_t fmcdac_timer_now_cycles(void);
 static uint32_t fmcdac_cycles_to_us(uint64_t cycles);
 static uint32_t fmcdac_cycles_to_ns_per_op(uint64_t cycles, uint32_t ops);
 static uint32_t fmcdac_ops_per_second(uint32_t ops, uint64_t cycles);
+static int fmcdac_console_getc(void);
 static void fmcdac_flush_input(void);
 static void fmcdac_awg_stream_poll(void);
 #if FMCDAC_AWG_SCHED_DMA_REFILL
@@ -1444,10 +1449,20 @@ static void fmcdac_flush_input(void)
 {
 	int c;
 	do {
-		c = getc(stdin);
+		c = fmcdac_console_getc();
 		if (c == EOF)
 			break;
 	} while (c != '\n' && c != '\r');
+}
+
+static int fmcdac_console_getc(void)
+{
+#if FMCDAC_AWG_RELEASE_PROFILE
+	/* Keep the UDP/DMA service loop live while the diagnostic UART is idle. */
+	if (XUartLite_IsReceiveEmpty(XPAR_AXI_UART_BASEADDR))
+		return EOF;
+#endif
+	return getc(stdin);
 }
 
 static int fmcdac_read_line(char *buf, size_t len)
@@ -1460,7 +1475,7 @@ static int fmcdac_read_line(char *buf, size_t len)
 
 	while (1) {
 		fmcdac_awg_stream_poll();
-		c = getc(stdin);
+		c = fmcdac_console_getc();
 		if (c == EOF)
 			continue;
 		if (c == '\r' || c == '\n') {
@@ -1486,7 +1501,7 @@ static int fmcdac_read_exact(uint8_t *buf, size_t len)
 
 	while (pos < len) {
 		fmcdac_awg_stream_poll();
-		c = getc(stdin);
+		c = fmcdac_console_getc();
 		if (c == EOF)
 			continue;
 		buf[pos++] = (uint8_t)c;
@@ -1517,7 +1532,7 @@ static int fmcdac_read_exact_hex(uint8_t *buf, size_t len)
 		return -1;
 
 	while (pos < len) {
-		c = getc(stdin);
+		c = fmcdac_console_getc();
 		if (c == EOF) {
 			fmcdac_awg_stream_poll();
 			continue;
@@ -1637,19 +1652,18 @@ static int32_t fmcdac_sfp0_tx_disable(void *ctx, bool disabled)
 
 static void fmcdac_scheduler_irq(void *instance)
 {
+#if !FMCDAC_AWG_SCHED_ETH
 	uint32_t irq_status;
+#endif
 
 	(void)instance;
+#if FMCDAC_AWG_SCHED_ETH
+	awg_phase_f_scheduler_irq(&g_fmcdac_phase_f);
+#else
 	if (no_os_axi_io_read(FMCDAC_AWG_SCHED_BASEADDR,
 			      AWG_SCHED_REG_IRQ_STATUS, &irq_status))
 		return;
 	awg_sched_stream_irq_handler(irq_status);
-#if FMCDAC_AWG_SCHED_ETH
-	if (g_fmcdac_phase_f.scheduler_dma_initialized &&
-	    (irq_status & (AWG_SCHED_IRQ_LOW_WATERMARK |
-			   AWG_SCHED_IRQ_EMPTY_STALL)) != 0U)
-		awg_sched_dma_request_service(&g_fmcdac_phase_f.scheduler_dma);
-#else
 	if (g_fmcdac_sched_refill_initialized &&
 	    (irq_status & (AWG_SCHED_IRQ_LOW_WATERMARK |
 			   AWG_SCHED_IRQ_EMPTY_STALL)) != 0U)
@@ -4066,6 +4080,13 @@ static int fmcdac_awg_stream_console_streamhex(struct fmcdac_dev *dev,
 	uint16_t flags = 0U;
 	int ret;
 
+#if !FMCDAC_AWG_LEGACY_INGRESS_MAINTENANCE
+	(void)dev;
+	(void)line;
+	xil_printf("[AWG-STREAM] ERROR reason=legacy_ingress_disabled profile=release\n\r");
+	return -ENOTSUP;
+#endif
+
 	if (!line)
 		return -EINVAL;
 
@@ -4156,6 +4177,73 @@ static int fmcdac_awg_stream_console_streamhex(struct fmcdac_dev *dev,
 		   (unsigned long)AWG_STREAM_PROTO_MAGIC,
 		   (unsigned long)AWG_STREAM_PROTO_ACK_DISABLED,
 		   -ENOTSUP);
+	return -ENOTSUP;
+#endif
+}
+
+static int fmcdac_awg_stream_console_status2(void)
+{
+#if FMCDAC_AWG_SCHED_ETH
+	struct awg_phase_f_streamstatus2 status;
+	const char *mode;
+	int ret;
+
+	ret = awg_phase_f_read_streamstatus2(&g_fmcdac_phase_f, &status);
+	if (ret) {
+		xil_printf("[AWG-STREAM] ERROR reason=streamstatus2_read_failed status=%d\n\r",
+			   ret);
+		return ret;
+	}
+	mode = status.selected_payload_kind == AWG_STREAM_PROTO_V2_KIND_EVENTS ?
+		"direct" :
+		status.selected_payload_kind == AWG_STREAM_PROTO_V2_KIND_C1 ?
+		"c1" : "control";
+	xil_printf("[AWG-STREAM] STREAMSTATUS2 version=%lu selected_mode=%s selected_kind=%u "
+		   "c1_preflight=%u awgx_id=0x%08lX awgx_version=0x%08lX "
+		   "awgx_caps=0x%08lX awgx_control=0x%08lX awgx_status=0x%08lX "
+		   "awgc_id=0x%08lX awgc_version=0x%08lX awgc_caps=0x%08lX "
+		   "awgc_status=0x%08lX errors=0x%08lX "
+		   "accepted_commands=0x%08lX%08lX emitted_logical_events=0x%08lX%08lX "
+		   "busy_cycles=0x%08lX%08lX stall_cycles=0x%08lX%08lX "
+		   "logical_output_crc=0x%08lX%08lX declared_logical_events=0x%08lX%08lX "
+		   "max_repeat_depth=%lu max_commands=%lu preflight_errors=0x%08lX "
+		   "preflight_command=%lu preflight_event_error=%u protocol_accepts=%lu "
+		   "protocol_rejects=%lu\n\r",
+		   (unsigned long)status.version, mode,
+		   (unsigned)status.selected_payload_kind,
+		   (unsigned)status.c1_preflight_complete,
+		   (unsigned long)status.awgx_id,
+		   (unsigned long)status.awgx_version,
+		   (unsigned long)status.awgx_caps,
+		   (unsigned long)status.awgx_control,
+		   (unsigned long)status.awgx_status,
+		   (unsigned long)status.awgc_id,
+		   (unsigned long)status.awgc_version,
+		   (unsigned long)status.awgc_caps,
+		   (unsigned long)status.awgc_status,
+		   (unsigned long)status.awgc_error,
+		   (unsigned long)(status.accepted_commands >> 32),
+		   (unsigned long)status.accepted_commands,
+		   (unsigned long)(status.emitted_logical_events >> 32),
+		   (unsigned long)status.emitted_logical_events,
+		   (unsigned long)(status.busy_cycles >> 32),
+		   (unsigned long)status.busy_cycles,
+		   (unsigned long)(status.stall_cycles >> 32),
+		   (unsigned long)status.stall_cycles,
+		   (unsigned long)(status.logical_output_crc >> 32),
+		   (unsigned long)status.logical_output_crc,
+		   (unsigned long)(status.declared_logical_events >> 32),
+		   (unsigned long)status.declared_logical_events,
+		   (unsigned long)status.maximum_repeat_depth,
+		   (unsigned long)status.maximum_commands,
+		   (unsigned long)g_fmcdac_phase_f.c1_preflight_report.error_mask,
+		   (unsigned long)g_fmcdac_phase_f.c1_preflight_report.command_index,
+		   (unsigned)g_fmcdac_phase_f.c1_preflight_report.event_error,
+		   (unsigned long)g_fmcdac_phase_f.stats.protocol_accepts,
+		   (unsigned long)g_fmcdac_phase_f.stats.protocol_rejects);
+	return 0;
+#else
+	xil_printf("[AWG-STREAM] ERROR reason=streamstatus2_requires_ethernet\n\r");
 	return -ENOTSUP;
 #endif
 }
@@ -4308,6 +4396,13 @@ static int fmcdac_awg_sched_console_loadbin(struct fmcdac_dev *dev,
 	uint32_t count;
 	size_t payload_bytes;
 	int ret;
+
+#if !FMCDAC_AWG_LEGACY_INGRESS_MAINTENANCE
+	(void)dev;
+	(void)line;
+	fmcdac_awg_sched_console_emit_error("legacy_ingress_disabled");
+	return -ENOTSUP;
+#endif
 
 	if (!dev || !dev->ad9144_core || !dev->ad9144_device) {
 		fmcdac_awg_sched_console_emit_error("dac_core_unavailable");
@@ -4582,7 +4677,7 @@ static void fmcdac_run_awg_sched_console(struct fmcdac_dev *dev)
 		   (unsigned long)FMCDAC_AWG_SCHED_MAX_EVENTS,
 		   (unsigned long)FMCDAC_AWG_SCHED_TICK_HZ,
 		   (unsigned long)FMCDAC_AWG_SCHED_DONE_TIMEOUT_MS);
-	xil_printf("[AWG-UART] Ready. Commands: INFO STATUS LOADBIN <count> RUN ABORT DUMP STREAMINFO STREAMSTATUS STREAMRESET STREAMHEX <bytes> EXIT\n\r");
+	xil_printf("[AWG-UART] Ready. Commands: INFO STATUS LOADBIN <count> RUN ABORT DUMP STREAMINFO STREAMSTATUS STREAMSTATUS2 STREAMRESET STREAMHEX <bytes> EXIT\n\r");
 
 	while (1) {
 		if (fmcdac_read_line(line, sizeof(line)) < 0)
@@ -4625,6 +4720,11 @@ static void fmcdac_run_awg_sched_console(struct fmcdac_dev *dev)
 
 		if (strcmp(line, "STREAMSTATUS") == 0) {
 			(void)fmcdac_awg_stream_console_status("status");
+			continue;
+		}
+
+		if (strcmp(line, "STREAMSTATUS2") == 0) {
+			(void)fmcdac_awg_stream_console_status2();
 			continue;
 		}
 

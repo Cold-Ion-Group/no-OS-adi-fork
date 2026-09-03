@@ -25,16 +25,22 @@ DMA_TEST_BIN := awg_sched_dma_test
 PARAM_TEST_BIN := parameters_compile_test
 NET_TEST_BIN := awg_net_test
 ETH_IO_TEST_BIN := awg_eth_io_test
+EVENT_VALIDATION_TEST_BIN := awg_event_validation_test
+C1_VALIDATION_TEST_BIN := awg_c1_validate_test
+PHASE_F_TELEMETRY_TEST_BIN := awg_phase_f_telemetry_test
 
 SRCS := awg_sched_validate_test.c \
         $(SRC_DIR)/awg_sched.c \
+        $(SRC_DIR)/awg_event_validate.c \
         $(SRC_DIR)/awg_stream_ring.c
 
 PROTO_SRCS := awg_stream_proto_test.c \
-              $(SRC_DIR)/awg_stream_proto.c
+              $(SRC_DIR)/awg_stream_proto.c \
+              $(SRC_DIR)/awg_event_validate.c
 
 PROTO_V2_SRCS := awg_stream_proto_v2_test.c \
-                 $(SRC_DIR)/awg_stream_proto.c
+                 $(SRC_DIR)/awg_stream_proto.c \
+                 $(SRC_DIR)/awg_event_validate.c
 
 DMA_SRCS := awg_sched_dma_test.c \
             $(SRC_DIR)/awg_sched_dma.c \
@@ -46,6 +52,7 @@ PARAM_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -Werror \
                 -DFMCDAC_AWG_SCHED_STREAM=1 \
                 -DFMCDAC_AWG_SCHED_DMA_REFILL=1 \
                 -DFMCDAC_AWG_SCHED_ETH=1 \
+                -DFMCDAC_AWG_RELEASE_PROFILE=1 \
                 -DFMCDAC_AWG_SCHED_USE_IRQ=1 \
                 -DFMCDAC_AWG_SCHED_BASEADDR=0x44AA0000U \
                 -DFMCDAC_AWG_SCHED_DMA_BASEADDR=0x44AB0000U \
@@ -61,7 +68,7 @@ ETH_IO_SRCS := awg_eth_io_test.c \
                $(SRC_DIR)/awg_eth_rx.c \
                $(SRC_DIR)/awg_eth_tx.c
 
-all: $(TEST_BIN) $(PROTO_TEST_BIN) $(PROTO_V2_TEST_BIN) $(DMA_TEST_BIN) $(PARAM_TEST_BIN) $(NET_TEST_BIN) $(ETH_IO_TEST_BIN)
+all: $(TEST_BIN) $(PROTO_TEST_BIN) $(PROTO_V2_TEST_BIN) $(DMA_TEST_BIN) $(PARAM_TEST_BIN) $(NET_TEST_BIN) $(ETH_IO_TEST_BIN) $(EVENT_VALIDATION_TEST_BIN) $(C1_VALIDATION_TEST_BIN) $(PHASE_F_TELEMETRY_TEST_BIN)
 
 $(TEST_BIN): $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
@@ -84,7 +91,21 @@ $(NET_TEST_BIN): $(NET_SRCS)
 $(ETH_IO_TEST_BIN): $(ETH_IO_SRCS)
 	$(CC) $(CFLAGS) -Werror -o $@ $^
 
-run: $(TEST_BIN) $(PROTO_TEST_BIN) $(PROTO_V2_TEST_BIN) $(DMA_TEST_BIN) $(PARAM_TEST_BIN) $(NET_TEST_BIN) $(ETH_IO_TEST_BIN)
+$(EVENT_VALIDATION_TEST_BIN): awg_event_validation_test.c $(SRC_DIR)/awg_event_validate.c
+	$(CC) $(CFLAGS) -Werror \
+		-DEVENT_VECTOR_PATH='"../../../../rfsoc-bench/contracts/event_v1_validation_vectors.tsv"' \
+		-o $@ $^
+
+$(C1_VALIDATION_TEST_BIN): awg_c1_validate_test.c $(SRC_DIR)/awg_c1_validate.c $(SRC_DIR)/awg_event_validate.c
+	$(CC) $(CFLAGS) -Werror -o $@ $^
+
+$(PHASE_F_TELEMETRY_TEST_BIN): awg_phase_f_telemetry_test.c $(SRC_DIR)/awg_phase_f.c
+	$(CC) $(CFLAGS) -Werror -ffunction-sections -fdata-sections \
+		-DFMCDAC_AWG_SCHED_DMA_REFILL=1 -DFMCDAC_AWG_SCHED_ETH=1 \
+		-DFMCDAC_AWG_LEGACY_INGRESS_MAINTENANCE=0 \
+		-Wl,--gc-sections -o $@ $^
+
+run: $(TEST_BIN) $(PROTO_TEST_BIN) $(PROTO_V2_TEST_BIN) $(DMA_TEST_BIN) $(PARAM_TEST_BIN) $(NET_TEST_BIN) $(ETH_IO_TEST_BIN) $(EVENT_VALIDATION_TEST_BIN) $(C1_VALIDATION_TEST_BIN) $(PHASE_F_TELEMETRY_TEST_BIN)
 	./$(TEST_BIN)
 	./$(PROTO_TEST_BIN)
 	./$(PROTO_V2_TEST_BIN)
@@ -92,11 +113,14 @@ run: $(TEST_BIN) $(PROTO_TEST_BIN) $(PROTO_V2_TEST_BIN) $(DMA_TEST_BIN) $(PARAM_
 	./$(PARAM_TEST_BIN)
 	./$(NET_TEST_BIN)
 	./$(ETH_IO_TEST_BIN)
+	./$(EVENT_VALIDATION_TEST_BIN)
+	./$(C1_VALIDATION_TEST_BIN)
+	./$(PHASE_F_TELEMETRY_TEST_BIN)
 
 run-host:
 	python awg_sched_host_test.py
 
 clean:
-	rm -f $(TEST_BIN) $(PROTO_TEST_BIN) $(PROTO_V2_TEST_BIN) $(DMA_TEST_BIN) $(PARAM_TEST_BIN) $(NET_TEST_BIN) $(ETH_IO_TEST_BIN)
+	rm -f $(TEST_BIN) $(PROTO_TEST_BIN) $(PROTO_V2_TEST_BIN) $(DMA_TEST_BIN) $(PARAM_TEST_BIN) $(NET_TEST_BIN) $(ETH_IO_TEST_BIN) $(EVENT_VALIDATION_TEST_BIN) $(C1_VALIDATION_TEST_BIN) $(PHASE_F_TELEMETRY_TEST_BIN)
 
 .PHONY: all run run-host clean

@@ -18,6 +18,7 @@ struct sched_stub {
 	uint32_t close_calls;
 	uint32_t pushed_count;
 	int push_ret;
+	int close_ret;
 	awg_event_v1_t pushed[TEST_RECORDS];
 	awg_sched_stream_snapshot_t snapshot;
 };
@@ -25,9 +26,11 @@ struct sched_stub {
 struct route_stub {
 	uint32_t prepare_calls;
 	uint32_t select_calls;
+	uint32_t finalize_calls;
 	uint8_t selected_kind;
 	int prepare_ret;
 	int select_ret;
+	int finalize_ret;
 };
 
 static struct sched_stub g_sched;
@@ -63,12 +66,25 @@ int awg_sched_stream_push(const awg_event_v1_t *events, uint32_t count)
 	return 0;
 }
 
+int awg_sched_stream_push_final(const awg_event_v1_t *events, uint32_t count,
+				 bool require_event)
+{
+	if (require_event && count == 0U)
+		return -EINVAL;
+	return awg_sched_stream_push(events, count);
+}
+
+int awg_sched_stream_push_opaque(const void *records, uint32_t count)
+{
+	return awg_sched_stream_push(records, count);
+}
+
 int awg_sched_stream_close(bool send_eof)
 {
 	if (send_eof)
 		return -EINVAL;
 	g_sched.close_calls++;
-	return 0;
+	return g_sched.close_ret;
 }
 
 uint32_t awg_sched_stream_ddr_free_events(void)
@@ -103,6 +119,14 @@ static int route_select(void *ctx, uint8_t kind)
 	route->select_calls++;
 	route->selected_kind = kind;
 	return route->select_ret;
+}
+
+static int route_finalize(void *ctx, uint8_t kind)
+{
+	struct route_stub *route = ctx;
+	route->finalize_calls++;
+	route->selected_kind = kind;
+	return route->finalize_ret;
 }
 
 static void put_le16(uint8_t *data, uint16_t value)
@@ -188,6 +212,7 @@ static void open_session(awg_stream_proto_v2_session_t *session,
 	const awg_stream_proto_v2_ops_t ops = {
 		.prepare = route_prepare,
 		.select_kind = route_select,
+		.finalize_kind = route_finalize,
 		.ctx = route,
 	};
 	awg_stream_proto_v2_ack_t ack;
@@ -212,6 +237,7 @@ static void test_open_identity_and_duplicate(void)
 	const awg_stream_proto_v2_ops_t ops = {
 		.prepare = route_prepare,
 		.select_kind = route_select,
+		.finalize_kind = route_finalize,
 		.ctx = &route,
 	};
 	uint8_t digest[32];
@@ -250,6 +276,7 @@ static void test_direct_tail_eof_and_idempotency(void)
 	const awg_stream_proto_v2_ops_t ops = {
 		.prepare = route_prepare,
 		.select_kind = route_select,
+		.finalize_kind = route_finalize,
 		.ctx = &route,
 	};
 	uint8_t digest[32] = { 0 };
@@ -302,6 +329,7 @@ static void test_c1_records_are_opaque_and_close_does_not_add_eof(void)
 	const awg_stream_proto_v2_ops_t ops = {
 		.prepare = route_prepare,
 		.select_kind = route_select,
+		.finalize_kind = route_finalize,
 		.ctx = &route,
 	};
 	uint8_t digest[32] = { 0x5aU };
@@ -328,6 +356,7 @@ static void test_c1_records_are_opaque_and_close_does_not_add_eof(void)
 	CHECK(awg_stream_proto_v2_handle_frame(&session, frame, length,
 		&config, &ops, &ack) == 0);
 	CHECK(g_sched.pushed_count == 2U && g_sched.close_calls == 1U);
+	CHECK(route.finalize_calls == 1U && session.c1_preflight_complete);
 }
 
 static void test_rejection_and_retry_paths(void)
@@ -339,6 +368,7 @@ static void test_rejection_and_retry_paths(void)
 	const awg_stream_proto_v2_ops_t ops = {
 		.prepare = route_prepare,
 		.select_kind = route_select,
+		.finalize_kind = route_finalize,
 		.ctx = &route,
 	};
 	uint8_t digest[32] = { 0 };
@@ -349,7 +379,7 @@ static void test_rejection_and_retry_paths(void)
 	fixture_reset(&route, &session);
 	open_session(&session, &route, 11U, frame, digest);
 	event_record(records, 1U, 0U, 1U);
-	event_record(records + AWG_STREAM_PROTO_V2_RECORD_BYTES, 2U, 0U, 2U);
+	event_record(records + AWG_STREAM_PROTO_V2_RECORD_BYTES, 9U, 0U, 2U);
 
 	length = build_frame(frame, 11U, 2U,
 		AWG_STREAM_PROTO_V2_KIND_EVENTS, 0U, records, 2U);
@@ -386,6 +416,127 @@ static void test_rejection_and_retry_paths(void)
 	CHECK(session.next_seq == 1U && g_sched.pushed_count == 0U);
 }
 
+static void test_direct_validation_crosses_v2_frames_transactionally(void)
+{
+	awg_stream_proto_v2_session_t session;
+	awg_stream_proto_v2_ack_t ack;
+	awg_sched_stream_cfg_t config = stream_config();
+	struct route_stub route;
+	const awg_stream_proto_v2_ops_t ops = {
+		.prepare = route_prepare,
+		.select_kind = route_select,
+		.finalize_kind = route_finalize,
+		.ctx = &route,
+	};
+	uint8_t digest[32] = { 0 };
+	uint8_t record[AWG_STREAM_PROTO_V2_RECORD_BYTES];
+	uint8_t frame[TEST_FRAME_BYTES];
+	size_t length;
+
+	fixture_reset(&route, &session);
+	open_session(&session, &route, 21U, frame, digest);
+	event_record(record, 100U, 0U, 1U);
+	length = build_frame(frame, 21U, 1U,
+		AWG_STREAM_PROTO_V2_KIND_EVENTS, 0U, record, 1U);
+	CHECK(awg_stream_proto_v2_handle_frame(&session, frame, length,
+		&config, &ops, &ack) == 0);
+	CHECK(g_sched.pushed_count == 0U && session.have_pending_event);
+
+	event_record(record, 107U, 0U, 2U);
+	length = build_frame(frame, 21U, 2U,
+		AWG_STREAM_PROTO_V2_KIND_EVENTS, 0U, record, 1U);
+	CHECK(awg_stream_proto_v2_handle_frame(&session, frame, length,
+		&config, &ops, &ack) == -ERANGE);
+	CHECK(ack.status == AWG_STREAM_PROTO_ACK_BAD_EVENT);
+	CHECK(session.next_seq == 2U && session.event_validation.accepted_events == 1U);
+	CHECK(g_sched.pushed_count == 0U &&
+	      session.pending_event.timestamp_ticks == 100U);
+
+	event_record(record, 108U, 0U, 2U);
+	length = build_frame(frame, 21U, 2U,
+		AWG_STREAM_PROTO_V2_KIND_EVENTS, 0U, record, 1U);
+	CHECK(awg_stream_proto_v2_handle_frame(&session, frame, length,
+		&config, &ops, &ack) == 0);
+	CHECK(g_sched.pushed_count == 1U &&
+	      session.event_validation.accepted_events == 2U);
+
+	event_record(record, 116U, 0U, 3U);
+	record[22U] = 1U; /* payload bit 80 */
+	length = build_frame(frame, 21U, 3U,
+		AWG_STREAM_PROTO_V2_KIND_EVENTS, 0U, record, 1U);
+	CHECK(awg_stream_proto_v2_handle_frame(&session, frame, length,
+		&config, &ops, &ack) == -EINVAL);
+	CHECK(ack.status == AWG_STREAM_PROTO_ACK_BAD_EVENT);
+	CHECK(session.next_seq == 3U && session.event_validation.accepted_events == 2U);
+}
+
+static void test_c1_finalize_failure_discards_before_close(void)
+{
+	awg_stream_proto_v2_session_t session;
+	awg_stream_proto_v2_ack_t ack;
+	awg_sched_stream_cfg_t config = stream_config();
+	struct route_stub route;
+	const awg_stream_proto_v2_ops_t ops = {
+		.prepare = route_prepare,
+		.select_kind = route_select,
+		.finalize_kind = route_finalize,
+		.ctx = &route,
+	};
+	uint8_t digest[32] = { 0 };
+	uint8_t records[2U * AWG_STREAM_PROTO_V2_RECORD_BYTES] = { 0 };
+	uint8_t frame[TEST_FRAME_BYTES];
+	size_t length;
+
+	fixture_reset(&route, &session);
+	open_session(&session, &route, 22U, frame, digest);
+	length = build_frame(frame, 22U, 1U,
+		AWG_STREAM_PROTO_V2_KIND_C1, 0U, records, 2U);
+	CHECK(awg_stream_proto_v2_handle_frame(&session, frame, length,
+		&config, &ops, &ack) == 0);
+	route.finalize_ret = -EINVAL;
+	length = build_frame(frame, 22U, 2U,
+		AWG_STREAM_PROTO_V2_KIND_CONTROL, 0U, NULL, 0U);
+	CHECK(awg_stream_proto_v2_handle_frame(&session, frame, length,
+		&config, &ops, &ack) == -EINVAL);
+	CHECK(ack.status == AWG_STREAM_PROTO_ACK_BAD_EVENT);
+	CHECK(route.finalize_calls == 1U);
+	CHECK(g_sched.reset_calls == 1U && g_sched.close_calls == 0U);
+	CHECK(session.closed && !session.c1_preflight_complete);
+}
+
+static void test_c1_close_failure_cannot_release_preflight(void)
+{
+	awg_stream_proto_v2_session_t session;
+	awg_stream_proto_v2_ack_t ack;
+	awg_sched_stream_cfg_t config = stream_config();
+	struct route_stub route;
+	const awg_stream_proto_v2_ops_t ops = {
+		.prepare = route_prepare,
+		.select_kind = route_select,
+		.finalize_kind = route_finalize,
+		.ctx = &route,
+	};
+	uint8_t digest[32] = { 0 };
+	uint8_t records[2U * AWG_STREAM_PROTO_V2_RECORD_BYTES] = { 0 };
+	uint8_t frame[TEST_FRAME_BYTES];
+	size_t length;
+
+	fixture_reset(&route, &session);
+	open_session(&session, &route, 23U, frame, digest);
+	length = build_frame(frame, 23U, 1U,
+		AWG_STREAM_PROTO_V2_KIND_C1, 0U, records, 2U);
+	CHECK(awg_stream_proto_v2_handle_frame(&session, frame, length,
+		&config, &ops, &ack) == 0);
+	g_sched.close_ret = -EIO;
+	length = build_frame(frame, 23U, 2U,
+		AWG_STREAM_PROTO_V2_KIND_CONTROL, 0U, NULL, 0U);
+	CHECK(awg_stream_proto_v2_handle_frame(&session, frame, length,
+		&config, &ops, &ack) == -EIO);
+	CHECK(ack.status == AWG_STREAM_PROTO_ACK_SCHED_ERROR);
+	CHECK(route.finalize_calls == 1U && g_sched.close_calls == 1U);
+	CHECK(session.closed && !session.c1_preflight_complete);
+}
+
 static void test_ack_wire_layout(void)
 {
 	static const uint8_t expected[AWG_STREAM_PROTO_V2_ACK_BYTES] = {
@@ -420,6 +571,9 @@ int main(void)
 	test_direct_tail_eof_and_idempotency();
 	test_c1_records_are_opaque_and_close_does_not_add_eof();
 	test_rejection_and_retry_paths();
+	test_direct_validation_crosses_v2_frames_transactionally();
+	test_c1_finalize_failure_discards_before_close();
+	test_c1_close_failure_cannot_release_preflight();
 	test_ack_wire_layout();
 
 	if (g_failures) {

@@ -2,6 +2,7 @@
 #define _PARAMETERS_H_
 
 #include "app_config.h"
+#include "awg_c1_validate.h"
 #include "xparameters.h"
 
 #define UART_BAUDRATE                           115200U
@@ -160,8 +161,13 @@
 #endif
 
 #if (AWG_STREAM_DDR_BASEADDR % AWG_DMA_CACHELINE_BYTES) != 0U || \
-    (AWG_STREAM_DDR_SIZE_BYTES % 32U) != 0U
+    (AWG_STREAM_DDR_SIZE_BYTES % AWG_C1_COMMAND_BYTES) != 0U
 #error "AWG scheduler ring must be cacheline aligned and an event-size multiple"
+#endif
+
+#if AWG_STREAM_DDR_SIZE_BYTES < \
+    ((AWG_C1_MAX_COMMAND_RECORDS + 2U) * AWG_C1_COMMAND_BYTES)
+#error "AWG scheduler ring cannot stage one maximum-size C1 program"
 #endif
 
 #if FMCDAC_AWG_SCHED_ETH

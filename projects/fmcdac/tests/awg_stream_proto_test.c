@@ -62,6 +62,19 @@ int awg_sched_stream_push(const awg_event_v1_t *events, uint32_t count)
 	return 0;
 }
 
+int awg_sched_stream_push_final(const awg_event_v1_t *events, uint32_t count,
+				 bool require_event)
+{
+	if (require_event && count == 0U)
+		return -EINVAL;
+	return awg_sched_stream_push(events, count);
+}
+
+int awg_sched_stream_push_opaque(const void *records, uint32_t count)
+{
+	return awg_sched_stream_push(records, count);
+}
+
 int awg_sched_stream_close(bool send_eof)
 {
 	g_sched.close_calls++;
@@ -135,8 +148,8 @@ static awg_event_v1_t make_event(uint64_t timestamp, uint16_t channel,
 	event.flags = flags;
 	event.payload.word0 = seed;
 	event.payload.word1 = seed + 1U;
-	event.payload.word2 = seed + 2U;
-	event.payload.word3 = seed + 3U;
+	event.payload.word2 = (seed + 2U) & UINT32_C(0xFFFF);
+	event.payload.word3 = 0U;
 	return event;
 }
 
@@ -201,7 +214,7 @@ static bool test_open_next_and_duplicate(void)
 	awg_stream_proto_ack_t ack;
 	awg_stream_proto_ack_t first_ack;
 	awg_sched_stream_cfg_t cfg = test_open_cfg();
-	awg_event_v1_t event = make_event(100U, 2U, 0U, UINT32_C(0x1000));
+	awg_event_v1_t event = make_event(100U, 0U, 0U, UINT32_C(0x1000));
 	uint8_t frame[TEST_FRAME_BYTES];
 	size_t len;
 
@@ -230,7 +243,7 @@ static bool test_open_next_and_duplicate(void)
 	CHECK(g_sched.open_calls == 1U);
 	CHECK(g_sched.push_calls == 1U);
 
-	event = make_event(101U, 2U, 0U, UINT32_C(0x2000));
+	event = make_event(108U, 1U, 0U, UINT32_C(0x2000));
 	len = build_frame(frame, 1U, 0U, &event, 1U);
 	CHECK(awg_stream_proto_handle_frame_ctx(&session, frame, len, &cfg,
 					       &ack) == 0);
@@ -351,10 +364,20 @@ static bool test_eof_on_final_event_and_post_close(void)
 	CHECK(awg_stream_proto_handle_frame_ctx(&session, frame, len, &cfg,
 					       &ack) == 0);
 
-	/* Input EOF bits are normalized: only the frame's final event keeps EOF. */
+	/* The canonical policy rejects an early EOF instead of normalizing it away. */
 	events[0] = make_event(300U, 1U,
 			       AWG_SCHED_FLAG_PHASE_REINIT | AWG_SCHED_FLAG_EOF, 10U);
-	events[1] = make_event(301U, 1U, 0U, 20U);
+	events[1] = make_event(308U, 1U, 0U, 20U);
+	len = build_frame(frame, 1U, AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF,
+			  events, 2U);
+	CHECK(awg_stream_proto_handle_frame_ctx(&session, frame, len, &cfg,
+					       &ack) == -EINVAL);
+	CHECK(ack.status == AWG_STREAM_PROTO_ACK_BAD_EVENT);
+	CHECK(g_sched.push_calls == 0U && g_sched.close_calls == 0U);
+	CHECK(!session.closed && session.next_seq == 1U);
+
+	/* A clean closing frame gets EOF appended to its final event. */
+	events[0].flags = AWG_SCHED_FLAG_PHASE_REINIT;
 	len = build_frame(frame, 1U, AWG_STREAM_PROTO_FLAG_CLOSE_WITH_EOF,
 			  events, 2U);
 	CHECK(awg_stream_proto_handle_frame_ctx(&session, frame, len, &cfg,
@@ -380,7 +403,7 @@ static bool test_new_open_resets_closed_session(void)
 	awg_stream_proto_session_t session;
 	awg_stream_proto_ack_t ack;
 	awg_sched_stream_cfg_t cfg = test_open_cfg();
-	awg_event_v1_t event = make_event(400U, 3U, 0U, 40U);
+	awg_event_v1_t event = make_event(400U, 1U, 0U, 40U);
 	uint8_t frame[TEST_FRAME_BYTES];
 	size_t len;
 
@@ -396,7 +419,7 @@ static bool test_new_open_resets_closed_session(void)
 	CHECK(session.closed);
 
 	/* A fresh OPEN is sequence zero and resets the prior closed stream. */
-	event = make_event(1U, 3U, 0U, 50U);
+	event = make_event(1U, 1U, 0U, 50U);
 	len = build_frame(frame, 0U, AWG_STREAM_PROTO_FLAG_OPEN, &event, 1U);
 	CHECK(awg_stream_proto_handle_frame_ctx(&session, frame, len, &cfg,
 					       &ack) == 0);
@@ -431,6 +454,44 @@ static bool test_ring_full_status_is_distinct(void)
 	CHECK(ack.status == AWG_STREAM_PROTO_ACK_RING_FULL);
 	CHECK(ack.status != AWG_STREAM_PROTO_ACK_OVERFLOW);
 	CHECK(session.next_seq == 1U);
+	return true;
+}
+
+static bool test_active_validation_crosses_gwas1_frames_transactionally(void)
+{
+	awg_stream_proto_session_t session;
+	awg_stream_proto_ack_t ack;
+	awg_sched_stream_cfg_t cfg = test_open_cfg();
+	awg_event_v1_t event = make_event(100U, 0U, 0U, 1U);
+	uint8_t frame[TEST_FRAME_BYTES];
+	size_t len;
+
+	sched_stub_reset();
+	awg_stream_proto_session_init(&session);
+	len = build_frame(frame, 0U, AWG_STREAM_PROTO_FLAG_OPEN, &event, 1U);
+	CHECK(awg_stream_proto_handle_frame_ctx(&session, frame, len, &cfg,
+		&ack) == 0);
+
+	event = make_event(107U, 1U, 0U, 2U);
+	len = build_frame(frame, 1U, 0U, &event, 1U);
+	CHECK(awg_stream_proto_handle_frame_ctx(&session, frame, len, &cfg,
+		&ack) == -ERANGE);
+	CHECK(ack.status == AWG_STREAM_PROTO_ACK_BAD_EVENT);
+	CHECK(session.next_seq == 1U && session.event_validation.accepted_events == 1U);
+
+	event = make_event(108U, 1U, 0U, 2U);
+	len = build_frame(frame, 1U, 0U, &event, 1U);
+	CHECK(awg_stream_proto_handle_frame_ctx(&session, frame, len, &cfg,
+		&ack) == 0);
+	CHECK(session.event_validation.accepted_events == 2U);
+
+	event = make_event(116U, 0U, 0U, 3U);
+	event.payload.word2 = UINT32_C(0x00010000);
+	len = build_frame(frame, 2U, 0U, &event, 1U);
+	CHECK(awg_stream_proto_handle_frame_ctx(&session, frame, len, &cfg,
+		&ack) == -EINVAL);
+	CHECK(ack.status == AWG_STREAM_PROTO_ACK_BAD_EVENT);
+	CHECK(session.next_seq == 2U && session.event_validation.accepted_events == 2U);
 	return true;
 }
 
@@ -482,6 +543,8 @@ int main(void)
 		{ "EOF final event and post-close", test_eof_on_final_event_and_post_close },
 		{ "new OPEN reset", test_new_open_resets_closed_session },
 		{ "ring-full status", test_ring_full_status_is_distinct },
+		{ "active validation across GWAS/1 frames",
+		  test_active_validation_crosses_gwas1_frames_transactionally },
 		{ "28-byte ACK serialization", test_ack_serialization_is_28_byte_little_endian },
 	};
 	size_t i;

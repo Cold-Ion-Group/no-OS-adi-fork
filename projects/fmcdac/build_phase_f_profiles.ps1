@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Build all five FMCDAC firmware profiles from one XSA.
+Build all six FMCDAC firmware profiles from one XSA.
 #>
 [CmdletBinding()]
 param(
@@ -30,7 +30,8 @@ $profiles = @(
     'scheduler-preload',
     'scheduler-stream',
     'scheduler-dma',
-    'scheduler-eth'
+    'scheduler-eth',
+    'scheduler-eth-release'
 )
 
 foreach ($profile in $profiles) {

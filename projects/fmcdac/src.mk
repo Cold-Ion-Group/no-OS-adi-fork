@@ -4,6 +4,8 @@
 
 SRCS += $(PROJECT)/src/app/fmcdac.c \
         $(PROJECT)/src/app/awg_sched.c \
+        $(PROJECT)/src/app/awg_event_validate.c \
+        $(PROJECT)/src/app/awg_c1_validate.c \
         $(PROJECT)/src/app/awg_stream_ring.c \
         $(PROJECT)/src/app/awg_stream_proto.c \
         $(DRIVERS)/frequency/ad9516/ad9516.c \
@@ -44,6 +46,8 @@ INCS += $(PROJECT)/src/app/app_config.h \
         $(PROJECT)/src/app/awg_sched.h \
         $(PROJECT)/src/app/awg_sched_regs.h \
         $(PROJECT)/src/app/awg_event.h \
+        $(PROJECT)/src/app/awg_event_validate.h \
+        $(PROJECT)/src/app/awg_c1_validate.h \
         $(PROJECT)/src/app/awg_stream_ring.h \
         $(PROJECT)/src/app/awg_stream_proto.h \
         $(PROJECT)/src/app/parameters.h \

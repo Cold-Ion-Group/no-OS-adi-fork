@@ -68,6 +68,7 @@ typedef struct {
 	uint32_t last_seq;
 	uint32_t last_frame_crc;
 	uint64_t last_timestamp;
+	awg_event_validation_state_t event_validation;
 	awg_stream_proto_ack_t last_ack;
 } awg_stream_proto_session_t;
 
@@ -111,10 +112,13 @@ typedef struct {
 typedef int (*awg_stream_proto_v2_prepare_fn)(void *ctx);
 typedef int (*awg_stream_proto_v2_select_kind_fn)(void *ctx,
 		uint8_t payload_kind);
+typedef int (*awg_stream_proto_v2_finalize_kind_fn)(void *ctx,
+		uint8_t payload_kind);
 
 typedef struct {
 	awg_stream_proto_v2_prepare_fn prepare;
 	awg_stream_proto_v2_select_kind_fn select_kind;
+	awg_stream_proto_v2_finalize_kind_fn finalize_kind;
 	void *ctx;
 } awg_stream_proto_v2_ops_t;
 
@@ -125,12 +129,14 @@ typedef struct {
 	bool kind_selected;
 	bool have_pending_event;
 	bool have_last_timestamp;
+	bool c1_preflight_complete;
 	uint8_t payload_kind;
 	uint32_t session_id;
 	uint32_t next_seq;
 	uint32_t last_seq;
 	uint32_t last_frame_crc;
 	uint64_t last_timestamp;
+	awg_event_validation_state_t event_validation;
 	uint8_t program_sha256[AWG_STREAM_PROTO_V2_PROGRAM_HASH_BYTES];
 	awg_event_v1_t pending_event;
 	awg_stream_proto_v2_ack_t last_ack;

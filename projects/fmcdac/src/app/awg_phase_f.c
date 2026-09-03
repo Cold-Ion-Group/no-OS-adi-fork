@@ -7,10 +7,53 @@
 #include "awg_sched_regs.h"
 #include "no_os_axi_io.h"
 
+#ifndef FMCDAC_AWG_LEGACY_INGRESS_MAINTENANCE
+#define FMCDAC_AWG_LEGACY_INGRESS_MAINTENANCE 1
+#endif
+
+static int32_t awg_phase_f_extension_read(struct awg_phase_f *phase,
+		uint32_t offset, uint32_t *value)
+{
+	if (!phase || !value || !phase->config.extension_base)
+		return -EINVAL;
+	return no_os_axi_io_read(phase->config.extension_base, offset, value);
+}
+
+static int32_t awg_phase_f_extension_read64(struct awg_phase_f *phase,
+		uint32_t low_offset, uint32_t high_offset, uint64_t *value)
+{
+	uint32_t high_before;
+	uint32_t high_after;
+	uint32_t low;
+	uint32_t attempts;
+	int32_t ret;
+
+	if (!value)
+		return -EINVAL;
+	for (attempts = 0U; attempts < 4U; attempts++) {
+		ret = awg_phase_f_extension_read(phase, high_offset, &high_before);
+		if (ret)
+			return ret;
+		ret = awg_phase_f_extension_read(phase, low_offset, &low);
+		if (ret)
+			return ret;
+		ret = awg_phase_f_extension_read(phase, high_offset, &high_after);
+		if (ret)
+			return ret;
+		if (high_before == high_after) {
+			*value = ((uint64_t)high_after << 32) | low;
+			return 0;
+		}
+	}
+	return -EAGAIN;
+}
+
 static int32_t awg_phase_f_extension_init(struct awg_phase_f *phase)
 {
 	uint32_t id;
 	uint32_t version;
+	uint32_t compression_id;
+	uint32_t compression_version;
 	uint32_t required;
 	int32_t ret;
 
@@ -36,6 +79,24 @@ static int32_t awg_phase_f_extension_init(struct awg_phase_f *phase)
 	if (version != AWG_PHASE_F_AWGX_VERSION)
 		return -ENOTSUP;
 	if ((phase->extension_caps & required) != required)
+		return -ENOTSUP;
+
+	ret = no_os_axi_io_read(phase->config.extension_base,
+		AWG_PHASE_F_AWGC_REG_ID, &compression_id);
+	if (ret)
+		return ret;
+	ret = no_os_axi_io_read(phase->config.extension_base,
+		AWG_PHASE_F_AWGC_REG_VERSION, &compression_version);
+	if (ret)
+		return ret;
+	ret = no_os_axi_io_read(phase->config.extension_base,
+		AWG_PHASE_F_AWGC_REG_CAPS, &phase->compression_caps);
+	if (ret)
+		return ret;
+	if (compression_id != AWG_PHASE_F_AWGC_ID)
+		return -ENODEV;
+	if (compression_version != AWG_PHASE_F_AWGC_VERSION ||
+	    phase->compression_caps != AWG_PHASE_F_AWGC_CAPS)
 		return -ENOTSUP;
 	return 0;
 }
@@ -70,6 +131,11 @@ static int awg_phase_f_protocol_prepare(void *ctx)
 		AWG_PHASE_F_AWGX_REG_CONTROL, 0U);
 	if (!ret)
 		phase->selected_payload_kind = AWG_STREAM_PROTO_V2_KIND_CONTROL;
+	if (!ret) {
+		memset(&phase->c1_preflight, 0, sizeof(phase->c1_preflight));
+		memset(&phase->c1_preflight_report, 0,
+		       sizeof(phase->c1_preflight_report));
+	}
 	return ret;
 }
 
@@ -109,6 +175,41 @@ static int awg_phase_f_protocol_select_kind(void *ctx, uint8_t kind)
 	return 0;
 }
 
+static int awg_phase_f_protocol_finalize_kind(void *ctx, uint8_t kind)
+{
+	struct awg_phase_f *phase = ctx;
+	awg_stream_ring_t *ring;
+	uint32_t records;
+	uint32_t contiguous;
+	const void *blob;
+
+	if (!phase || !phase->initialized ||
+	    kind != AWG_STREAM_PROTO_V2_KIND_C1 ||
+	    phase->selected_payload_kind != kind)
+		return -EINVAL;
+	if (phase->scheduler_dma_initialized &&
+	    awg_sched_dma_in_flight(&phase->scheduler_dma))
+		return -EBUSY;
+
+	ring = awg_sched_stream_ring_get();
+	if (!ring) {
+		phase->c1_preflight_report.error_mask = AWG_C1_ERROR_BAD_SIZE;
+		return -ENODEV;
+	}
+	records = awg_stream_ring_count(ring);
+	contiguous = awg_stream_ring_consumer_contiguous(ring);
+	if (records < (AWG_C1_HEADER_BYTES / AWG_C1_COMMAND_BYTES) ||
+	    contiguous != records) {
+		phase->c1_preflight_report.error_mask = AWG_C1_ERROR_BAD_SIZE;
+		phase->c1_preflight_report.command_index = records;
+		return -EMSGSIZE;
+	}
+	blob = awg_stream_ring_consumer_const_ptr(ring);
+	return awg_c1_preflight(blob,
+		(size_t)records * AWG_C1_COMMAND_BYTES,
+		&phase->c1_preflight, &phase->c1_preflight_report);
+}
+
 static int32_t awg_phase_f_tx(struct awg_phase_f *phase, size_t length)
 {
 	int32_t ret;
@@ -141,6 +242,7 @@ static int32_t awg_phase_f_reply_udp(struct awg_phase_f *phase,
 	const awg_stream_proto_v2_ops_t ops = {
 		.prepare = awg_phase_f_protocol_prepare,
 		.select_kind = awg_phase_f_protocol_select_kind,
+		.finalize_kind = awg_phase_f_protocol_finalize_kind,
 		.ctx = phase,
 	};
 	awg_stream_proto_v2_ack_t ack;
@@ -151,7 +253,7 @@ static int32_t awg_phase_f_reply_udp(struct awg_phase_f *phase,
 	int32_t proto_ret;
 	int32_t ret;
 
-	/* Keep the completed GWAS/1 sender usable as a diagnostic fallback. */
+	/* GWAS/1 is compiled in only for deliberate engineering maintenance. */
 	is_v2 = packet->payload_length >= AWG_STREAM_PROTO_V2_HEADER_BYTES +
 		AWG_STREAM_PROTO_CRC_BYTES &&
 		((packet->payload[18U] == AWG_STREAM_PROTO_V2_HEADER_BYTES &&
@@ -168,9 +270,16 @@ static int32_t awg_phase_f_reply_udp(struct awg_phase_f *phase,
 		awg_stream_proto_v2_ack_to_le(&ack, phase->ack_payload);
 		ack_length = AWG_STREAM_PROTO_V2_ACK_BYTES;
 	} else {
+#if FMCDAC_AWG_LEGACY_INGRESS_MAINTENANCE
 		proto_ret = awg_stream_proto_handle_frame_ctx(&phase->legacy_protocol,
 				packet->payload, packet->payload_length,
 				&phase->config.stream, &legacy_ack);
+#else
+		memset(&legacy_ack, 0, sizeof(legacy_ack));
+		legacy_ack.magic = AWG_STREAM_PROTO_MAGIC;
+		legacy_ack.status = AWG_STREAM_PROTO_ACK_DISABLED;
+		proto_ret = -ENOTSUP;
+#endif
 		awg_stream_proto_ack_to_le(&legacy_ack, phase->ack_payload);
 		ack_length = AWG_STREAM_PROTO_ACK_BYTES;
 	}
@@ -263,6 +372,13 @@ static int32_t awg_phase_f_init_scheduler_dma(struct awg_phase_f *phase)
 	return 0;
 }
 
+bool awg_phase_f_scheduler_release_allowed(const struct awg_phase_f *phase)
+{
+	return phase &&
+	       (phase->selected_payload_kind != AWG_STREAM_PROTO_V2_KIND_C1 ||
+		phase->protocol.c1_preflight_complete);
+}
+
 int32_t awg_phase_f_init(struct awg_phase_f *phase,
 			 const struct awg_phase_f_config *config)
 {
@@ -339,7 +455,11 @@ int32_t awg_phase_f_service(struct awg_phase_f *phase)
 	if (ret && !first_error)
 		first_error = ret;
 	if (phase->scheduler_dma_initialized) {
-		ret = awg_sched_dma_service(&phase->scheduler_dma);
+		/* A C1 program is never released until whole-program preflight passes. */
+		if (awg_phase_f_scheduler_release_allowed(phase))
+			ret = awg_sched_dma_service(&phase->scheduler_dma);
+		else
+			ret = 0;
 		if (ret && ret != -EAGAIN && !first_error)
 			first_error = ret;
 	}
@@ -361,6 +481,59 @@ int32_t awg_phase_f_service(struct awg_phase_f *phase)
 	return first_error;
 }
 
+int32_t awg_phase_f_read_streamstatus2(
+	struct awg_phase_f *phase,
+	struct awg_phase_f_streamstatus2 *status)
+{
+	int32_t ret;
+
+	if (!phase || !phase->initialized || !status)
+		return -EINVAL;
+	memset(status, 0, sizeof(*status));
+	status->version = AWG_PHASE_F_STREAMSTATUS2_VERSION;
+	status->selected_payload_kind = phase->selected_payload_kind;
+	status->c1_preflight_complete = phase->protocol.c1_preflight_complete;
+
+#define AWG_PHASE_F_READ32(_reg, _member) do { \
+	ret = awg_phase_f_extension_read(phase, (_reg), &status->_member); \
+	if (ret) return ret; \
+} while (0)
+#define AWG_PHASE_F_READ64(_lo, _hi, _member) do { \
+	ret = awg_phase_f_extension_read64(phase, (_lo), (_hi), \
+		&status->_member); \
+	if (ret) return ret; \
+} while (0)
+	AWG_PHASE_F_READ32(AWG_PHASE_F_AWGX_REG_ID, awgx_id);
+	AWG_PHASE_F_READ32(AWG_PHASE_F_AWGX_REG_VERSION, awgx_version);
+	AWG_PHASE_F_READ32(AWG_PHASE_F_AWGX_REG_CAPS, awgx_caps);
+	AWG_PHASE_F_READ32(AWG_PHASE_F_AWGX_REG_CONTROL, awgx_control);
+	AWG_PHASE_F_READ32(AWG_PHASE_F_AWGX_REG_STATUS, awgx_status);
+	AWG_PHASE_F_READ32(AWG_PHASE_F_AWGC_REG_ID, awgc_id);
+	AWG_PHASE_F_READ32(AWG_PHASE_F_AWGC_REG_VERSION, awgc_version);
+	AWG_PHASE_F_READ32(AWG_PHASE_F_AWGC_REG_CAPS, awgc_caps);
+	AWG_PHASE_F_READ32(AWG_PHASE_F_AWGC_REG_STATUS, awgc_status);
+	AWG_PHASE_F_READ32(AWG_PHASE_F_AWGC_REG_ERROR, awgc_error);
+	AWG_PHASE_F_READ64(AWG_PHASE_F_AWGC_REG_RECORDS_LO,
+		AWG_PHASE_F_AWGC_REG_RECORDS_HI, accepted_commands);
+	AWG_PHASE_F_READ64(AWG_PHASE_F_AWGC_REG_EVENTS_LO,
+		AWG_PHASE_F_AWGC_REG_EVENTS_HI, emitted_logical_events);
+	AWG_PHASE_F_READ64(AWG_PHASE_F_AWGC_REG_BUSY_LO,
+		AWG_PHASE_F_AWGC_REG_BUSY_HI, busy_cycles);
+	AWG_PHASE_F_READ64(AWG_PHASE_F_AWGC_REG_STALL_LO,
+		AWG_PHASE_F_AWGC_REG_STALL_HI, stall_cycles);
+	AWG_PHASE_F_READ64(AWG_PHASE_F_AWGC_REG_OUTPUT_CRC_LO,
+		AWG_PHASE_F_AWGC_REG_OUTPUT_CRC_HI, logical_output_crc);
+	AWG_PHASE_F_READ64(AWG_PHASE_F_AWGC_REG_DECLARED_LO,
+		AWG_PHASE_F_AWGC_REG_DECLARED_HI, declared_logical_events);
+	AWG_PHASE_F_READ32(AWG_PHASE_F_AWGC_REG_MAX_DEPTH,
+		maximum_repeat_depth);
+	AWG_PHASE_F_READ32(AWG_PHASE_F_AWGC_REG_MAX_COMMANDS,
+		maximum_commands);
+#undef AWG_PHASE_F_READ64
+#undef AWG_PHASE_F_READ32
+	return 0;
+}
+
 void awg_phase_f_scheduler_irq(void *instance)
 {
 	struct awg_phase_f *phase = instance;
@@ -375,7 +548,8 @@ void awg_phase_f_scheduler_irq(void *instance)
 	awg_sched_stream_irq_handler(irq_status);
 	if (phase->scheduler_dma_initialized &&
 	    (irq_status & (AWG_SCHED_IRQ_LOW_WATERMARK |
-			   AWG_SCHED_IRQ_EMPTY_STALL)) != 0U)
+			   AWG_SCHED_IRQ_EMPTY_STALL)) != 0U &&
+	    awg_phase_f_scheduler_release_allowed(phase))
 		awg_sched_dma_request_service(&phase->scheduler_dma);
 }
 

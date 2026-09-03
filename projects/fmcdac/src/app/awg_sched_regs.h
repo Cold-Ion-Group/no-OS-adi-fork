@@ -73,6 +73,9 @@
 #define AWG_SCHED_ERR_MISSED_DEADLINE   0x01u
 #define AWG_SCHED_ERR_SPACING_VIOLATION 0x02u
 #define AWG_SCHED_ERR_REINIT_SPACING    0x03u
+/* Compatible active-build additions; frozen v1 values 0x00-0x03 stay fixed. */
+#define AWG_SCHED_ERR_EXTENSION_FAULT   0x04u
+#define AWG_SCHED_ERR_STREAM_OVERFLOW   0x05u
 
 /* IRQ_STATUS / IRQ_ENABLE bits. IRQ_STATUS is write-one-to-clear. */
 #define AWG_SCHED_IRQ_DONE              (1u << 0)

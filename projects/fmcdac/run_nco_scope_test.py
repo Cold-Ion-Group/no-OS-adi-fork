@@ -49,8 +49,9 @@ from awg_sched_host import (
     AWG_STREAM_UART_HEX_BYTES_PER_EVENT,
     AWG_STREAM_UART_RAW_BAUD,
     AWG_STREAM_UART_RAW_BYTES_PER_S,
+    AwgSchedEvent,
+    AwgSchedInfo,
     build_awg_sweep_events,
-    build_uniform_freq_list,
     estimate_uartlite_stream_seconds,
     pack_events,
     pack_stream_frame,
@@ -7313,6 +7314,11 @@ def write_phase_noise_results_csv(steps: Sequence[StepCaptureSummary], output_pa
         metrics = step.metrics
         expected_hz = step.expected_freq_hz[0]
         freq_error_hz = metrics.power_freq_hz - expected_hz
+        trace_capture_error = (
+            ""
+            if metrics.trace_capture_error is None
+            else metrics.trace_capture_error.replace('"', '""')
+        )
         lines.append(
             f"{expected_hz / 1e6:.6f},"
             f"{metrics.span_hz:.6f},"
@@ -7324,7 +7330,7 @@ def write_phase_noise_results_csv(steps: Sequence[StepCaptureSummary], output_pa
             f"{metrics.sweep_count},"
             f"{metrics.trace_points},"
             f"{str(metrics.trace_capture_degraded).lower()},"
-            f"\"{'' if metrics.trace_capture_error is None else metrics.trace_capture_error.replace('\"', '\"\"')}\","
+            f"\"{trace_capture_error}\","
             f"{step.csv_path}"
         )
 

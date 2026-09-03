@@ -24,7 +24,7 @@ param(
     [string]$BuildLogPath = '',
     [string]$BuildConfigPath = '',
     [ValidateSet('unknown', 'default', 'scheduler-preload', 'scheduler-stream',
-                 'scheduler-dma', 'scheduler-eth')]
+                 'scheduler-dma', 'scheduler-eth', 'scheduler-eth-release')]
     [string]$Profile = 'unknown',
     [string]$OutputPath = (Join-Path $PSScriptRoot 'manifest.json')
 )
@@ -71,6 +71,65 @@ function Get-ArtifactRecord {
     }
 }
 
+function Get-XparametersDefines {
+    param([string]$Path)
+
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'A generated xparameters.h is required to validate the active AWG build.'
+    }
+    $defines = @{}
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -match '^\s*#define\s+([A-Za-z_][A-Za-z0-9_]*)\s+([^\s/]+)') {
+            $name = $Matches[1]
+            $value = $Matches[2].TrimEnd('U', 'u', 'L', 'l')
+            try {
+                $defines[$name] = if ($value -match '^0[xX]') {
+                    [Convert]::ToUInt64($value.Substring(2), 16)
+                } else {
+                    [Convert]::ToUInt64($value, 10)
+                }
+            } catch {
+                # Generated BSP aliases are not acceptable release evidence.
+            }
+        }
+    }
+    return $defines
+}
+
+function Assert-ActiveAwgXparameters {
+    param([string]$Path)
+
+    $expected = [ordered]@{
+        XPAR_AWG_TIMED_CTRL_0_BASEADDR = 0x44AA0000
+        XPAR_AXI_SCHED_DMA_BASEADDR = 0x44AB0000
+        XPAR_AXI_ETH_RX_DMA_BASEADDR = 0x44AC0000
+        XPAR_AXI_ETH_TX_DMA_BASEADDR = 0x44AD0000
+        XPAR_AWG_EXTENSION_0_BASEADDR = 0x44AE0000
+        XPAR_ETH_MAC_10G_BASEADDR = 0x44C00000
+        XPAR_AXI_AD9144_TPL_DAC_TPL_CORE_BASEADDR = 0x44A04000
+        XPAR_AXI_AD9144_JESD_TX_AXI_BASEADDR = 0x44A90000
+        XPAR_AXI_AD9144_XCVR_BASEADDR = 0x44A60000
+        XPAR_AXI_AD9144_DMA_BASEADDR = 0x7C420000
+        XPAR_AXI_INTC_AXI_AD9144_JESD_TX_AXI_IRQ_INTR = 15
+        XPAR_AXI_INTC_AWG_TIMED_CTRL_0_IRQ_INTR = 14
+        XPAR_AXI_INTC_AXI_AD9144_DMA_IRQ_INTR = 13
+        XPAR_AXI_INTC_AXI_SCHED_DMA_IRQ_INTR = 12
+        XPAR_AXI_INTC_AXI_ETH_RX_DMA_IRQ_INTR = 10
+        XPAR_AXI_INTC_AXI_ETH_TX_DMA_IRQ_INTR = 9
+    }
+    $defines = Get-XparametersDefines $Path
+    foreach ($name in $expected.Keys) {
+        if (-not $defines.ContainsKey($name)) {
+            throw "Active AWG build XPAR is missing: $name"
+        }
+        if ([UInt64]$defines[$name] -ne [UInt64]$expected[$name]) {
+            throw ('Active AWG build XPAR mismatch for {0}: expected 0x{1:X}, got 0x{2:X}' -f
+                $name, [UInt64]$expected[$name], [UInt64]$defines[$name])
+        }
+    }
+    return $expected
+}
+
 # --- Hash build artifacts ---
 $xsaArtifact = Get-ArtifactRecord $XsaPath 'XSA'
 $bitArtifact = Get-ArtifactRecord $BitPath 'Bitstream'
@@ -115,6 +174,50 @@ $buildConfig = [ordered]@{
     lane_polarity_invert  = '0x04'
 }
 
+# A release manifest is evidence, not a hand-maintained description.  The
+# generated BSP must carry this exact address/interrupt binding from the XSA.
+$activeBuild = $null
+if ($Profile -eq 'scheduler-eth-release') {
+    if (-not $XparametersPath) {
+        throw 'scheduler-eth-release requires -XparametersPath from the generated BSP.'
+    }
+    $xparExpected = Assert-ActiveAwgXparameters $XparametersPath
+    $activeBuild = [ordered]@{
+        schema = 'rfsoc-bench/awg-active-build-release/1.0'
+        generated_from = [ordered]@{
+            xparameters_file = $xparametersArtifact.file
+            xparameters_sha256 = $xparametersArtifact.sha256
+            profile = $Profile
+        }
+        scheduler = [ordered]@{
+            ip_id = '0x41574753'; ip_version = '0x00010000'; ip_caps = '0x08804000'
+            base_address = '0x44AA0000'; clock_hz = [ordered]@{ numerator = 245760000; denominator = 1 }
+            dds_phase_accumulator_bits = 32; cordic_angle_bits = 16
+            min_spacing_ticks = 8; usable_fifo_entries = 511
+            frozen_module_default_channels = 8; instantiated_channels = 2
+        }
+        extensions = [ordered]@{
+            base_address = '0x44AE0000'
+            awgx = [ordered]@{ ip_id = '0x41574758'; ip_version = '0x00010000'; direct_caps = '0x0000000F'; c1_caps = '0x0000001F' }
+            awgc = [ordered]@{ ip_id = '0x41574743'; ip_version = '0x00010000'; caps = '0x00402010' }
+        }
+        address_map = [ordered]@{
+            tpl = '0x44A04000'; xcvr = '0x44A60000'; jesd_tx = '0x44A90000'
+            scheduler = '0x44AA0000'; scheduler_dma = '0x44AB0000'
+            eth_rx_dma = '0x44AC0000'; eth_tx_dma = '0x44AD0000'
+            extensions = '0x44AE0000'; eth_mac_10g = '0x44C00000'; dac_dma = '0x7C420000'
+        }
+        xparameters = $xparExpected
+        interrupts = [ordered]@{
+            jesd_tx = 15; scheduler = 14; dac_dma = 13; scheduler_dma = 12
+            eth_rx_dma = 10; eth_tx_dma = 9; eth_mac_10g = 'polled-no-discrete-irq'
+            processing_system = [ordered]@{ jesd_tx = 10; scheduler = 11; dac_dma = 12; scheduler_dma = 13; eth_rx_dma = 14; eth_tx_dma = 15 }
+        }
+        jesd = [ordered]@{ mode = 4; converters = 2; lanes = 4; octets_per_frame = 1; frames_per_multiframe = 32; bits_per_sample = 16; subclass = 1 }
+        ingress = 'UDP RX DMA -> DDR ring -> scheduler DMA; legacy UART/GWAS1 ingress disabled unless maintenance is explicitly enabled'
+    }
+}
+
 # --- Assemble manifest ---
 $manifest = [ordered]@{
     project   = 'fmcdac_kcu116'
@@ -143,6 +246,7 @@ $manifest = [ordered]@{
     }
     submodules   = $submodules
     build_config = $buildConfig
+    active_build = $activeBuild
     build_config_provenance = if ($buildConfigArtifact.sha256) {
         'baseline values plus overrides in firmware.generated.build_config_file'
     } else {
@@ -245,6 +349,14 @@ if ($Verify) {
     if ($Profile -ne 'unknown' -and $existing.firmware.profile -ne $Profile) {
         $mismatches += ('profile: manifest={0} current={1}' -f
             $existing.firmware.profile, $Profile)
+    }
+    if ($Profile -eq 'scheduler-eth-release') {
+        if (-not $existing.active_build) {
+            $mismatches += 'active_build: manifest has no release active-build evidence'
+        } elseif ($existing.active_build.generated_from.xparameters_sha256 -ne $xparametersArtifact.sha256) {
+            $mismatches += ('active-build xparameters sha256: manifest={0} current={1}' -f
+                $existing.active_build.generated_from.xparameters_sha256, $xparametersArtifact.sha256)
+        }
     }
     if ($fwDirty) {
         $warnings += 'Working tree has uncommitted changes (dirty) - normal during development'

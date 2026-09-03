@@ -14,7 +14,7 @@ param(
     [string]$XsaPath,
 
     [ValidateSet('default', 'scheduler-preload', 'scheduler-stream',
-                 'scheduler-dma', 'scheduler-eth')]
+                 'scheduler-dma', 'scheduler-eth', 'scheduler-eth-release')]
     [string]$Profile = 'scheduler-eth',
 
     [string]$XilinxSettings = 'C:\Xilinx\Vitis\2021.2\settings64.bat',

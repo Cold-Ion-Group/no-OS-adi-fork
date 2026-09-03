@@ -7,6 +7,7 @@
 
 #include "app_config.h"
 #include "awg_event.h"
+#include "awg_event_validate.h"
 #include "awg_stream_ring.h"
 
 #ifdef __cplusplus
@@ -180,6 +181,9 @@ void awg_sched_dump_artifacts(const awg_event_v1_t *events, uint32_t count,
 
 int awg_sched_stream_open(const awg_sched_stream_cfg_t *cfg);
 int awg_sched_stream_push(const awg_event_v1_t *ev, uint32_t n);
+int awg_sched_stream_push_final(const awg_event_v1_t *ev, uint32_t n,
+				 bool require_event);
+int awg_sched_stream_push_opaque(const void *records, uint32_t n);
 int awg_sched_stream_drain_step(void);
 int awg_sched_stream_close(bool send_eof);
 void awg_sched_stream_irq_handler(uint32_t irq_status);
